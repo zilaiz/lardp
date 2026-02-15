@@ -5,4 +5,5 @@ defaults:
 
 # Override for mh variant
 env_type: "mh"
-dataset_filename: "robomimic/transport/mh/image.hdf5"
+# dataset_filename: "robomimic/transport/mh/image.hdf5"
+dataset_filename: "data/robomimic/transport/mh/image_v15.hdf5"

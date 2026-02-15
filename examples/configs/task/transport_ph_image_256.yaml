@@ -14,7 +14,7 @@ env_type: "ph"
 # dataset_repo: "amandlek/robomimic"
 # dataset_filename: "v1.5/transport/ph/demo_v15.hdf5"
 
-dataset_path: "data/robomimic/transport/ph/image_v15.hdf5"
+dataset_path: "data/robomimic/transport/ph/image_v15_256.hdf5"
 
 max_episode_steps: 700
 render_obs_key: "shouldercamera0_image"
@@ -31,26 +31,26 @@ shape_meta:
     shouldercamera0_image:
       shape:
         - 3
-        - 84
-        - 84
+        - 256
+        - 256
       type: rgb
     shouldercamera1_image:
       shape:
         - 3
-        - 84
-        - 84
+        - 256
+        - 256
       type: rgb
     robot0_eye_in_hand_image:
       shape:
         - 3
-        - 84
-        - 84
+        - 256
+        - 256
       type: rgb
     robot1_eye_in_hand_image:
       shape:
         - 3
-        - 84
-        - 84
+        - 256
+        - 256
       type: rgb
     robot0_eef_pos:
       shape:

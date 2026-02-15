@@ -215,3 +215,5 @@ checkpoints/
 results/
 node_modules/
 cache/
+slurm/
+*lam_infer_output/

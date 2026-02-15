@@ -8,11 +8,13 @@ obs_type: "state"
 env_type: "ph"
 
 # HuggingFace dataset configuration - auto-downloads from the repository
-dataset_filename: "robomimic/lift/ph/low_dim.hdf5"
+# dataset_filename: "robomimic/lift/ph/low_dim.hdf5"
 
 # Alternative: Use original repo (already processed)
 # dataset_repo: "amandlek/robomimic"
 # dataset_filename: "v1.5/lift/ph/low_dim_v15.hdf5"
+
+dataset_path: "data/robomimic/lift/ph/low_dim_v15.hdf5"
 
 max_episode_steps: 400
 obs_keys: ["object", "robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos"]
