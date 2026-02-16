@@ -2,6 +2,7 @@ defaults:
   - log: default
   - optimization: default
   - network: mlp
+  - lam: default
   - task: lift_ph_state
   - launcher: basic
   - _self_

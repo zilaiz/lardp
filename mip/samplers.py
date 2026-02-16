@@ -23,7 +23,7 @@ def get_default_step_list(loss_type: str):
 
 
 def get_sampler(loss_type: str):
-    if loss_type == "flow":
+    if loss_type == "flow" or loss_type == "flow_repa":
         return ode_sampler
     elif loss_type == "regression":
         return regression_sampler

@@ -5,6 +5,7 @@ defaults:
 seed: 0
 loss_type: "flow"
 loss_scale: 0.1
+repa_scale: 0.0 # REPA loss coefficient
 norm_type: "l2" # "l1", "l2", "smooth_l1"
 lr: 1e-4
 weight_decay: 1e-5

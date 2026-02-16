@@ -20,6 +20,7 @@ class OptimizationConfig:
     seed: int = 0
     loss_type: str = "flow"
     loss_scale: float = 100.0
+    repa_scale: float = 0.0 # REPA loss coefficient
     norm_type: str = "l2"
     lr: float = 1e-4
     weight_decay: float = 1e-5
@@ -78,6 +79,10 @@ class NetworkConfig:
     # RNN specific configs
     rnn_type: str = "LSTM"  # "LSTM" or "GRU"
     max_freq: float = 100.0
+    # REPA specific
+    align_depth: int = 0
+    projector_dim: int = 2048
+    z_dims: list[int] | None = None
 
 
 @dataclass
@@ -123,6 +128,17 @@ class TaskConfig:
     use_group_norm: bool = True
     use_seq: bool = True
 
+@dataclass
+class LAMConfig:
+    lam_image_channels: int = 3
+    lam_model_dim: int = 1024
+    lam_latent_dim: int = 32
+    lam_patch_size: int = 16
+    lam_enc_blocks: int = 16
+    lam_dec_blocks: int = 16
+    lam_num_heads: int = 16
+    lam_dropout: float = 0.0
+    lam_ckpt_path: str = None
 
 @dataclass
 class Config:
@@ -130,4 +146,5 @@ class Config:
     network: NetworkConfig
     task: TaskConfig
     log: LogConfig
+    lam: LAMConfig = None
     mode: str = "train"  # "train" or "eval"

@@ -3,8 +3,9 @@ import math
 import torch
 import torch.nn as nn
 from einops import rearrange
-from lam.modules.embeddings import RotaryEmbedding
 from torch import Tensor
+
+from .embeddings import RotaryEmbedding
 
 
 def patchify(videos: Tensor, size: int) -> Tensor:

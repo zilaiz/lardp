@@ -54,3 +54,14 @@ shape_meta:
       type: low_dim
 
 num_envs: 4
+
+# crop_shape:
+#   - 232
+#   - 232
+
+resize_shape: 
+  - 84
+  - 84
+crop_shape:
+  - 76
+  - 76

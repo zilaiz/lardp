@@ -1,13 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from lam.modules.blocks import (
+from torch import Tensor
+
+from .blocks import (
     SpatioTemporalTransformer,
     SpatioTransformer,
     patchify,
     unpatchify,
 )
-from torch import Tensor
 
 
 class LatentActionModel(nn.Module):
@@ -67,8 +68,8 @@ class LatentActionModel(nn.Module):
         z = z[:, 1:, 0]  # (B, T-1, 1, E)
 
         # VAE
-        z = z.reshape(B * (T - 1), self.model_dim)
-        moments = self.fc(z)
+        z_rep_prebn = z.reshape(B * (T - 1), self.model_dim)
+        moments = self.fc(z_rep_prebn)
         z_mu, z_var = torch.chunk(moments, 2, dim=1)
         # Reparameterization
         if not self.training:
@@ -85,6 +86,7 @@ class LatentActionModel(nn.Module):
 
         return {
             "patches": patches,
+            "z_rep_prebn": z_rep_prebn,
             "z_rep": z_rep,
             "z_mu": z_mu,
             "z_var": z_var

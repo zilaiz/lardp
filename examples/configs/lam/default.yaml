@@ -1,0 +1,10 @@
+lam_image_channels: 3
+lam_model_dim: 1024
+lam_latent_dim: 32
+lam_patch_size: 16
+lam_enc_blocks: 16
+lam_dec_blocks: 16
+lam_num_heads: 16
+lam_dropout: 0.0
+
+lam_ckpt_path: /oscar/data/csun45/zzeng28/cache/huggingface/hub/models--Little-Podi--AdaWorld/snapshots/ae42b514c30fe80d9384528dcdd0f19e8d8a3909/lam.ckpt

@@ -8,7 +8,7 @@ import loguru
 import torch
 import torch.nn as nn
 
-from mip.config import NetworkConfig, TaskConfig
+from mip.config import LAMConfig, NetworkConfig, TaskConfig
 from mip.encoders import (
     IdentityEncoder,
     MLPEncoder,
@@ -25,6 +25,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
+    from mip.networks.sudeepdit_repa import SudeepDiTREPA
 
     network_class = {
         "mlp": MLP,
@@ -35,6 +36,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "rnn": RNN,
         "vanilla_rnn": VanillaRNN,
         "sudeepdit": SudeepDiT,
+        "sudeepdit_repa": SudeepDiTREPA,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -119,6 +121,21 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             timestep_emb_type=network_config.timestep_emb_type,
         )
 
+    elif network_config.network_type == "sudeepdit_repa":
+        loguru.logger.info(f"REPA config - align_depth: {network_config.align_depth} | projector_dim: {network_config.projector_dim} | z_dims: {network_config.z_dims}")
+        return network_class(
+            **common_params,
+            d_model=network_config.emb_dim,
+            n_heads=network_config.n_heads,
+            depth=network_config.num_layers,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+            align_depth=network_config.align_depth,
+            projector_dim=network_config.projector_dim,
+            z_dims=network_config.z_dims,
+        )
+
+
 
 def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
     if task_config.obs_type == "image":
@@ -163,6 +180,32 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
         return MultiImageObsEncoder(**kwargs)
     else:
         raise ValueError(f"Invalid encoder type: {encoder_type}")
+
+
+def get_lam(lam_config: LAMConfig):
+    from mip.networks.lam.modules import LatentActionModel
+
+    lam = LatentActionModel(
+        in_dim=lam_config.lam_image_channels,
+        model_dim=lam_config.lam_model_dim,
+        latent_dim=lam_config.lam_latent_dim,
+        patch_size=lam_config.lam_patch_size,
+        enc_blocks=lam_config.lam_enc_blocks,
+        dec_blocks=lam_config.lam_dec_blocks,
+        num_heads=lam_config.lam_num_heads,
+        dropout=lam_config.lam_dropout
+    )
+
+    if lam_config.lam_ckpt_path:
+        ckpt_state_dict = torch.load(lam_config.lam_ckpt_path, map_location=torch.device("cpu"))['state_dict']
+        lam_state_dict = {k: v for k, v in ckpt_state_dict.items() if k.startswith("lam.")}
+        lam_weights_compatible = {k.removeprefix('lam.'): v for k, v in lam_state_dict.items()}
+        lam.load_state_dict(lam_weights_compatible)
+        lam.eval()
+        loguru.logger.info("Pretrained LAM is loaded")
+        return lam
+    else:
+        raise ValueError("No pretrained LAM checkpoint provided")
 
 
 class GroupNorm1d(nn.Module):

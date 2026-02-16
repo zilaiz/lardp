@@ -66,7 +66,7 @@ def make_dataset(task_config, mode="train"):
                 val_dataset_percentage=task_config.val_dataset_percentage,
             )
         elif task_config.obs_type == "image":
-            return RobomimicImageDataset(
+            return RobomimicImageREPADataset(
                 dataset_path,
                 horizon=task_config.horizon,
                 shape_meta=task_config.shape_meta,
@@ -77,6 +77,17 @@ def make_dataset(task_config, mode="train"):
                 val_dataset_percentage=task_config.val_dataset_percentage,
                 mode=mode,
             )
+            # return RobomimicImageDataset(
+            #     dataset_path,
+            #     horizon=task_config.horizon,
+            #     shape_meta=task_config.shape_meta,
+            #     n_obs_steps=task_config.obs_steps,
+            #     pad_before=task_config.obs_steps - 1,
+            #     pad_after=task_config.act_steps - 1,
+            #     abs_action=task_config.abs_action,
+            #     val_dataset_percentage=task_config.val_dataset_percentage,
+            #     mode=mode,
+            # )
         else:
             raise ValueError(f"Invalid observation type: {task_config.obs_type}")
     else:
@@ -403,6 +414,149 @@ class RobomimicImageDataset(BaseDataset):
         action = self.normalizer["action"].normalize(action)
 
         torch_data = {
+            "obs": dict_apply(obs_dict, torch.tensor),
+            "action": torch.tensor(action),
+        }
+        return torch_data
+
+    def undo_transform_action(self, action):
+        raw_shape = action.shape
+        if raw_shape[-1] == 20:
+            # dual arm
+            action = action.reshape(-1, 2, 10)
+
+        d_rot = action.shape[-1] - 4
+        pos = action[..., :3]
+        rot = action[..., 3 : 3 + d_rot]
+        gripper = action[..., [-1]]
+        rot = self.rotation_transformer.inverse(rot)
+        uaction = np.concatenate([pos, rot, gripper], axis=-1)
+
+        if raw_shape[-1] == 20:
+            # dual arm
+            uaction = uaction.reshape(*raw_shape[:-1], 14)
+
+        return uaction
+
+
+class RobomimicImageREPADataset(BaseDataset):
+    def __init__(
+        self,
+        dataset_dir,
+        shape_meta: dict,
+        n_obs_steps=None,
+        horizon=1,
+        pad_before=0,
+        pad_after=0,
+        abs_action=False,
+        rotation_rep="rotation_6d",
+        val_dataset_percentage=0.0,
+        mode="train",
+    ):
+        super().__init__()
+        self.rotation_transformer = RotationTransformer(
+            from_rep="axis_angle", to_rep=rotation_rep
+        )
+        self.val_dataset_percentage = val_dataset_percentage
+        self.mode = mode
+
+        self.replay_buffer = _convert_robomimic_to_replay(
+            store=zarr.storage.MemoryStore(),
+            shape_meta=shape_meta,
+            dataset_path=dataset_dir,
+            abs_action=abs_action,
+            rotation_transformer=self.rotation_transformer,
+            val_dataset_percentage=val_dataset_percentage,
+            mode=mode,
+        )
+
+        rgb_keys = []
+        lowdim_keys = []
+        obs_shape_meta = shape_meta["obs"]
+        for key, attr in obs_shape_meta.items():
+            type = attr.get("type", "low_dim")
+            if type == "rgb":
+                rgb_keys.append(key)
+            elif type == "low_dim":
+                lowdim_keys.append(key)
+
+        key_first_k = {}
+        if n_obs_steps is not None:
+            # only take first k obs from images
+            for key in rgb_keys + lowdim_keys:
+                key_first_k[key] = n_obs_steps
+        self.sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer,
+            sequence_length=horizon+1,  # additional obs to compute tgt_act_reps
+            pad_before=pad_before,
+            pad_after=pad_after,
+            key_first_k=key_first_k,
+        )
+
+        self.shape_meta = shape_meta
+        self.rgb_keys = rgb_keys
+        self.lowdim_keys = lowdim_keys
+        self.abs_action = abs_action
+        self.horizon = horizon
+        self.pad_before = pad_before
+        self.pad_after = pad_after
+        self.n_obs_steps = n_obs_steps
+
+        self.normalizer = self.get_normalizer()
+
+    def get_normalizer(self):
+        normalizer = defaultdict(dict)
+        for key in self.lowdim_keys:
+            normalizer["obs"][key] = MinMaxNormalizer(self.replay_buffer[key][:])
+        for key in self.rgb_keys:
+            normalizer["obs"][key] = ImageNormalizer()
+        normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
+
+        return normalizer
+
+    def __str__(self) -> str:
+        return f"Keys: {self.replay_buffer.keys()} Steps: {self.replay_buffer.n_steps} Episodes: {self.replay_buffer.n_episodes}"
+
+    def __len__(self) -> int:
+        return len(self.sampler)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        sample = self.sampler.sample_sequence(idx)
+
+        # obs
+        # to save RAM, only return first n_obs_steps of OBS
+        # since the rest will be discarded anyway.
+        # when self.n_obs_steps is None
+        # this slice does nothing (takes all)
+        T_slice = slice(self.n_obs_steps)
+
+        obs_dict = {}
+        lam_obs_dict = {}
+        for key in self.rgb_keys:
+            # move channel last to channel first
+            # T,H,W,C
+            # convert uint8 image to float32
+            obs_dict[key] = (
+                np.moveaxis(sample[key][T_slice], -1, 1).astype(np.float32) / 255.0
+            )
+            lam_obs_dict[key] = sample[key].astype(np.float32) / 255.0  # T,H,W,C
+            lam_obs_dict[key] = np.stack([np.stack([lam_obs_dict[key][i], lam_obs_dict[key][i+1]], axis=0) for i in range(lam_obs_dict[key].shape[0] - 1)])
+
+            # T,C,H,W
+            del sample[key]
+            obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
+
+        for key in self.lowdim_keys:
+            obs_dict[key] = sample[key][T_slice].astype(np.float32)
+            del sample[key]
+            obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
+
+        # action
+        action = sample["action"].astype(np.float32)
+        action = self.normalizer["action"].normalize(action)
+
+        torch_data = {
+            "lam_obs": dict_apply(lam_obs_dict, torch.tensor),
             "obs": dict_apply(obs_dict, torch.tensor),
             "action": torch.tensor(action),
         }

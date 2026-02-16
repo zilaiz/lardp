@@ -6,7 +6,7 @@ import hydra
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from lam.modules import LatentActionModel
+from modules import LatentActionModel
 from tqdm import tqdm
 
 
