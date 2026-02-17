@@ -45,9 +45,14 @@ def make_dataset(task_config, mode="train"):
             repo_type="dataset",
         )
         logger.info(f"Downloaded dataset to: {dataset_path}")
-    elif hasattr(task_config, "dataset_path"):
+    elif hasattr(task_config, "dataset_path") and not task_config.use_precomputed_lam:
         # Use explicit path if provided
         dataset_path = os.path.expanduser(task_config.dataset_path)
+        logger.info(f"Loading dataset from {dataset_path}")
+    elif hasattr(task_config, "precla_dataset_path") and task_config.use_precomputed_lam:
+        # Use explicit path if provided
+        dataset_path = os.path.expanduser(task_config.precla_dataset_path)
+        logger.info(f"Loading dataset from {dataset_path}")
     else:
         raise ValueError(
             "Either dataset_repo/dataset_filename or dataset_path must be provided"
@@ -66,7 +71,39 @@ def make_dataset(task_config, mode="train"):
                 val_dataset_percentage=task_config.val_dataset_percentage,
             )
         elif task_config.obs_type == "image":
-            return RobomimicImageREPADataset(
+            lam_frame_skips = task_config.lam_frame_skips
+            lam_camera_keys = task_config.lam_camera_keys
+            use_precomputed_lam = task_config.use_precomputed_lam
+            lam_latent_type = task_config.lam_latent_type
+            if lam_latent_type is not None and use_precomputed_lam:
+                return RobomimicImageLAMDataset(
+                    dataset_path,
+                    horizon=task_config.horizon,
+                    shape_meta=task_config.shape_meta,
+                    n_obs_steps=task_config.obs_steps,
+                    pad_before=task_config.obs_steps - 1,
+                    pad_after=task_config.act_steps - 1,
+                    abs_action=task_config.abs_action,
+                    val_dataset_percentage=task_config.val_dataset_percentage,
+                    mode=mode,
+                    lam_frame_skips=lam_frame_skips,
+                    lam_camera_keys=lam_camera_keys,
+                    lam_latent_type=lam_latent_type,
+                )
+            elif lam_latent_type is not None:
+                return RobomimicImageREPADataset(
+                    dataset_path,
+                    horizon=task_config.horizon,
+                    shape_meta=task_config.shape_meta,
+                    n_obs_steps=task_config.obs_steps,
+                    pad_before=task_config.obs_steps - 1,
+                    pad_after=task_config.act_steps - 1,
+                    abs_action=task_config.abs_action,
+                    val_dataset_percentage=task_config.val_dataset_percentage,
+                    mode=mode,
+                    lam_camera_keys=lam_camera_keys,
+                )
+            return RobomimicImageDataset(
                 dataset_path,
                 horizon=task_config.horizon,
                 shape_meta=task_config.shape_meta,
@@ -77,17 +114,6 @@ def make_dataset(task_config, mode="train"):
                 val_dataset_percentage=task_config.val_dataset_percentage,
                 mode=mode,
             )
-            # return RobomimicImageDataset(
-            #     dataset_path,
-            #     horizon=task_config.horizon,
-            #     shape_meta=task_config.shape_meta,
-            #     n_obs_steps=task_config.obs_steps,
-            #     pad_before=task_config.obs_steps - 1,
-            #     pad_after=task_config.act_steps - 1,
-            #     abs_action=task_config.abs_action,
-            #     val_dataset_percentage=task_config.val_dataset_percentage,
-            #     mode=mode,
-            # )
         else:
             raise ValueError(f"Invalid observation type: {task_config.obs_type}")
     else:
@@ -440,6 +466,12 @@ class RobomimicImageDataset(BaseDataset):
 
 
 class RobomimicImageREPADataset(BaseDataset):
+    """Image dataset for on-the-fly LAM inference.
+
+    Returns raw LAM camera images (horizon+1 frames) alongside the standard
+    obs dict so the training loop can run LAM inference on them.
+    """
+
     def __init__(
         self,
         dataset_dir,
@@ -452,6 +484,7 @@ class RobomimicImageREPADataset(BaseDataset):
         rotation_rep="rotation_6d",
         val_dataset_percentage=0.0,
         mode="train",
+        lam_camera_keys=None,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -459,6 +492,7 @@ class RobomimicImageREPADataset(BaseDataset):
         )
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
+        self.lam_camera_keys = lam_camera_keys  # None = all rgb_keys
 
         self.replay_buffer = _convert_robomimic_to_replay(
             store=zarr.storage.MemoryStore(),
@@ -480,14 +514,24 @@ class RobomimicImageREPADataset(BaseDataset):
             elif type == "low_dim":
                 lowdim_keys.append(key)
 
+        # Determine which rgb_keys are used for LAM
+        if self.lam_camera_keys is not None:
+            lam_rgb_keys = [k for k in rgb_keys if k in self.lam_camera_keys]
+        else:
+            lam_rgb_keys = list(rgb_keys)
+        non_lam_rgb_keys = [k for k in rgb_keys if k not in lam_rgb_keys]
+
+        # BUG FIX: Only limit non-LAM keys to n_obs_steps.
+        # LAM camera keys need ALL horizon+1 frames (not just n_obs_steps),
+        # otherwise SequenceSampler fills frames beyond n_obs_steps with NaN.
         key_first_k = {}
         if n_obs_steps is not None:
-            # only take first k obs from images
-            for key in rgb_keys + lowdim_keys:
+            for key in non_lam_rgb_keys + lowdim_keys:
                 key_first_k[key] = n_obs_steps
+
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
-            sequence_length=horizon+1,  # additional obs to compute tgt_act_reps
+            sequence_length=horizon + 1,  # need horizon+1 obs to form horizon action pairs
             pad_before=pad_before,
             pad_after=pad_after,
             key_first_k=key_first_k,
@@ -496,6 +540,7 @@ class RobomimicImageREPADataset(BaseDataset):
         self.shape_meta = shape_meta
         self.rgb_keys = rgb_keys
         self.lowdim_keys = lowdim_keys
+        self.lam_rgb_keys = lam_rgb_keys
         self.abs_action = abs_action
         self.horizon = horizon
         self.pad_before = pad_before
@@ -523,26 +568,19 @@ class RobomimicImageREPADataset(BaseDataset):
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         sample = self.sampler.sample_sequence(idx)
 
-        # obs
-        # to save RAM, only return first n_obs_steps of OBS
-        # since the rest will be discarded anyway.
-        # when self.n_obs_steps is None
-        # this slice does nothing (takes all)
         T_slice = slice(self.n_obs_steps)
 
         obs_dict = {}
-        lam_obs_dict = {}
+        lam_raw_images = {}
         for key in self.rgb_keys:
-            # move channel last to channel first
-            # T,H,W,C
-            # convert uint8 image to float32
+            # For LAM cameras: extract all horizon+1 raw frames as float32/255
+            if key in self.lam_rgb_keys:
+                lam_raw_images[key] = sample[key].astype(np.float32) / 255.0  # (horizon+1, H, W, C)
+
+            # For obs: first n_obs_steps frames, channel-first, normalized
             obs_dict[key] = (
                 np.moveaxis(sample[key][T_slice], -1, 1).astype(np.float32) / 255.0
             )
-            lam_obs_dict[key] = sample[key].astype(np.float32) / 255.0  # T,H,W,C
-            lam_obs_dict[key] = np.stack([np.stack([lam_obs_dict[key][i], lam_obs_dict[key][i+1]], axis=0) for i in range(lam_obs_dict[key].shape[0] - 1)])
-
-            # T,C,H,W
             del sample[key]
             obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
 
@@ -551,14 +589,14 @@ class RobomimicImageREPADataset(BaseDataset):
             del sample[key]
             obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
 
-        # action
-        action = sample["action"].astype(np.float32)
+        # action: slice to horizon (sampler returns horizon+1 length)
+        action = sample["action"][: self.horizon].astype(np.float32)
         action = self.normalizer["action"].normalize(action)
 
         torch_data = {
-            "lam_obs": dict_apply(lam_obs_dict, torch.tensor),
             "obs": dict_apply(obs_dict, torch.tensor),
             "action": torch.tensor(action),
+            "lam_raw_images": dict_apply(lam_raw_images, torch.tensor),
         }
         return torch_data
 
@@ -846,6 +884,379 @@ def _convert_robomimic_to_replay(
                     if not f.result():
                         raise RuntimeError("Failed to encode image!")
                 pbar.update(len(completed))
+
+    replay_buffer = ReplayBuffer(root)
+    return replay_buffer
+
+
+class RobomimicImageLAMDataset(BaseDataset):
+    """Image dataset that loads precomputed LAM latent actions from HDF5.
+
+    Expects the HDF5 to contain precomputed latent actions at:
+        demo_i/latent_actions/fs{k}/{camera_key}          (T, 32)
+        demo_i/latent_actions_prebn/fs{k}/{camera_key}    (T, 1024)  [optional]
+    """
+
+    def __init__(
+        self,
+        dataset_dir,
+        shape_meta: dict,
+        n_obs_steps=None,
+        horizon=1,
+        pad_before=0,
+        pad_after=0,
+        abs_action=False,
+        rotation_rep="rotation_6d",
+        val_dataset_percentage=0.0,
+        mode="train",
+        lam_frame_skips=None,
+        lam_camera_keys=None,
+        lam_latent_type="prebn",
+    ):
+        super().__init__()
+        self.rotation_transformer = RotationTransformer(
+            from_rep="axis_angle", to_rep=rotation_rep
+        )
+        self.val_dataset_percentage = val_dataset_percentage
+        self.mode = mode
+        self.lam_frame_skips = lam_frame_skips or []
+        self.lam_camera_keys = lam_camera_keys
+        self.lam_latent_type = lam_latent_type
+
+        self.replay_buffer = _convert_robomimic_lam_to_replay(
+            store=zarr.storage.MemoryStore(),
+            shape_meta=shape_meta,
+            dataset_path=dataset_dir,
+            abs_action=abs_action,
+            rotation_transformer=self.rotation_transformer,
+            val_dataset_percentage=val_dataset_percentage,
+            mode=mode,
+            lam_frame_skips=self.lam_frame_skips,
+            lam_camera_keys=self.lam_camera_keys,
+            lam_latent_type=self.lam_latent_type,
+        )
+
+        rgb_keys = []
+        lowdim_keys = []
+        obs_shape_meta = shape_meta["obs"]
+        for key, attr in obs_shape_meta.items():
+            type = attr.get("type", "low_dim")
+            if type == "rgb":
+                rgb_keys.append(key)
+            elif type == "low_dim":
+                lowdim_keys.append(key)
+
+        # Build latent action keys explicitly from config
+        effective_cam_keys = self.lam_camera_keys or rgb_keys
+        prefix = "latent_action_prebn" if lam_latent_type == "prebn" else "latent_action"
+        self.latent_action_keys = []
+        for cam in effective_cam_keys:
+            for fs in self.lam_frame_skips:
+                key = f"{prefix}_fs{fs}_{cam}"
+                if key in self.replay_buffer:
+                    self.latent_action_keys.append(key)
+
+        key_first_k = {}
+        if n_obs_steps is not None:
+            for key in rgb_keys + lowdim_keys:
+                key_first_k[key] = n_obs_steps
+        self.sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer,
+            sequence_length=horizon,
+            pad_before=pad_before,
+            pad_after=pad_after,
+            key_first_k=key_first_k,
+        )
+
+        self.shape_meta = shape_meta
+        self.rgb_keys = rgb_keys
+        self.lowdim_keys = lowdim_keys
+        self.abs_action = abs_action
+        self.horizon = horizon
+        self.pad_before = pad_before
+        self.pad_after = pad_after
+        self.n_obs_steps = n_obs_steps
+
+        self.normalizer = self.get_normalizer()
+
+    def get_normalizer(self):
+        normalizer = defaultdict(dict)
+        for key in self.lowdim_keys:
+            normalizer["obs"][key] = MinMaxNormalizer(self.replay_buffer[key][:])
+        for key in self.rgb_keys:
+            normalizer["obs"][key] = ImageNormalizer()
+        normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
+        return normalizer
+
+    def __str__(self) -> str:
+        return (
+            f"Keys: {self.replay_buffer.keys()} "
+            f"Steps: {self.replay_buffer.n_steps} "
+            f"Episodes: {self.replay_buffer.n_episodes}"
+        )
+
+    def __len__(self) -> int:
+        return len(self.sampler)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        sample = self.sampler.sample_sequence(idx)
+
+        T_slice = slice(self.n_obs_steps)
+
+        obs_dict = {}
+        for key in self.rgb_keys:
+            obs_dict[key] = (
+                np.moveaxis(sample[key][T_slice], -1, 1).astype(np.float32) / 255.0
+            )
+            del sample[key]
+            obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
+
+        for key in self.lowdim_keys:
+            obs_dict[key] = sample[key][T_slice].astype(np.float32)
+            del sample[key]
+            obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
+
+        action = sample["action"].astype(np.float32)
+        action = self.normalizer["action"].normalize(action)
+
+        # Build latent action dict (single type selected by lam_latent_type)
+        latent_actions = {}
+        for key in self.latent_action_keys:
+            latent_actions[key] = sample[key].astype(np.float32)
+
+        torch_data = {
+            "obs": dict_apply(obs_dict, torch.tensor),
+            "action": torch.tensor(action),
+            "latent_actions": dict_apply(latent_actions, torch.tensor),
+        }
+        return torch_data
+
+    def undo_transform_action(self, action):
+        raw_shape = action.shape
+        if raw_shape[-1] == 20:
+            action = action.reshape(-1, 2, 10)
+
+        d_rot = action.shape[-1] - 4
+        pos = action[..., :3]
+        rot = action[..., 3 : 3 + d_rot]
+        gripper = action[..., [-1]]
+        rot = self.rotation_transformer.inverse(rot)
+        uaction = np.concatenate([pos, rot, gripper], axis=-1)
+
+        if raw_shape[-1] == 20:
+            uaction = uaction.reshape(*raw_shape[:-1], 14)
+
+        return uaction
+
+
+def _convert_robomimic_lam_to_replay(
+    store,
+    shape_meta,
+    dataset_path,
+    abs_action,
+    rotation_transformer,
+    lam_frame_skips,
+    lam_camera_keys=None,
+    lam_latent_type="prebn",
+    n_workers=None,
+    max_inflight_tasks=None,
+    val_dataset_percentage=0.0,
+    mode="train",
+):
+    """Convert Robomimic dataset with precomputed LAM latent actions to ReplayBuffer.
+
+    Extends _convert_robomimic_to_replay by also loading latent action data from
+    demo_i/latent_actions/fs{k}/{camera_key} in the HDF5.
+    """
+    assert lam_latent_type in ("prebn", "bn"), f"Invalid lam_latent_type: {lam_latent_type}"
+    import multiprocessing
+
+    if n_workers is None:
+        n_workers = multiprocessing.cpu_count()
+    if max_inflight_tasks is None:
+        max_inflight_tasks = n_workers * 5
+
+    # parse shape_meta
+    rgb_keys = []
+    lowdim_keys = []
+    obs_shape_meta = shape_meta["obs"]
+    for key, attr in obs_shape_meta.items():
+        shape = attr["shape"]
+        type = attr.get("type", "low_dim")
+        if type == "rgb":
+            rgb_keys.append(key)
+        elif type == "low_dim":
+            lowdim_keys.append(key)
+
+    # create zarr group
+    root = zarr.group(store)
+    data_group = root.require_group("data", overwrite=True)
+    meta_group = root.require_group("meta", overwrite=True)
+
+    with h5py.File(dataset_path) as file:
+        # count total steps
+        demos = file["data"]
+        total_demos = len(demos)
+
+        # Calculate split indices
+        if val_dataset_percentage > 0.0:
+            val_count = int(total_demos * val_dataset_percentage)
+            train_count = total_demos - val_count
+            if mode == "train":
+                demo_indices = list(range(train_count))
+            elif mode == "val":
+                demo_indices = list(range(train_count, total_demos))
+            else:
+                raise ValueError(f"Invalid mode: {mode}. Must be 'train' or 'val'")
+        else:
+            demo_indices = list(range(total_demos))
+
+        episode_ends = []
+        prev_end = 0
+        for i in demo_indices:
+            demo = demos[f"demo_{i}"]
+            episode_length = demo["actions"].shape[0]
+            episode_end = prev_end + episode_length
+            prev_end = episode_end
+            episode_ends.append(episode_end)
+        n_steps = episode_ends[-1] if episode_ends else 0
+        episode_starts = [0] + episode_ends[:-1]
+        _ = meta_group.create_array(
+            name="episode_ends",
+            data=np.array(episode_ends, dtype=np.int64),
+            compressor=None,
+            overwrite=True,
+        )
+
+        # save lowdim data
+        for key in tqdm(lowdim_keys + ["action"], desc=f"Loading {mode} lowdim data"):
+            data_key = "obs/" + key
+            if key == "action":
+                data_key = "actions"
+            this_data = []
+            for i in demo_indices:
+                demo = demos[f"demo_{i}"]
+                this_data.append(demo[data_key][:].astype(np.float32))
+            this_data = np.concatenate(this_data, axis=0) if this_data else np.array([])
+            if key == "action":
+                this_data = _convert_actions(
+                    raw_actions=this_data,
+                    abs_action=abs_action,
+                    rotation_transformer=rotation_transformer,
+                )
+                assert this_data.shape == (n_steps,) + tuple(
+                    shape_meta["action"]["shape"]
+                )
+            else:
+                assert this_data.shape == (n_steps,) + tuple(
+                    shape_meta["obs"][key]["shape"]
+                )
+            _ = data_group.create_array(
+                name=key,
+                data=this_data,
+                chunks=this_data.shape,
+                compressor=None,
+                overwrite=True,
+            )
+
+        # save image data
+        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx):
+            try:
+                zarr_arr[zarr_idx] = hdf5_arr[hdf5_idx]
+                _ = zarr_arr[zarr_idx]
+                return True
+            except Exception:
+                return False
+
+        with tqdm(
+            total=n_steps * len(rgb_keys),
+            desc=f"Loading {mode} image data",
+            mininterval=1.0,
+        ) as pbar:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=n_workers
+            ) as executor:
+                futures = set()
+                for key in rgb_keys:
+                    data_key = "obs/" + key
+                    shape = tuple(shape_meta["obs"][key]["shape"])
+                    c, h, w = shape
+                    img_arr = data_group.require_dataset(
+                        name=key,
+                        shape=(n_steps, h, w, c),
+                        chunks=(1, h, w, c),
+                        compressor=None,
+                        dtype=np.uint8,
+                    )
+                    for demo_list_idx, episode_idx in enumerate(demo_indices):
+                        demo = demos[f"demo_{episode_idx}"]
+                        hdf5_arr = demo["obs"][key]
+                        for hdf5_idx in range(hdf5_arr.shape[0]):
+                            if len(futures) >= max_inflight_tasks:
+                                completed, futures = concurrent.futures.wait(
+                                    futures,
+                                    return_when=concurrent.futures.FIRST_COMPLETED,
+                                )
+                                for f in completed:
+                                    if not f.result():
+                                        raise RuntimeError("Failed to encode image!")
+                                pbar.update(len(completed))
+
+                            zarr_idx = episode_starts[demo_list_idx] + hdf5_idx
+                            futures.add(
+                                executor.submit(
+                                    img_copy, img_arr, zarr_idx, hdf5_arr, hdf5_idx
+                                )
+                            )
+                completed, futures = concurrent.futures.wait(futures)
+                for f in completed:
+                    if not f.result():
+                        raise RuntimeError("Failed to encode image!")
+                pbar.update(len(completed))
+
+        # Auto-detect LAM camera keys if not provided
+        if lam_camera_keys is None:
+            # Discover from the HDF5 group matching the requested latent type
+            first_demo = demos[f"demo_{demo_indices[0]}"]
+            hdf5_group = "latent_actions_prebn" if lam_latent_type == "prebn" else "latent_actions"
+            if hdf5_group in first_demo:
+                # Get camera keys from first available frame_skip
+                first_fs_key = list(first_demo[hdf5_group].keys())[0]
+                lam_camera_keys = sorted(first_demo[hdf5_group][first_fs_key].keys())
+            else:
+                lam_camera_keys = []
+
+        # Load precomputed latent action data
+        for fs in lam_frame_skips:
+            for cam_key in lam_camera_keys:
+                if lam_latent_type == "prebn":
+                    zarr_key = f"latent_action_prebn_fs{fs}_{cam_key}"
+                    hdf5_path = f"latent_actions_prebn/fs{fs}/{cam_key}"
+                else:
+                    zarr_key = f"latent_action_fs{fs}_{cam_key}"
+                    hdf5_path = f"latent_actions/fs{fs}/{cam_key}"
+
+                la_data = []
+                for i in demo_indices:
+                    demo = demos[f"demo_{i}"]
+                    if hdf5_path in demo:
+                        la_data.append(demo[hdf5_path][:].astype(np.float32))
+                    else:
+                        raise KeyError(
+                            f"Missing precomputed latent actions at data/demo_{i}/{hdf5_path}. "
+                            f"Run mip/networks/lam/precompute_lam.py first."
+                        )
+                la_data = np.concatenate(la_data, axis=0)
+                assert la_data.shape[0] == n_steps, (
+                    f"Latent action steps mismatch: {la_data.shape[0]} vs {n_steps}"
+                )
+                _ = data_group.create_array(
+                    name=zarr_key,
+                    data=la_data,
+                    chunks=la_data.shape,
+                    compressor=None,
+                    overwrite=True,
+                )
 
     replay_buffer = ReplayBuffer(root)
     return replay_buffer

@@ -48,7 +48,10 @@ class TrainingAgentREPA:
         self.flow_map_ema = deepcopy(self.flow_map).requires_grad_(False)
 
         # REPA specific
-        self.lam = get_lam(config.lam).to(config.optimization.device)
+        if config.task.lam_latent_type is not None and not config.task.use_precomputed_lam:
+            self.lam = get_lam(config.lam).to(config.optimization.device)
+        else:
+            self.lam = None  # Not needed — either no LAM or targets come from HDF5
         self.repa_scale = config.optimization.repa_scale
 
         # Create detached models for CUDA graphs (if enabled)

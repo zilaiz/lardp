@@ -53,21 +53,14 @@ def get_loss_fn(loss_type: str) -> Callable:
         raise NotImplementedError(f"Loss type {loss_type} not implemented.")
 
 
-def mean_flat(x):
-    """Take the mean over all non-batch dimensions."""
-    return torch.mean(x, dim=list(range(1, len(x.size()))))
-
-
 def repa_loss(zs_tilde, tgt_act_reps):
     proj_loss = 0.
-    bsz = tgt_act_reps[0].shape[0]
-    for i, (z, z_tilde) in enumerate(zip(tgt_act_reps, zs_tilde, strict=False)):
+    for z, z_tilde in zip(tgt_act_reps, zs_tilde, strict=False):
         assert z.shape == z_tilde.shape
-        for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde, strict=False)):
-            z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1)
-            z_j = torch.nn.functional.normalize(z_j, dim=-1)
-            proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
-    proj_loss /= (len(tgt_act_reps) * bsz)
+        z = F.normalize(z, dim=-1)
+        z_tilde = F.normalize(z_tilde, dim=-1)
+        proj_loss += -(z * z_tilde).sum(dim=-1).mean()
+    proj_loss /= len(tgt_act_reps)
     return proj_loss
 
 

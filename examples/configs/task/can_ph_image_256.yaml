@@ -15,6 +15,7 @@ env_type: "ph"
 # dataset_filename: "v1.5/can/ph/demo_v15.hdf5"
 
 dataset_path: "data/robomimic/can/ph/image_v15_256.hdf5"
+precla_dataset_path: "data/robomimic/can/ph/image_v15_lam_256.hdf5"
 
 max_episode_steps: 400
 render_obs_key: "agentview_image"

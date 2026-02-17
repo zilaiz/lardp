@@ -53,8 +53,6 @@ class LatentActionModel(nn.Module):
             dropout=dropout
         )
 
-        self.mu_record = None
-
     def encode(self, videos: Tensor) -> dict:
         # Preprocess videos
         B, T = videos.shape[:2]
@@ -77,12 +75,6 @@ class LatentActionModel(nn.Module):
         else:
             z_rep = z_mu + torch.randn_like(z_var) * torch.exp(0.5 * z_var)
         z_rep = z_rep.reshape(B, T - 1, 1, self.latent_dim)
-
-        if not self.training:
-            if self.mu_record is None:
-                self.mu_record = z_mu
-            else:
-                self.mu_record = torch.cat([self.mu_record, z_mu], dim=0)
 
         return {
             "patches": patches,

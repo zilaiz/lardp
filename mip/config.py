@@ -127,6 +127,11 @@ class TaskConfig:
     random_crop: bool = True
     use_group_norm: bool = True
     use_seq: bool = True
+    # LAM precomputed latent actions
+    lam_frame_skips: list[int] | None = None  # e.g., [1, 8]; None = no LAM
+    lam_camera_keys: list[str] | None = None  # e.g., ["agentview_image"]; None = auto-detect from HDF5
+    use_precomputed_lam: bool = False  # True = load from HDF5, False = on-the-fly LAM inference
+    lam_latent_type: str | None = None  # None = no LAM; "prebn" or "bn" = enable
 
 @dataclass
 class LAMConfig:

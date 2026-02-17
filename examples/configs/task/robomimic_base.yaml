@@ -24,3 +24,9 @@ crop_shape:
 random_crop: true
 use_group_norm: true
 use_seq: true
+
+# REPA specific settings
+lam_frame_skips: [1]
+lam_camera_keys: null
+use_precomputed_lam: false
+lam_latent_type: null

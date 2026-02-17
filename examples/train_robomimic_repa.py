@@ -49,6 +49,68 @@ def timed(section: str, record_dict: dict):
     record_dict[section].append(time.perf_counter() - start)
 
 
+def compute_lam_targets(lam, lam_raw_images, frame_skips, horizon, device, lam_latent_type="prebn"):
+    """Build frame pairs per frame_skip, run LAM, expand to horizon.
+
+    Args:
+        lam: LAM model (in eval mode)
+        lam_raw_images: dict of cam_key -> (B, horizon+1, H, W, C) float32
+        frame_skips: list of ints, e.g. [1, 8]
+        horizon: int, e.g. 10
+        device: torch device
+        lam_latent_type: "prebn" (z_rep_prebn, 1024-dim) or "bn" (z_mu, 32-dim)
+
+    Returns:
+        (B, N, horizon, z_dim) tensor where N = len(frame_skips) * len(cameras)
+    """
+    assert lam_latent_type in ("prebn", "bn"), f"Invalid lam_latent_type: {lam_latent_type}"
+    _lam_output_key = {"prebn": "z_rep_prebn", "bn": "z_mu"}
+    lam_key = _lam_output_key[lam_latent_type]
+
+    all_reps = []
+    T = horizon + 1
+    with torch.no_grad():
+        for cam_key, raw_imgs in lam_raw_images.items():
+            # raw_imgs: (B, horizon+1, H, W, C)
+            B = raw_imgs.shape[0]
+            for fs in frame_skips:
+                # Subsample indices within [0, T-1]
+                indices = list(range(0, T, fs))
+                if indices[-1] != T - 1:
+                    indices.append(T - 1)
+
+                # Build pairs from consecutive subsampled indices
+                num_pairs = len(indices) - 1
+
+                # Build video tensor: (num_pairs * B, 2, H, W, C)
+                pair_videos = []
+                for i in range(num_pairs):
+                    a, b = indices[i], indices[i + 1]
+                    pair_videos.append(
+                        torch.stack([raw_imgs[:, a], raw_imgs[:, b]], dim=1)
+                    )
+                pair_videos = torch.cat(pair_videos, dim=0).to(device)
+
+                # Run LAM encode
+                enc_out = lam.encode(pair_videos)
+                z = enc_out[lam_key]  # (num_pairs * B, z_dim)
+                z = z.reshape(num_pairs, B, -1).permute(1, 0, 2)  # (B, num_pairs, z_dim)
+
+                # Expand: repeat each latent fs times, pad/truncate to horizon
+                z_expanded = z.repeat_interleave(fs, dim=1)
+                if z_expanded.shape[1] < horizon:
+                    pad = z_expanded[:, -1:].expand(
+                        -1, horizon - z_expanded.shape[1], -1
+                    )
+                    z_expanded = torch.cat([z_expanded, pad], dim=1)
+                z_expanded = z_expanded[:, :horizon]  # (B, horizon, z_dim)
+
+                all_reps.append(z_expanded)
+
+    # (B, N, horizon, z_dim) where N = len(cameras) * len(frame_skips)
+    return torch.stack(all_reps, dim=1)
+
+
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):
     """Standalone training function.
 
@@ -60,6 +122,10 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         logger: Logger for metrics
         resume_state: Optional dict with training state to resume from
     """
+    assert config.task.lam_latent_type is not None, (
+        "REPA training requires lam_latent_type to be set (e.g. 'prebn' or 'bn')"
+    )
+
     # dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -137,27 +203,34 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     batch_size = next(iter(obs_dict.values())).shape[0]
                     obs = TensorDict(obs_dict, batch_size=batch_size)
 
-                    lam_obs_batch = batch["lam_obs"]  # NOTE: can involve multiple camera views
+                    if config.task.lam_latent_type is not None:
+                        if config.task.use_precomputed_lam:
+                            # Precomputed path: dense per-timestep LAM inference from HDF5.
+                            # Each timestep has a unique sliding-window latent action.
+                            la_list = [
+                                v.to(config.optimization.device)
+                                for v in batch["latent_actions"].values()
+                            ]
+                            tgt_act_reps = torch.stack(la_list, dim=1)  # (B, N, horizon, z_dim)
+                        else:
+                            # On-the-fly path: sparse frame pairs with repeat_interleave
+                            # expansion — multiple timesteps share the same latent action.
+                            tgt_act_reps = compute_lam_targets(
+                                agent.lam,
+                                batch["lam_raw_images"],
+                                config.task.lam_frame_skips,
+                                config.task.horizon,
+                                config.optimization.device,
+                                lam_latent_type=config.task.lam_latent_type,
+                            )  # (B, N, horizon, z_dim)
 
-                    tgt_act_reps = []
-                    aligned_obs_keys = []
-                    with torch.no_grad():
-                        for obs_key, lam_obs_batch_view in lam_obs_batch.items():
-                            # lam_obs_batch_view B, Ta, 2, H, W, C
-                            B, Ta = lam_obs_batch_view.shape[:2]
-                            lam_input = {"videos": lam_obs_batch_view.reshape(-1, *lam_obs_batch_view.shape[2:]).to(config.optimization.device)}
-                            tgt_act_reps.append(agent.lam(lam_input)["z_rep_prebn"].reshape(B, Ta, -1))
-                            aligned_obs_keys.append(obs_key)
-                    tgt_act_reps = torch.stack(tgt_act_reps[:len(config.network.z_dims)], dim=0).permute(1, 0, 2, 3) # B, N, Ta, z_dim
-                    # loguru.logger.info(f"REPA config - Aligned obs keys: {aligned_obs_keys[:len(config.network.z_dims)]}")
-
+                        # Limit N to the number of z_dims configured for REPA alignment
+                        tgt_act_reps = tgt_act_reps[:, : len(config.network.z_dims)]
+                    else:
+                        raise ValueError("lam_latent_type is None")
 
                 elif config.task.obs_type == "state":
                     raise ValueError("obs_type is not image")
-                    # obs = batch["obs"]["state"].to(config.optimization.device)
-                    # obs = obs[
-                    #     :, : config.task.obs_steps, :
-                    # ]  # (B, obs_horizon, obs_dim)
                 act = batch["action"].to(config.optimization.device)
                 act = act[:, : config.task.horizon, :]  # (B, horizon, act_dim)
 

@@ -109,7 +109,6 @@ ignore = [
     "SIM105", # Use contextlib.suppress instead of try-except-pass
     "SIM117", # Multiple with statements
     "UP007",  # Non-PEP604 annotation union
-    "UP038",  # Use X | Y in isinstance call instead of (X, Y)
 ]
 
 [tool.ruff.format]
