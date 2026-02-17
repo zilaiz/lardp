@@ -62,6 +62,7 @@ def repa_loss(zs_tilde, tgt_act_reps):
     proj_loss = 0.
     bsz = tgt_act_reps[0].shape[0]
     for i, (z, z_tilde) in enumerate(zip(tgt_act_reps, zs_tilde, strict=False)):
+        assert z.shape == z_tilde.shape
         for j, (z_j, z_tilde_j) in enumerate(zip(z, z_tilde, strict=False)):
             z_tilde_j = torch.nn.functional.normalize(z_tilde_j, dim=-1)
             z_j = torch.nn.functional.normalize(z_j, dim=-1)
