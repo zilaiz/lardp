@@ -137,7 +137,7 @@ def flow_repa_loss(
     # predict
     act_t = interp.calc_It(t, act_0, act_1)
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
-    b_t, zs_tilde = flow_map.get_velocity(t, act_t, obs_emb)
+    b_t, zs_tilde = flow_map.get_velocity_repa(t, act_t, obs_emb)
 
     # compute loss
     loss = get_norm(b_t - act_t_dot, config.norm_type)

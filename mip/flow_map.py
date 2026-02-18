@@ -171,10 +171,12 @@ class FlowMap(nn.Module):
         """Get the velocity field of the flow."""
         net_output = self.net(xs, t, t, label)
         bt = net_output[0]
-        if len(net_output) > 2:
-            zs_tilde = net_output[2]
-            return bt, zs_tilde
         return bt
+
+    def get_velocity_repa(self, t, xs, label):
+        """Get the velocity field of the flow, along with the hidden states."""
+        bt, _, zs_tilde = self.net(xs, t, t, label)
+        return bt, zs_tilde
 
     def get_reference_velocity(self, t, xs, label):
         """Get the velocity field of the reference net."""
