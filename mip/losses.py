@@ -31,6 +31,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_loss
     elif loss_type == "flow_repa":
         return flow_repa_loss
+    elif loss_type == "flow_reg":
+        return flow_reg_loss
     elif loss_type == "regression":
         return regression_loss
     elif loss_type == "tsd":
@@ -144,7 +146,65 @@ def flow_repa_loss(
     loss = config.loss_scale * torch.mean(loss)
 
     projection_loss = repa_loss(zs_tilde, tgt_act_reps)
+    projection_loss *= config.repa_scale
     return loss, projection_loss, {}
+
+
+def flow_reg_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+    cls_token: torch.Tensor,
+    tgt_act_reps: torch.Tensor,
+) -> float:
+    """Flow model loss, matching the velocity field.
+
+    Args:
+        flow_map (FlowMap): the flow map
+        interp (Interpolant): the interpolant
+        obs (torch.Tensor): the target state
+        obs (torch.Tensor): the label
+        cls_token (torch.Tensor): the cls token
+        delta_t (torch.Tensor): the time step difference, used for flow map / shortcut model / consistency training only.
+        tgt_act_reps (torch.Tensor): target action representations
+
+    Returns:
+        float: the loss
+    """
+    # sample - use empty+uniform_/normal_ for CUDA graph compatibility
+    t = torch.empty_like(delta_t).uniform_(0, 1)
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    cls_0 = torch.empty_like(cls_token[:, 0]).normal_(0, 1)
+    cls_1 = cls_token[:, 0]
+
+    # get condition
+    obs_emb = encoder(obs, None)
+
+    # predict
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+
+    cls_t = interp.calc_It(t, cls_0, cls_1)
+    cls_t_dot = interp.calc_It_dot(t, cls_0, cls_1)
+
+    b_t, zs_tilde, b_t_cls = flow_map.get_velocity_reg(t, act_t, obs_emb, cls_t)
+
+    # compute loss
+    loss = get_norm(b_t - act_t_dot, config.norm_type)
+    loss = config.loss_scale * torch.mean(loss)
+
+    cls_loss = get_norm(b_t_cls - cls_t_dot, config.norm_type)
+    cls_loss = config.cls_loss_scale * torch.mean(cls_loss)
+
+    projection_loss = repa_loss(zs_tilde, torch.cat([cls_token.transpose(0, 1), tgt_act_reps], dim=2))
+    projection_loss *= config.repa_scale
+    return loss, projection_loss, cls_loss, {}
 
 
 def regression_loss(

@@ -14,7 +14,7 @@ from mip.torch_utils import at_least_ndim
 
 
 def get_default_step_list(loss_type: str):
-    if loss_type in ["flow", "flow_repa", "ctm", "lmd", "psd", "lsd", "esd", "mf"]:
+    if loss_type in ["flow", "flow_repa", "flow_reg", "ctm", "lmd", "psd", "lsd", "esd", "mf"]:
         return 3 ** np.arange(2, -1, -1)
     elif loss_type in ["regression", "mip", "tsd"]:
         return [1]
@@ -23,8 +23,10 @@ def get_default_step_list(loss_type: str):
 
 
 def get_sampler(loss_type: str):
-    if loss_type == "flow" or loss_type == "flow_repa":
+    if loss_type in {"flow", "flow_repa"}:
         return ode_sampler
+    elif loss_type == "flow_reg":
+        return ode_reg_sampler
     elif loss_type == "regression":
         return regression_sampler
     elif loss_type in ["tsd", "mip"]:
@@ -60,6 +62,39 @@ def ode_sampler(
         s_expanded = at_least_ndim(s, act_s.dim())
         t_expanded = at_least_ndim(t, act_s.dim())
         act_s = act_s + b_s * (t_expanded - s_expanded)
+    act = act_s
+    return act
+
+
+def ode_reg_sampler(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    act_0: torch.Tensor,
+    obs: torch.Tensor,
+    cls_token_0: torch.Tensor,
+):
+    num_steps = config.num_steps
+    sample_mode = config.sample_mode
+    t_schedule = np.linspace(0, 1, num_steps + 1)
+    if sample_mode == "stochastic":
+        act_s = torch.randn_like(act_0, device=act_0.device)
+        cls_token_s = torch.rand_like(cls_token_0, device=cls_token_0.device)
+    else:
+        act_s = torch.zeros_like(act_0, device=act_0.device)
+        cls_token_s = torch.zeros_like(cls_token_0, device=cls_token_0.device)
+    obs_emb = encoder(obs, None)
+    bs = act_0.shape[0]
+    for i in range(num_steps):
+        s_val = t_schedule[i]
+        t_val = t_schedule[i + 1]
+        s = torch.full((bs,), s_val, device=act_0.device)
+        t = torch.full((bs,), t_val, device=act_0.device)
+        b_s, _, b_s_cls = flow_map.get_velocity_reg(s, act_s, obs_emb, cls_token_s)
+        s_expanded = at_least_ndim(s, act_s.dim())
+        t_expanded = at_least_ndim(t, act_s.dim())
+        act_s = act_s + b_s * (t_expanded - s_expanded)
+        cls_token_s = cls_token_s + b_s_cls * (t_expanded - s_expanded)
     act = act_s
     return act
 

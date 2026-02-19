@@ -20,6 +20,7 @@ class OptimizationConfig:
     seed: int = 0
     loss_type: str = "flow"
     loss_scale: float = 100.0
+    cls_loss_scale: float = 0.03
     repa_scale: float = 0.0 # REPA loss coefficient
     norm_type: str = "l2"
     lr: float = 1e-4

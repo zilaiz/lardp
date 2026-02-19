@@ -931,7 +931,7 @@ class RobomimicImageLAMDataset(BaseDataset):
             rotation_transformer=self.rotation_transformer,
             val_dataset_percentage=val_dataset_percentage,
             mode=mode,
-            lam_frame_skips=self.lam_frame_skips,
+            lam_frame_skips=self.lam_frame_skips + [horizon],
             lam_camera_keys=self.lam_camera_keys,
             lam_latent_type=self.lam_latent_type,
         )
@@ -950,11 +950,16 @@ class RobomimicImageLAMDataset(BaseDataset):
         effective_cam_keys = self.lam_camera_keys or rgb_keys
         prefix = "latent_action_prebn" if lam_latent_type == "prebn" else "latent_action"
         self.latent_action_keys = []
+        assert len(self.lam_frame_skips) == 1 # TODO: haven't fully supported alignment with multiple frame skips yet
         for cam in effective_cam_keys:
             for fs in self.lam_frame_skips:
                 key = f"{prefix}_fs{fs}_{cam}"
                 if key in self.replay_buffer:
                     self.latent_action_keys.append(key)
+
+        self.cls_keys = []
+        for cam in effective_cam_keys:
+            self.cls_keys.append(f"{prefix}_fs{horizon}_{cam}")
 
         key_first_k = {}
         if n_obs_steps is not None:
@@ -1024,10 +1029,15 @@ class RobomimicImageLAMDataset(BaseDataset):
         for key in self.latent_action_keys:
             latent_actions[key] = sample[key].astype(np.float32)
 
+        cls_tokens = {}
+        for key in self.cls_keys:
+            cls_tokens[key] = sample[key][:1].astype(np.float32)
+
         torch_data = {
             "obs": dict_apply(obs_dict, torch.tensor),
             "action": torch.tensor(action),
             "latent_actions": dict_apply(latent_actions, torch.tensor),
+            "cls_tokens": dict_apply(cls_tokens, torch.tensor),
         }
         return torch_data
 

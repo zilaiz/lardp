@@ -178,6 +178,11 @@ class FlowMap(nn.Module):
         bt, _, zs_tilde = self.net(xs, t, t, label)
         return bt, zs_tilde
 
+    def get_velocity_reg(self, t, xs, label, cls_token):
+        """Get the velocity field of the flow and the cls token, along with the hidden states."""
+        bt, _, zs_tilde, bt_cls = self.net(xs, t, t, label, cls_token)
+        return bt, zs_tilde, bt_cls
+
     def get_reference_velocity(self, t, xs, label):
         """Get the velocity field of the reference net."""
         bt, _ = self.reference_net(xs, t, t, label)

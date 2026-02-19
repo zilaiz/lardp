@@ -19,7 +19,7 @@ from mip.samplers import get_sampler
 from mip.torch_utils import report_parameters
 
 
-class TrainingAgentREPA:
+class TrainingAgentREG:
     """Training agent for behavior cloning with flow matching."""
 
     def __init__(
@@ -219,10 +219,11 @@ class TrainingAgentREPA:
             act = data["act"]
             obs = data["obs"]
             delta_t = data["delta_t"]
+            cls_tokens = data["cls_tokens"]
             tgt_act_reps = data["tgt_act_reps"]
 
             # Forward pass and compute loss
-            dp_loss, projection_loss, _info = self.loss_fn(
+            dp_loss, projection_loss, dp_cls_loss, _info = self.loss_fn(
                 self.config.optimization,
                 self.flow_map,
                 self.encoder,
@@ -230,10 +231,11 @@ class TrainingAgentREPA:
                 act,
                 obs,
                 delta_t,
+                cls_tokens,
                 tgt_act_reps.permute(1, 0, 2, 3), # N, B, T, z_dim
             )
 
-            loss = dp_loss + projection_loss
+            loss = dp_loss + dp_cls_loss + projection_loss
 
             # Backward pass
             loss.backward()
@@ -259,6 +261,7 @@ class TrainingAgentREPA:
             result = TensorDict(
                 {
                     "dp_loss": dp_loss.detach(),
+                    "dp_cls_loss": dp_cls_loss.detach(),
                     "repa_loss": projection_loss.detach(),
                     "loss": loss.detach(),
                     "grad_norm": grad_norm.detach(),
@@ -286,6 +289,7 @@ class TrainingAgentREPA:
         act: torch.Tensor,
         obs: torch.Tensor | dict | TensorDict,
         delta_t: torch.Tensor,
+        cls_tokens: torch.Tensor,
         tgt_act_reps: torch.Tensor
     ):
         """Update the model parameters with a training batch.
@@ -320,6 +324,7 @@ class TrainingAgentREPA:
                 "act": act,
                 "obs": obs,  # obs can be dict or tensor - TensorDict will handle it
                 "delta_t": delta_t,
+                "cls_tokens": cls_tokens,
                 "tgt_act_reps": tgt_act_reps,
 
             },
@@ -330,6 +335,7 @@ class TrainingAgentREPA:
         # Convert TensorDict to regular dict with scalar values
         return {
             "dp_loss": result["dp_loss"],
+            "dp_cls_loss": result["dp_cls_loss"],
             "repa_loss": result["repa_loss"],
             "loss": result["loss"],
             "grad_norm": result["grad_norm"],
@@ -354,6 +360,7 @@ class TrainingAgentREPA:
         encoder,
         act_0: torch.Tensor,
         obs: torch.Tensor,
+        cls_token: torch.Tensor = None,
     ):
         """Internal sampling implementation (can be compiled).
 
@@ -367,12 +374,13 @@ class TrainingAgentREPA:
         Returns:
             Sampled action tensor
         """
-        return self.sampler(config, flow_map, encoder, act_0, obs)
+        return self.sampler(config, flow_map, encoder, act_0, obs, cls_token)
 
     def sample(
         self,
         act_0: torch.Tensor,
         obs: torch.Tensor,
+        cls_token_0: torch.Tensor,
         num_steps: int = -1,
         use_ema: bool = True,
     ):
@@ -381,6 +389,7 @@ class TrainingAgentREPA:
         Args:
             act_0: Initial action tensor of shape (batch_size, Ta, act_dim)
             obs: Observation tensor of shape (batch_size, To, obs_dim)
+            cls_token_0: cls token tensor of shape (batch_size, 1, z_dim)
             num_steps: Number of sampling steps (default: use config value)
             use_ema: Whether to use EMA parameters for sampling
 
@@ -417,9 +426,9 @@ class TrainingAgentREPA:
             # For regular mode, we temporarily switch to eval mode
             if not self.use_cudagraphs:
                 with self._inference_mode():
-                    act = self._compiled_sampler(config, flow_map, encoder, act_0, obs)
+                    act = self._compiled_sampler(config, flow_map, encoder, act_0, obs, cls_token_0)
             else:
-                act = self._compiled_sampler(config, flow_map, encoder, act_0, obs)
+                act = self._compiled_sampler(config, flow_map, encoder, act_0, obs, cls_token_0)
         return act
 
     def save(self, path: str, training_state: dict = None):

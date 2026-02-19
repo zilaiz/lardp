@@ -25,6 +25,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
+    from mip.networks.sudeepdit_reg import SudeepDiTREG
     from mip.networks.sudeepdit_repa import SudeepDiTREPA
 
     network_class = {
@@ -37,6 +38,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "vanilla_rnn": VanillaRNN,
         "sudeepdit": SudeepDiT,
         "sudeepdit_repa": SudeepDiTREPA,
+        "sudeepdit_reg": SudeepDiTREG
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -121,7 +123,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             timestep_emb_type=network_config.timestep_emb_type,
         )
 
-    elif network_config.network_type == "sudeepdit_repa":
+    elif network_config.network_type == "sudeepdit_repa" or network_config.network_type == "sudeepdit_reg":
         loguru.logger.info(f"REPA config - align_depth: {network_config.align_depth} | projector_dim: {network_config.projector_dim} | z_dims: {network_config.z_dims}")
         return network_class(
             **common_params,
