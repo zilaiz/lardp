@@ -199,8 +199,8 @@ def flow_reg_loss(
     loss = get_norm(b_t - act_t_dot, config.norm_type)
     loss = config.loss_scale * torch.mean(loss)
 
-    cls_loss = get_norm(b_t_cls - cls_t_dot, config.norm_type)
-    cls_loss = config.cls_loss_scale * torch.mean(cls_loss)
+    cls_loss = F.mse_loss(b_t_cls, cls_t_dot)
+    cls_loss *= config.cls_loss_scale
 
     projection_loss = repa_loss(zs_tilde, torch.cat([cls_token.transpose(0, 1), tgt_act_reps], dim=2))
     projection_loss *= config.repa_scale

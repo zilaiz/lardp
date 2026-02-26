@@ -28,20 +28,20 @@ def save_comparison(prev_frame, orig_frame, recon_frame, frame_idx, output_dir):
     plt.close(fig)
 
 
-@hydra.main(version_base=None, config_path="./config/", config_name="lam")
+@hydra.main(version_base=None, config_path="../../../examples/configs/lam", config_name="default")
 def main(config):
     lam = LatentActionModel(
-        in_dim=config.model.image_channels,
-        model_dim=config.model.lam_model_dim,
-        latent_dim=config.model.lam_latent_dim,
-        patch_size=config.model.lam_patch_size,
-        enc_blocks=config.model.lam_enc_blocks,
-        dec_blocks=config.model.lam_dec_blocks,
-        num_heads=config.model.lam_num_heads,
-        dropout=config.model.lam_dropout
+        in_dim=config.lam_image_channels,
+        model_dim=config.lam_model_dim,
+        latent_dim=config.lam_latent_dim,
+        patch_size=config.lam_patch_size,
+        enc_blocks=config.lam_enc_blocks,
+        dec_blocks=config.lam_dec_blocks,
+        num_heads=config.lam_num_heads,
+        dropout=config.lam_dropout
     )
 
-    ckpt_state_dict = torch.load(config.model.lam_ckpt_path, map_location=torch.device("cpu"))['state_dict']
+    ckpt_state_dict = torch.load(config.lam_ckpt_path, map_location=torch.device("cpu"))['state_dict']
     lam_state_dict = {k: v for k, v in ckpt_state_dict.items() if k.startswith("lam.")}
     lam_weights_compatible = {k.removeprefix('lam.'): v for k, v in lam_state_dict.items()}
     lam.load_state_dict(lam_weights_compatible)
