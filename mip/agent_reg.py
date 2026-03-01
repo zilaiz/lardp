@@ -14,7 +14,7 @@ from mip.config import Config
 from mip.flow_map import FlowMap
 from mip.interpolant import Interpolant
 from mip.losses import get_loss_fn
-from mip.network_utils import get_encoder, get_lam, get_network
+from mip.network_utils import get_dino, get_encoder, get_lam, get_network
 from mip.samplers import get_sampler
 from mip.torch_utils import report_parameters
 
@@ -48,8 +48,8 @@ class TrainingAgentREG:
         self.flow_map_ema = deepcopy(self.flow_map).requires_grad_(False)
 
         # REPA specific
-        if config.task.lam_latent_type is not None and not config.task.use_precomputed_lam:
-            self.lam = get_lam(config.lam).to(config.optimization.device)
+        if config.task.latent_type is not None and not config.task.use_precomputed:
+            self.lam = get_lam(config.lam).to(config.optimization.device) if config.task.latent_type == "lam" else get_dino(config.task.dino_model).to(config.optimization.device)
         else:
             self.lam = None  # Not needed — either no LAM or targets come from HDF5
 

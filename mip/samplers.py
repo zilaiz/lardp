@@ -79,7 +79,7 @@ def ode_reg_sampler(
     t_schedule = np.linspace(0, 1, num_steps + 1)
     if sample_mode == "stochastic":
         act_s = torch.randn_like(act_0, device=act_0.device)
-        cls_token_s = torch.rand_like(cls_token_0, device=cls_token_0.device)
+        cls_token_s = torch.randn_like(cls_token_0, device=cls_token_0.device)
     else:
         act_s = torch.zeros_like(act_0, device=act_0.device)
         cls_token_s = torch.zeros_like(cls_token_0, device=cls_token_0.device)

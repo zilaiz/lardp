@@ -49,68 +49,6 @@ def timed(section: str, record_dict: dict):
     record_dict[section].append(time.perf_counter() - start)
 
 
-def compute_lam_targets(lam, lam_raw_images, frame_skips, horizon, device, lam_latent_type="prebn"):
-    """Build frame pairs per frame_skip, run LAM, expand to horizon.
-
-    Args:
-        lam: LAM model (in eval mode)
-        lam_raw_images: dict of cam_key -> (B, horizon+1, H, W, C) float32
-        frame_skips: list of ints, e.g. [1, 8]
-        horizon: int, e.g. 10
-        device: torch device
-        lam_latent_type: "prebn" (z_rep_prebn, 1024-dim) or "bn" (z_mu, 32-dim)
-
-    Returns:
-        (B, N, horizon, z_dim) tensor where N = len(frame_skips) * len(cameras)
-    """
-    assert lam_latent_type in ("prebn", "bn"), f"Invalid lam_latent_type: {lam_latent_type}"
-    _lam_output_key = {"prebn": "z_rep_prebn", "bn": "z_mu"}
-    lam_key = _lam_output_key[lam_latent_type]
-
-    all_reps = []
-    T = horizon + 1
-    with torch.no_grad():
-        for cam_key, raw_imgs in lam_raw_images.items():
-            # raw_imgs: (B, horizon+1, H, W, C)
-            B = raw_imgs.shape[0]
-            for fs in frame_skips:
-                # Subsample indices within [0, T-1]
-                indices = list(range(0, T, fs))
-                if indices[-1] != T - 1:
-                    indices.append(T - 1)
-
-                # Build pairs from consecutive subsampled indices
-                num_pairs = len(indices) - 1
-
-                # Build video tensor: (num_pairs * B, 2, H, W, C)
-                pair_videos = []
-                for i in range(num_pairs):
-                    a, b = indices[i], indices[i + 1]
-                    pair_videos.append(
-                        torch.stack([raw_imgs[:, a], raw_imgs[:, b]], dim=1)
-                    )
-                pair_videos = torch.cat(pair_videos, dim=0).to(device)
-
-                # Run LAM encode
-                enc_out = lam.encode(pair_videos)
-                z = enc_out[lam_key]  # (num_pairs * B, z_dim)
-                z = z.reshape(num_pairs, B, -1).permute(1, 0, 2)  # (B, num_pairs, z_dim)
-
-                # Expand: repeat each latent fs times, pad/truncate to horizon
-                z_expanded = z.repeat_interleave(fs, dim=1)
-                if z_expanded.shape[1] < horizon:
-                    pad = z_expanded[:, -1:].expand(
-                        -1, horizon - z_expanded.shape[1], -1
-                    )
-                    z_expanded = torch.cat([z_expanded, pad], dim=1)
-                z_expanded = z_expanded[:, :horizon]  # (B, horizon, z_dim)
-
-                all_reps.append(z_expanded)
-
-    # (B, N, horizon, z_dim) where N = len(cameras) * len(frame_skips)
-    return torch.stack(all_reps, dim=1)
-
-
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):
     """Standalone training function.
 
@@ -122,10 +60,9 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         logger: Logger for metrics
         resume_state: Optional dict with training state to resume from
     """
-    assert config.task.lam_latent_type is not None, (
-        "REPA training requires lam_latent_type to be set (e.g. 'prebn' or 'bn')"
+    assert config.task.dino_model is not None, (
+        "REPA training requires dino_model to be set (e.g. 'vits16plus' or 'vitb16')"
     )
-
     # dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -181,6 +118,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         "update": [],
         "total_step": [],
     }
+    show_latent_key = False
 
     for n_gradient_step in range(start_step, config.optimization.gradient_steps):
         with timed("total_step", perf_times):
@@ -203,31 +141,30 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     batch_size = next(iter(obs_dict.values())).shape[0]
                     obs = TensorDict(obs_dict, batch_size=batch_size)
 
-                    if config.task.lam_latent_type is not None:
-                        if config.task.use_precomputed_lam:
-                            # Precomputed path: dense per-timestep LAM inference from HDF5.
-                            # Each timestep has a unique sliding-window latent action.
-                            la_list = [
-                                v.to(config.optimization.device)
-                                for v in batch["latent_actions"].values()
-                            ]
-                            tgt_act_reps = torch.stack(la_list, dim=1)  # (B, N, horizon, z_dim)
+                    if config.task.dino_model is not None:
+                        if config.task.use_precomputed:
+                            # Precomputed path: dense per-timestep dino latents inference from HDF5.
+                            dino_latents = []
+                            dino_latent_keys = []
+                            for k, v in batch["dino_latents"].items():
+                                dino_latents.append(v.to(config.optimization.device))
+                                dino_latent_keys.append(k)
+                            if config.task.dino_align_target == 'id':
+                                tgt_act_reps = torch.stack(dino_latents, dim=1)[:, :, -config.task.horizon :]  # (B, N, horizon, z_dim)
+                            elif config.task.dino_align_target == 'fd':
+                                tgt_act_reps = torch.stack(dino_latents, dim=1)[:, :, : config.task.horizon]  # (B, N, horizon, z_dim)
+                            else:
+                                raise ValueError(f"Invalid dino_align_target {config.task.dino_align_target}")
                         else:
-                            # On-the-fly path: sparse frame pairs with repeat_interleave
-                            # expansion — multiple timesteps share the same latent action.
-                            tgt_act_reps = compute_lam_targets(
-                                agent.lam,
-                                batch["lam_raw_images"],
-                                config.task.lam_frame_skips,
-                                config.task.horizon,
-                                config.optimization.device,
-                                lam_latent_type=config.task.lam_latent_type,
-                            )  # (B, N, horizon, z_dim)
+                            raise ValueError('No Precomputed DINO Latents Available')
 
                         # Limit N to the number of z_dims configured for REPA alignment
                         tgt_act_reps = tgt_act_reps[:, : len(config.network.z_dims)]
+                        if not show_latent_key:
+                            loguru.logger.info(f"Using DINO Latents: {dino_latent_keys[: len(config.network.z_dims)]}")
+                            show_latent_key = True
                     else:
-                        raise ValueError("lam_latent_type is None")
+                        raise ValueError("dino_model is None")
 
                 elif config.task.obs_type == "state":
                     raise ValueError("obs_type is not image")
@@ -324,7 +261,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     # Include training state for resuming
                     checkpoint_base_name = (
                         f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-                        f"{config.optimization.loss_type}_{config.network.network_type}_"
+                        f"{config.optimization.loss_type}_{config.task.latent_type}_{config.network.network_type}_"
                         f"{config.network.emb_dim}_seed{config.optimization.seed}"
                     )
                     training_state = {
@@ -574,7 +511,7 @@ def main(config):
         # Automatically look for checkpoint to resume from
         checkpoint_base_name = (
             f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-            f"{config.optimization.loss_type}_{config.network.network_type}_"
+            f"{config.optimization.loss_type}_{config.task.latent_type}_{config.network.network_type}_"
             f"{config.network.emb_dim}_seed{config.optimization.seed}"
         )
         checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)

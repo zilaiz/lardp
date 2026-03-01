@@ -19,7 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 
 # Import mip modules after setting environment variables
-from mip.agent_reg import TrainingAgentREG  # noqa: E402
+from mip.agent_repa import TrainingAgentREPA  # noqa: E402
 from mip.config import Config  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
 from mip.datasets.robomimic_dataset import make_dataset  # noqa: E402
@@ -181,6 +181,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         "update": [],
         "total_step": [],
     }
+    show_latent_key = False
 
     for n_gradient_step in range(start_step, config.optimization.gradient_steps):
         with timed("total_step", perf_times):
@@ -204,19 +205,18 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     obs = TensorDict(obs_dict, batch_size=batch_size)
 
                     if config.task.lam_latent_type is not None:
-                        if config.task.use_precomputed_lam:
+                        if config.task.use_precomputed:
                             # Precomputed path: dense per-timestep LAM inference from HDF5.
                             # Each timestep has a unique sliding-window latent action.
-                            la_list = [
-                                v.to(config.optimization.device)
-                                for v in batch["latent_actions"].values()
-                            ]
-                            cls_list = [
-                                v.to(config.optimization.device)
-                                for v in batch["cls_tokens"].values()
-                            ]
-                            tgt_act_reps = torch.stack(la_list, dim=1)  # (B, N_c * N_fs, horizon, z_dim)
-                            cls_tokens = torch.stack(cls_list, dim=1) # (B, N_c, 1, z_dim)
+                            la_list = []
+                            la_keys = []
+                            for k, v in batch["latent_actions"].items():
+                                la_list.append(v.to(config.optimization.device))
+                                la_keys.append(k)
+                            tgt_act_reps = torch.stack(la_list, dim=1)  # (B, N, horizon, z_dim)
+                            if not show_latent_key:
+                                loguru.logger.info(f"Using LAM: {la_keys[: len(config.network.z_dims)]}")
+                                show_latent_key = True
                         else:
                             # On-the-fly path: sparse frame pairs with repeat_interleave
                             # expansion — multiple timesteps share the same latent action.
@@ -231,7 +231,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
                         # Limit N to the number of z_dims configured for REPA alignment
                         tgt_act_reps = tgt_act_reps[:, : len(config.network.z_dims)]
-                        cls_tokens = cls_tokens[:, : len(config.network.z_dims)]
                     else:
                         raise ValueError("lam_latent_type is None")
 
@@ -247,7 +246,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                 delta_t = torch.full(
                     (batch_size,), delta_t_scalar, device=config.optimization.device
                 )
-                info = agent.update(act, obs, delta_t, cls_tokens, tgt_act_reps)
+                info = agent.update(act, obs, delta_t, tgt_act_reps)
                 lr_scheduler.step()
 
             for k, v in info.items():
@@ -330,7 +329,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     # Include training state for resuming
                     checkpoint_base_name = (
                         f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-                        f"{config.optimization.loss_type}_{config.network.network_type}_"
+                        f"{config.optimization.loss_type}_{config.task.latent_type}_{config.network.network_type}_"
                         f"{config.network.emb_dim}_seed{config.optimization.seed}"
                     )
                     training_state = {
@@ -429,17 +428,12 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
                     (config.task.num_envs, config.task.horizon, config.task.act_dim),
                     device=config.optimization.device,
                 )
-                cls_token_0 = torch.randn(
-                    (config.task.num_envs, 1, config.network.z_dims[0]),
-                    device=config.optimization.device,
-                )
 
             # run sampling (num_envs, horizon, action_dim)
             with timed("sample", inference_times):
                 act_normed = agent.sample(
                     act_0=act_0,
                     obs=obs,
-                    cls_token_0=cls_token_0,
                     num_steps=num_steps,
                     use_ema=True,
                 )
@@ -575,7 +569,7 @@ def main(config):
     dataset = make_dataset(config.task)
     loguru.logger.info("Finished setting up dataset")
 
-    agent = TrainingAgentREG(config)
+    agent = TrainingAgentREPA(config)
     resume_state = None
 
     if config.optimization.model_path and config.optimization.model_path != "None":
@@ -585,7 +579,7 @@ def main(config):
         # Automatically look for checkpoint to resume from
         checkpoint_base_name = (
             f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-            f"{config.optimization.loss_type}_{config.network.network_type}_"
+            f"{config.optimization.loss_type}_{config.task.latent_type}_{config.network.network_type}_"
             f"{config.network.emb_dim}_seed{config.optimization.seed}"
         )
         checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)

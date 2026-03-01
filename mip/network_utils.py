@@ -210,6 +210,9 @@ def get_lam(lam_config: LAMConfig):
         raise ValueError("No pretrained LAM checkpoint provided")
 
 
+def get_dino(dino_model: str):
+    pass
+
 class GroupNorm1d(nn.Module):
     def __init__(self, dim, num_groups=32, min_channels_per_group=4, eps=1e-5):
         super().__init__()

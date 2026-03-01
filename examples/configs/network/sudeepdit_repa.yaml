@@ -10,7 +10,7 @@ dropout: 0.0
 timestep_emb_dim: 512
 align_depth: 2
 projector_dim: 512
-z_dims: [32]
+z_dims: [384]
 
 # SudeepDiT specific configs
 n_heads: 4  # Number of attention heads

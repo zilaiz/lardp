@@ -26,7 +26,16 @@ use_group_norm: true
 use_seq: true
 
 # REPA specific settings
+latent_type: null
+use_precomputed: false
+
+# LAM
 lam_frame_skips: [1]
 lam_camera_keys: null
-use_precomputed_lam: false
 lam_latent_type: null
+
+# DINO
+dino_model: null
+dino_types: null
+dino_camera_keys: null
+dino_align_target: null
