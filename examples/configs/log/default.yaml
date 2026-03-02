@@ -8,8 +8,8 @@ project: "mip"
 group: "default"
 exp_name: "default"
 entity: "brown-palm"
-eval_freq: 20000
+eval_freq: 10000
 log_freq: 1000
-save_freq: 20000
+save_freq: 10000
 eval_episodes: 50
 save_video: False

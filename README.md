@@ -1,15 +1,20 @@
-# Miniumm Flow Policies Implementation
+<div align="center">
+
+# Minimum Flow Policies Implementation
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![arXiv](https://img.shields.io/badge/arXiv-2406.12345-b31b1b.svg)](https://arxiv.org/abs/2512.01809)
-[![Documentation](https://img.shields.io/badge/docs-latest-blue.svg)](https://simchowitzlabpublic.github.io/much-ado-about-noising/)
-[![Project Website](https://img.shields.io/badge/website-project-blue.svg)](https://simchowitzlabpublic.github.io/much-ado-about-noising-project/)
-[![HuggingFace Dataset](https://img.shields.io/badge/HuggingFace-dataset-yellow.svg?logo=huggingface)](https://huggingface.co/datasets/ChaoyiPan/mip-dataset)
-[![HuggingFace Checkpoints](https://img.shields.io/badge/HuggingFace-checkpoints-orange.svg?logo=huggingface)](https://huggingface.co/ChaoyiPan/mip-checkpoints)
 
+<br />
 
+[**Project Website**](https://simchowitzlabpublic.github.io/much-ado-about-noising-project/) •
+[**Documentation**](https://simchowitzlabpublic.github.io/much-ado-about-noising/) •
+[**Dataset**](https://huggingface.co/datasets/ChaoyiPan/mip-dataset) •
+[**Checkpoints**](https://huggingface.co/ChaoyiPan/mip-checkpoints)
+
+</div>
 
 This repository contains the code for the paper **"Much Ado About Noising: Dispelling the Myths of Generative Robotic Control"**. This repository is a PyTorch-based framework for behavior cloning with flow matching and related generative models, incorporating best practices from diffusion model training.
 

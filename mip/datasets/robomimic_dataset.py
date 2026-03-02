@@ -45,13 +45,9 @@ def make_dataset(task_config, mode="train"):
             repo_type="dataset",
         )
         logger.info(f"Downloaded dataset to: {dataset_path}")
-    elif hasattr(task_config, "dataset_path") and not task_config.use_precomputed:
+    elif hasattr(task_config, "dataset_path"):
         # Use explicit path if provided
         dataset_path = os.path.expanduser(task_config.dataset_path)
-        logger.info(f"Loading dataset from {dataset_path}")
-    elif hasattr(task_config, "prep_dataset_path") and task_config.use_precomputed:
-        # Use explicit path if provided
-        dataset_path = os.path.expanduser(task_config.prep_dataset_path)
         logger.info(f"Loading dataset from {dataset_path}")
     else:
         raise ValueError(

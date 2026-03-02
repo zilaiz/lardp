@@ -35,6 +35,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_reg_loss
     elif loss_type == "regression":
         return regression_loss
+    elif loss_type == "straight_flow":
+        return straight_flow_loss
     elif loss_type == "tsd":
         return tsd_loss
     elif loss_type == "mip":
@@ -104,6 +106,7 @@ def flow_loss(
     loss = get_norm(b_t - act_t_dot, config.norm_type)
     loss = config.loss_scale * torch.mean(loss)
     return loss, {}
+
 
 def flow_repa_loss(
     config: OptimizationConfig,
@@ -220,6 +223,34 @@ def regression_loss(
     # sample
     t = torch.zeros_like(delta_t, device=delta_t.device)
     act_0 = torch.zeros_like(act, device=act.device)
+
+    # get condition
+    obs_emb = encoder(obs, None)
+
+    # predict
+    act_pred = flow_map.get_velocity(t, act_0, obs_emb)
+
+    # compute loss
+    loss = get_norm(act_pred - act, config.norm_type)
+    loss = config.loss_scale * torch.mean(loss)
+    return loss, {}
+
+
+def straight_flow_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """Straight flow loss."""
+    # sample
+    t = torch.zeros_like(delta_t, device=delta_t.device)
+
+    # Major difference compared to regression: use random noise instead of zeros
+    act_0 = torch.randn_like(act, device=act.device)
 
     # get condition
     obs_emb = encoder(obs, None)

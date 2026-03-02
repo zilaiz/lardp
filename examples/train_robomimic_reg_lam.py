@@ -223,7 +223,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                             tgt_act_reps = torch.stack(la_list, dim=1)  # (B, N_c * N_fs, horizon, z_dim)
                             cls_tokens = torch.stack(cls_list, dim=1) # (B, N_c, 1, z_dim)
                             if not show_latent_key:
-                                loguru.logger.info(f"Using LAM: {la_keys[: len(config.network.z_dims)]} | CLS: {cls_keys[: len(config.network.z_dims)]}")
+                                loguru.logger.info(f"Using LAM for REPA: {la_keys[: len(config.network.z_dims)]} | CLS: {cls_keys[: len(config.network.z_dims)]}")
                                 show_latent_key = True
                         else:
                             # On-the-fly path: sparse frame pairs with repeat_interleave

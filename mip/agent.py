@@ -313,7 +313,7 @@ class TrainingAgent:
 
         # Convert TensorDict to regular dict with scalar values
         return {
-            "loss": result["loss"],
+            "dp_loss": result["loss"],
             "grad_norm": result["grad_norm"],
         }
 

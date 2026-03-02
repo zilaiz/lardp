@@ -161,7 +161,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                         # Limit N to the number of z_dims configured for REPA alignment
                         tgt_act_reps = tgt_act_reps[:, : len(config.network.z_dims)]
                         if not show_latent_key:
-                            loguru.logger.info(f"Using DINO Latents: {dino_latent_keys[: len(config.network.z_dims)]}")
+                            loguru.logger.info(f"Using DINO Latents for REPA: {dino_latent_keys[: len(config.network.z_dims)]}")
                             show_latent_key = True
                     else:
                         raise ValueError("dino_model is None")

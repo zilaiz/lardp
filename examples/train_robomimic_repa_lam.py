@@ -215,7 +215,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                                 la_keys.append(k)
                             tgt_act_reps = torch.stack(la_list, dim=1)  # (B, N, horizon, z_dim)
                             if not show_latent_key:
-                                loguru.logger.info(f"Using LAM: {la_keys[: len(config.network.z_dims)]}")
+                                loguru.logger.info(f"Using LAM for REPA: {la_keys[: len(config.network.z_dims)]}")
                                 show_latent_key = True
                         else:
                             # On-the-fly path: sparse frame pairs with repeat_interleave
