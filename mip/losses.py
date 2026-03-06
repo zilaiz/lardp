@@ -31,6 +31,10 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_loss
     elif loss_type == "flow_repa":
         return flow_repa_loss
+    elif loss_type == "flow_condistill":
+        return flow_condistill_loss
+    elif loss_type == "flow_fast_condistill":
+        return flow_fast_condistill_loss
     elif loss_type == "flow_reg":
         return flow_reg_loss
     elif loss_type == "regression":
@@ -142,7 +146,7 @@ def flow_repa_loss(
     # predict
     act_t = interp.calc_It(t, act_0, act_1)
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
-    b_t, zs_tilde = flow_map.get_velocity_repa(t, act_t, obs_emb)
+    b_t, zs_tilde = flow_map.get_velocity_repa(t, act_t, obs_emb, align_depth=config.s_align_depth)
 
     if zs_tilde is None:
         raise ValueError(
@@ -154,6 +158,138 @@ def flow_repa_loss(
     loss = config.loss_scale * torch.mean(loss)
 
     projection_loss = repa_loss(zs_tilde, tgt_act_reps)
+    projection_loss *= config.repa_scale
+    return loss, projection_loss, {}
+
+
+def flow_condistill_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    extra_cond_encoder: BaseEncoder,
+    flow_map_ema: FlowMap,
+    encoder_ema: BaseEncoder,
+    extra_cond_encoder_ema: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    extra_cond: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """Flow model loss, matching the velocity field.
+
+    Args:
+        flow_map (FlowMap): the flow map
+        interp (Interpolant): the interpolant
+        obs (torch.Tensor): the target state
+        obs (torch.Tensor): the label
+        delta_t (torch.Tensor): the time step difference, used for flow map / shortcut model / consistency training only.
+        tgt_act_reps (torch.Tensor): target action representations
+
+    Returns:
+        float: the loss
+    """
+    # sample - use empty+uniform_/normal_ for CUDA graph compatibility
+    t = torch.empty_like(delta_t).uniform_(0, 1)
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    # get condition
+    obs_emb = encoder(obs, None)  # encoder_dropout: 0
+    extra_cond_emb = extra_cond_encoder(extra_cond, None)  # extra_cond_encoder_dropout > 0
+
+    full_obs_emb = torch.cat([obs_emb, extra_cond_emb], dim=1)
+
+    # predict
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+    b_t, _ = flow_map.get_velocity_repa(t, act_t, full_obs_emb, align_depth=None)
+
+    # compute loss
+    loss = get_norm(b_t - act_t_dot, config.norm_type)
+    loss = config.loss_scale * torch.mean(loss)
+
+    # condition-guided distillation
+    _, zs_tilde_student = flow_map.get_velocity_repa(t, act_t, obs_emb, align_depth=config.s_align_depth)
+
+    with torch.no_grad():
+        obs_emb_ema = encoder_ema(obs, None)  # encoder dropout is already 0
+        extra_cond_encoder_ema.eval()
+        extra_cond_emb_ema = extra_cond_encoder_ema(extra_cond, None)  # make sure input masks have no dropout
+        extra_cond_encoder_ema.train()
+        full_obs_emb_ema = torch.cat([obs_emb_ema, extra_cond_emb_ema], dim=1)
+        _, zs_tilde_teacher = flow_map_ema.get_velocity_repa(t, act_t, full_obs_emb_ema, align_depth=config.t_align_depth)
+
+    if zs_tilde_student is None or zs_tilde_teacher is None:
+        raise ValueError(
+            "zs_tilde is None — set network.align_depth to a value in [1, depth] to enable representation extraction"
+        )
+    projection_loss = repa_loss(zs_tilde_student, zs_tilde_teacher)
+    projection_loss *= config.repa_scale
+    return loss, projection_loss, {}
+
+
+def flow_fast_condistill_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    extra_cond_encoder: BaseEncoder,
+    flow_map_ema: FlowMap,
+    encoder_ema: BaseEncoder,
+    extra_cond_encoder_ema: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    extra_cond: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """Flow model loss, matching the velocity field.
+
+    Args:
+        flow_map (FlowMap): the flow map
+        interp (Interpolant): the interpolant
+        obs (torch.Tensor): the target state
+        obs (torch.Tensor): the label
+        delta_t (torch.Tensor): the time step difference, used for flow map / shortcut model / consistency training only.
+        tgt_act_reps (torch.Tensor): target action representations
+
+    Returns:
+        float: the loss
+    """
+    # sample - use empty+uniform_/normal_ for CUDA graph compatibility
+    t = torch.empty_like(delta_t).uniform_(0, 1)
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    # get condition
+    obs_emb = encoder(obs, None)  # encoder_dropout: 0
+    extra_cond_emb = extra_cond_encoder(extra_cond, None)  # extra_cond_encoder_dropout > 0.5 NOTE: set a high extra_cond_encoder_dropout
+
+    full_obs_emb = torch.cat([obs_emb, extra_cond_emb], dim=1)
+
+    # predict
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+    b_t, zs_tilde_student = flow_map.get_velocity_repa(t, act_t, full_obs_emb, align_depth=config.s_align_depth)
+
+    # compute loss
+    loss = get_norm(b_t - act_t_dot, config.norm_type)
+    loss = config.loss_scale * torch.mean(loss)
+
+    # condition-guided distillation
+    with torch.no_grad():
+        obs_emb_ema = encoder_ema(obs, None)  # encoder dropout is already 0
+        extra_cond_encoder_ema.eval()
+        extra_cond_emb_ema = extra_cond_encoder_ema(extra_cond, None)  # make sure input masks have no dropout
+        extra_cond_encoder_ema.train()
+        full_obs_emb_ema = torch.cat([obs_emb_ema, extra_cond_emb_ema], dim=1)
+        _, zs_tilde_teacher = flow_map_ema.get_velocity_repa(t, act_t, full_obs_emb_ema, align_depth=config.t_align_depth)
+
+    if zs_tilde_student is None or zs_tilde_teacher is None:
+        raise ValueError(
+            "zs_tilde is None — set network.align_depth to a value in [1, depth] to enable representation extraction"
+        )
+    projection_loss = repa_loss(zs_tilde_student, zs_tilde_teacher)
     projection_loss *= config.repa_scale
     return loss, projection_loss, {}
 
@@ -201,7 +337,7 @@ def flow_reg_loss(
     cls_t = interp.calc_It(t, cls_0, cls_1)
     cls_t_dot = interp.calc_It_dot(t, cls_0, cls_1)
 
-    b_t, zs_tilde, b_t_cls = flow_map.get_velocity_reg(t, act_t, obs_emb, cls_t)
+    b_t, zs_tilde, b_t_cls = flow_map.get_velocity_reg(t, act_t, obs_emb, cls_t, align_depth=config.s_align_depth)
 
     if zs_tilde is None:
         raise ValueError(

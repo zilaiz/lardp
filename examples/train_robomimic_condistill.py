@@ -19,7 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 
 # Import mip modules after setting environment variables
-from mip.agent import TrainingAgent  # noqa: E402
+from mip.agent_condistill import TrainingAgentCondistill  # noqa: E402
 from mip.config import Config  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
 from mip.datasets.robomimic_dataset import make_dataset  # noqa: E402
@@ -60,6 +60,9 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
         logger: Logger for metrics
         resume_state: Optional dict with training state to resume from
     """
+    assert config.task.dino_model is not None, (
+        "REPA training requires dino_model to be set (e.g. 'vits16plus' or 'vitb16')"
+    )
     # dataloader
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -115,6 +118,11 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
         "update": [],
         "total_step": [],
     }
+    extra_cond_config = {
+        "image": ("extra_raw_images", 0),
+        "dino": ("dino_latents", 0),
+        "lam": ("latent_actions", -1),
+    }
 
     for n_gradient_step in range(start_step, config.optimization.gradient_steps):
         with timed("total_step", perf_times):
@@ -156,11 +164,23 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
                     # Convert to TensorDict for consistent handling throughout pipeline
                     batch_size = next(iter(obs_dict.values())).shape[0]
                     obs = TensorDict(obs_dict, batch_size=batch_size)
+
+                    # Precomputed path: dense per-timestep dino latents inference from HDF5.
+                    extra_cond_key, extra_cond_offset = extra_cond_config[config.task.latent_type]
+                    extra_cond_batch = batch[extra_cond_key]
+                    extra_cond_dict = {}
+
+                    for k in extra_cond_batch:
+                        extra_cond_dict[k] = extra_cond_batch[k][:, config.task.obs_steps + extra_cond_offset:, :].to(
+                            config.optimization.device
+                        )
+
+                    if n_gradient_step == start_step:
+                        loguru.logger.info(f"Using encoder type: {encoder_type}")
+                        loguru.logger.info(f"Using Extra Condition for Representation Alignment: {list(extra_cond_batch.keys())}")
+
                 elif config.task.obs_type == "state":
-                    obs = batch["obs"]["state"].to(config.optimization.device)
-                    obs = obs[
-                        :, : config.task.obs_steps, :
-                    ]  # (B, obs_horizon, obs_dim)
+                    raise ValueError("obs_type is not image")
                 act = batch["action"].to(config.optimization.device)
                 act = act[:, : config.task.horizon, :]  # (B, horizon, act_dim)
 
@@ -171,7 +191,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
                 delta_t = torch.full(
                     (batch_size,), delta_t_scalar, device=config.optimization.device
                 )
-                info = agent.update(act, obs, delta_t)
+                info = agent.update(act, obs, extra_cond_dict, delta_t)
                 lr_scheduler.step()
 
             for k, v in info.items():
@@ -254,7 +274,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
                     # Include training state for resuming
                     checkpoint_base_name = (
                         f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-                        f"{config.optimization.loss_type}_{config.network.network_type}_"
+                        f"{config.optimization.loss_type}_{config.task.latent_type}_{config.network.network_type}_"
                         f"{config.network.emb_dim}_seed{config.optimization.seed}"
                     )
                     training_state = {
@@ -499,7 +519,7 @@ def main(config):
     dataset = make_dataset(config.task)
     loguru.logger.info("Finished setting up dataset")
 
-    agent = TrainingAgent(config)
+    agent = TrainingAgentCondistill(config)
     resume_state = None
 
     if config.optimization.model_path and config.optimization.model_path != "None":
@@ -509,7 +529,7 @@ def main(config):
         # Automatically look for checkpoint to resume from
         checkpoint_base_name = (
             f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-            f"{config.optimization.loss_type}_{config.network.network_type}_"
+            f"{config.optimization.loss_type}_{config.task.latent_type}_{config.network.network_type}_"
             f"{config.network.emb_dim}_seed{config.optimization.seed}"
         )
         checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)

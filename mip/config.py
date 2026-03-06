@@ -22,6 +22,8 @@ class OptimizationConfig:
     loss_scale: float = 100.0
     cls_loss_scale: float = 0.03
     repa_scale: float = 0.0 # REPA loss coefficient
+    s_align_depth: int = 2
+    t_align_depth: int = 2
     norm_type: str = "l2"
     lr: float = 1e-4
     weight_decay: float = 1e-5
@@ -55,7 +57,8 @@ class NetworkConfig:
     emb_dim: int = 512
     dropout: float = 0.1
     encoder_dropout: float = 0.0
-    encoder_type: str = "mlp"  # "mlp", "per_step_mlp", "identity"
+    encoder_type: str | None = None  # "mlp", "per_step_mlp", "identity", "image", "dino"
+    extra_cond_encoder_dropout: float = 0.4
     expansion_factor: int = 4
     timestep_emb_dim: int = 128
     timestep_emb_type: str = "positional"  # Type of timestep embedding
@@ -81,7 +84,6 @@ class NetworkConfig:
     rnn_type: str = "LSTM"  # "LSTM" or "GRU"
     max_freq: float = 100.0
     # REPA specific
-    align_depth: int = 0
     projector_dim: int = 2048
     z_dims: list[int] | None = None
 
@@ -131,15 +133,16 @@ class TaskConfig:
     # REPA specific
     latent_type: str | None = None  # "lam" or "dino"
     use_precomputed: bool = False  # True = load from HDF5, False = on-the-fly LAM inference
+    camera_keys: list[str] | None = None  # e.g., ["agentview_image"]; None = auto-detect from HDF5
 
     lam_frame_skips: list[int] | None = None  # e.g., [1, 8]; None = no LAM
-    lam_camera_keys: list[str] | None = None  # e.g., ["agentview_image"]; None = auto-detect from HDF5
     lam_latent_type: str | None = None  # None = no LAM; "prebn" or "bn" = enable
 
     dino_types: list[str] | None = None  # ["cls", "patch_mean"]
     dino_model: str | None = None  # e.g. vits16plus, vitb16
-    dino_camera_keys: list[str] | None = None
     dino_align_target: str | None = None # "fd" or "id"
+    dino_ckpt_dir: str = "/oscar/data/csun45/zzeng28/cache/torch/dinov3"
+    dino_repo: str = "/oscar/data/csun45/zzeng28/cache/torch/dinov3/dinov3"
 
 @dataclass
 class LAMConfig:

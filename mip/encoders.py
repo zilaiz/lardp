@@ -882,3 +882,107 @@ class MultiImageObsEncoder(BaseEncoder):
     @property
     def dtype(self):
         return next(iter(self.parameters())).dtype
+
+
+class PrecomputedDINOEncoder(BaseEncoder):
+    """Encoder for precomputed DINO features from multiple camera views.
+
+    Takes a dict of precomputed DINO features (keyed by composite names like
+    "dino_cls_vits16plus_agentview_image") and optionally low_dim state keys,
+    concatenates them along the feature dimension, and projects to emb_dim.
+
+    Input:
+        - obs: dict with DINO keys (b, To, dino_embed_dim) and optionally low_dim keys (b, To, dim)
+        - mask: (b,) or None
+
+    Output:
+        - (b, To, emb_dim)
+    """
+
+    def __init__(
+        self,
+        num_views: int,
+        dino_embed_dim: int,
+        emb_dim: int,
+        dropout: float = 0.0,
+        low_dim_keys: list[str] | None = None,
+        low_dim_total_dim: int = 0,
+    ):
+        super().__init__()
+        self.dropout = dropout
+        self.low_dim_keys = sorted(low_dim_keys) if low_dim_keys else []
+
+        concat_dim = dino_embed_dim * num_views + low_dim_total_dim
+        self.proj = nn.Sequential(
+            nn.Linear(concat_dim, emb_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+    def forward(self, obs: dict, mask: torch.Tensor = None):
+        # Separate DINO keys from low_dim keys
+        dino_features = [obs[k] for k in sorted(obs.keys()) if k not in self.low_dim_keys]
+        low_dim_features = [obs[k] for k in self.low_dim_keys if k in obs]
+
+        x = torch.cat(dino_features + low_dim_features, dim=-1)  # (b, To, concat_dim)
+
+        mask = at_least_ndim(
+            get_mask(
+                mask,
+                (x.shape[0],),
+                self.dropout,
+                self.training,
+                x.device,
+            ),
+            x.dim(),
+        )
+        return self.proj(x) * mask
+
+
+class PrecomputedLAMEncoder(BaseEncoder):
+    """Encoder for precomputed LAM latent actions from multiple camera views.
+
+    Takes a dict of precomputed latent actions (keyed by composite names like
+    "latent_action_fs1_agentview_image"), concatenates them along the feature
+    dimension, and projects to emb_dim.
+
+    Input:
+        - obs: dict with composite keys, each value has shape (b, T, latent_dim)
+        - mask: (b,) or None
+
+    Output:
+        - (b, T, emb_dim)
+    """
+
+    def __init__(
+        self,
+        num_views: int,
+        latent_dim: int,
+        emb_dim: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.dropout = dropout
+
+        concat_dim = latent_dim * num_views
+        self.proj = nn.Sequential(
+            nn.Linear(concat_dim, emb_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+    def forward(self, obs: dict, mask: torch.Tensor = None):
+        features = [obs[k] for k in sorted(obs.keys())]  # each (b, T, latent_dim)
+        x = torch.cat(features, dim=-1)  # (b, T, concat_dim)
+
+        mask = at_least_ndim(
+            get_mask(
+                mask,
+                (x.shape[0],),
+                self.dropout,
+                self.training,
+                x.device,
+            ),
+            x.dim(),
+        )
+        return self.proj(x) * mask

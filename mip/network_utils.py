@@ -14,6 +14,8 @@ from mip.encoders import (
     MLPEncoder,
     MultiImageObsEncoder,
     PerStepMLPEncoder,
+    PrecomputedDINOEncoder,
+    PrecomputedLAMEncoder,
 )
 
 
@@ -26,6 +28,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
     from mip.networks.sudeepdit_og import SudeepDiTOG
+    from mip.networks.sudeepdit_og_condistill import SudeepDiTOGCondistill
     from mip.networks.sudeepdit_reg import SudeepDiTREG
     from mip.networks.sudeepdit_repa import SudeepDiTREPA
     from mip.networks.sudeepdit_repa_agg import SudeepDiTREPAAgg
@@ -40,6 +43,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "vanilla_rnn": VanillaRNN,
         "sudeepdit": SudeepDiT,
         "sudeepdit_og": SudeepDiTOG,
+        "sudeepdit_og_condistill": SudeepDiTOGCondistill,
         "sudeepdit_repa": SudeepDiTREPA,
         "sudeepdit_reg": SudeepDiTREG,
         "sudeepdit_repa_agg": SudeepDiTREPAAgg,
@@ -117,7 +121,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
                 }
             )
         return network_class(**rnn_params)
-    elif network_config.network_type == "sudeepdit" or network_config.network_type == 'sudeepdit_og':
+    elif network_config.network_type == "sudeepdit" or network_config.network_type == 'sudeepdit_og' or network_config.network_type == "sudeepdit_og_condistill":
         return network_class(
             **common_params,
             d_model=network_config.emb_dim,
@@ -128,7 +132,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         )
 
     elif "sudeepdit_repa" in network_config.network_type  or "sudeepdit_reg" in network_config.network_type:
-        loguru.logger.info(f"REPA config - align_depth: {network_config.align_depth} | projector_dim: {network_config.projector_dim} | z_dims: {network_config.z_dims}")
+        loguru.logger.info(f"REPA config - projector_dim: {network_config.projector_dim} | z_dims: {network_config.z_dims}")
         return network_class(
             **common_params,
             d_model=network_config.emb_dim,
@@ -136,20 +140,18 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             depth=network_config.num_layers,
             dropout=network_config.dropout,
             timestep_emb_type=network_config.timestep_emb_type,
-            align_depth=network_config.align_depth,
             projector_dim=network_config.projector_dim,
             z_dims=network_config.z_dims,
         )
 
 
-
 def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
     if task_config.obs_type == "image":
         # Force image encoder for image observations
-        encoder_type = "image"
+        encoder_type = getattr(network_config, "encoder_type", "image") or "image"
     elif task_config.obs_type in ["state", "keypoint"]:
         # For state/keypoint, default to configured encoder
-        encoder_type = getattr(network_config, "encoder_type", "mlp")
+        encoder_type = getattr(network_config, "encoder_type", "mlp") or "mlp"
     else:
         raise ValueError(f"Invalid observation type: {task_config.obs_type}")
     loguru.logger.info(f"Using encoder type: {encoder_type}")
@@ -184,8 +186,104 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
             "use_group_norm": task_config.use_group_norm,
         }
         return MultiImageObsEncoder(**kwargs)
+    elif encoder_type == "dino":
+        dino_embed_dims = {
+            "vits16": 384, "vits16plus": 384,
+            "vitb16": 768, "vitl16": 1024,
+        }
+        dino_embed_dim = dino_embed_dims[task_config.dino_model]
+        dino_types = task_config.dino_types or ["cls"]
+        if task_config.camera_keys:
+            num_cams = len(task_config.camera_keys)
+        else:
+            num_cams = sum(
+                1 for attr in task_config.shape_meta["obs"].values()
+                if attr.get("type", "low_dim") == "rgb"
+            )
+        num_views = num_cams * len(dino_types)
+        # Collect low_dim keys and their total dimension from shape_meta
+        low_dim_keys = []
+        low_dim_total_dim = 0
+        for key, attr in task_config.shape_meta["obs"].items():
+            if attr.get("type", "low_dim") == "low_dim":
+                low_dim_keys.append(key)
+                low_dim_total_dim += attr["shape"][0]
+        return PrecomputedDINOEncoder(
+            num_views=num_views,
+            dino_embed_dim=dino_embed_dim,
+            emb_dim=network_config.emb_dim,
+            dropout=network_config.encoder_dropout,
+            low_dim_keys=low_dim_keys,
+            low_dim_total_dim=low_dim_total_dim,
+        )
     else:
         raise ValueError(f"Invalid encoder type: {encoder_type}")
+
+
+def get_extra_cond_encoder(network_config: NetworkConfig, task_config: TaskConfig):
+    extra_cond_encoder_type = getattr(task_config, "latent_type", "image") or "image"
+    loguru.logger.info(f"Using extra cond encoder type: {extra_cond_encoder_type}")
+
+    if extra_cond_encoder_type == "image":
+        # Filter shape_meta to only include rgb keys (no low_dim)
+        rgb_only_shape_meta = {
+            "obs": {
+                k: v for k, v in task_config.shape_meta["obs"].items()
+                if v.get("type", "low_dim") != "low_dim"
+            },
+        }
+        kwargs = {
+            "shape_meta": rgb_only_shape_meta,
+            "rgb_model_name": network_config.rgb_model_name,
+            "emb_dim": network_config.emb_dim,
+            "use_seq": network_config.use_seq,
+            "keep_horizon_dims": network_config.keep_horizon_dims,
+            "resize_shape": task_config.resize_shape,
+            "crop_shape": task_config.crop_shape,
+            "random_crop": task_config.random_crop,
+            "use_group_norm": task_config.use_group_norm,
+        }
+        return MultiImageObsEncoder(**kwargs)
+    elif extra_cond_encoder_type == "dino":
+        dino_embed_dims = {
+            "vits16": 384, "vits16plus": 384,
+            "vitb16": 768, "vitl16": 1024,
+        }
+        dino_embed_dim = dino_embed_dims[task_config.dino_model]
+        dino_types = task_config.dino_types or ["cls"]
+        if task_config.camera_keys:
+            num_cams = len(task_config.camera_keys)
+        else:
+            num_cams = sum(
+                1 for attr in task_config.shape_meta["obs"].values()
+                if attr.get("type", "low_dim") == "rgb"
+            )
+        num_views = num_cams * len(dino_types)
+        return PrecomputedDINOEncoder(
+            num_views=num_views,
+            dino_embed_dim=dino_embed_dim,
+            emb_dim=network_config.emb_dim,
+            dropout=network_config.extra_cond_encoder_dropout,
+        )
+    elif extra_cond_encoder_type == "lam":
+        lam_latent_dims = {"bn": 32, "prebn": 1024}
+        latent_dim = lam_latent_dims[task_config.lam_latent_type]
+        if task_config.lam_camera_keys:
+            num_cams = len(task_config.lam_camera_keys)
+        else:
+            num_cams = sum(
+                1 for attr in task_config.shape_meta["obs"].values()
+                if attr.get("type", "low_dim") == "rgb"
+            )
+        num_views = num_cams * len(task_config.lam_frame_skips)
+        return PrecomputedLAMEncoder(
+            num_views=num_views,
+            latent_dim=latent_dim,
+            emb_dim=network_config.emb_dim,
+            dropout=network_config.extra_cond_encoder_dropout,
+        )
+    else:
+        raise ValueError(f"Invalid extra cond encoder type: {extra_cond_encoder_type}")
 
 
 def get_lam(lam_config: LAMConfig):
@@ -214,8 +312,41 @@ def get_lam(lam_config: LAMConfig):
         raise ValueError("No pretrained LAM checkpoint provided")
 
 
-def get_dino(dino_model: str):
-    pass
+def get_dino(task_config: TaskConfig):
+    """Load a pretrained DINOv3 ViT model for on-the-fly feature extraction.
+
+    Args:
+        task_config: TaskConfig with dino_model, dino_ckpt_dir, dino_repo fields.
+
+    Returns:
+        nn.Module: DINOv3 model in eval mode with requires_grad=False.
+    """
+    import os
+
+    DINO_MODELS = {
+        "vits16": {"hub_name": "dinov3_vits16", "embed_dim": 384, "ckpt_file": "dinov3_vits16.pth"},
+        "vits16plus": {"hub_name": "dinov3_vits16plus", "embed_dim": 384, "ckpt_file": "dinov3_vits16plus.pth"},
+        "vitb16": {"hub_name": "dinov3_vitb16", "embed_dim": 768, "ckpt_file": "dinov3_vitb16.pth"},
+        "vitl16": {"hub_name": "dinov3_vitl16", "embed_dim": 1024, "ckpt_file": "dinov3_vitl16.pth"},
+    }
+
+    model_name = task_config.dino_model
+    if model_name not in DINO_MODELS:
+        raise ValueError(f"Unknown DINO model '{model_name}'. Choose from: {list(DINO_MODELS.keys())}")
+
+    info = DINO_MODELS[model_name]
+    ckpt_dir = getattr(task_config, "dino_ckpt_dir", "/oscar/data/csun45/zzeng28/cache/torch/dinov3")
+    dino_repo = getattr(task_config, "dino_repo", "/oscar/data/csun45/zzeng28/cache/torch/dinov3/dinov3")
+    ckpt_path = os.path.join(ckpt_dir, info["ckpt_file"])
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"DINO checkpoint not found: {ckpt_path}")
+
+    model = torch.hub.load(dino_repo, info["hub_name"], source="local", weights=ckpt_path)
+    model.eval()
+    model.requires_grad_(False)
+    loguru.logger.info(f"Loaded DINOv3 {model_name} (embed_dim={info['embed_dim']}) from {ckpt_path}")
+    return model
 
 class GroupNorm1d(nn.Module):
     def __init__(self, dim, num_groups=32, min_channels_per_group=4, eps=1e-5):

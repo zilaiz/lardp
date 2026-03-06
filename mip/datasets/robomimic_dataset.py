@@ -69,9 +69,9 @@ def make_dataset(task_config, mode="train"):
         elif task_config.obs_type == "image":
             latent_type = task_config.latent_type
             use_precomputed = task_config.use_precomputed
+            camera_keys = task_config.camera_keys
             if latent_type == 'lam':
                 lam_frame_skips = task_config.lam_frame_skips
-                lam_camera_keys = task_config.lam_camera_keys
                 lam_latent_type = task_config.lam_latent_type
                 if lam_latent_type is not None and use_precomputed:
                     return RobomimicImageLAMDataset(
@@ -84,14 +84,13 @@ def make_dataset(task_config, mode="train"):
                         abs_action=task_config.abs_action,
                         val_dataset_percentage=task_config.val_dataset_percentage,
                         mode=mode,
+                        camera_keys=camera_keys,
                         lam_frame_skips=lam_frame_skips,
-                        lam_camera_keys=lam_camera_keys,
                         lam_latent_type=lam_latent_type,
                     )
             elif latent_type == 'dino':
                 dino_model = task_config.dino_model
                 dino_types = task_config.dino_types
-                dino_camera_keys = task_config.dino_camera_keys
                 if dino_model is not None and use_precomputed:
                     return RobomimicImageDINODataset(
                         dataset_path,
@@ -105,7 +104,7 @@ def make_dataset(task_config, mode="train"):
                         mode=mode,
                         dino_model=dino_model,
                         dino_types=dino_types,
-                        dino_camera_keys=dino_camera_keys
+                        camera_keys=camera_keys
                     )
             elif latent_type is not None:
                 return RobomimicImageREPADataset(
@@ -118,7 +117,7 @@ def make_dataset(task_config, mode="train"):
                     abs_action=task_config.abs_action,
                     val_dataset_percentage=task_config.val_dataset_percentage,
                     mode=mode,
-                    lam_camera_keys=lam_camera_keys,
+                    camera_keys=camera_keys,
                 )
             return RobomimicImageDataset(
                 dataset_path,
@@ -501,7 +500,7 @@ class RobomimicImageREPADataset(BaseDataset):
         rotation_rep="rotation_6d",
         val_dataset_percentage=0.0,
         mode="train",
-        lam_camera_keys=None,
+        camera_keys=None,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -509,7 +508,7 @@ class RobomimicImageREPADataset(BaseDataset):
         )
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
-        self.lam_camera_keys = lam_camera_keys  # None = all rgb_keys
+        self.extra_camera_keys = camera_keys  # None = all rgb_keys
 
         self.replay_buffer = _convert_robomimic_to_replay(
             store=zarr.storage.MemoryStore(),
@@ -531,19 +530,19 @@ class RobomimicImageREPADataset(BaseDataset):
             elif type == "low_dim":
                 lowdim_keys.append(key)
 
-        # Determine which rgb_keys are used for LAM
-        if self.lam_camera_keys is not None:
-            lam_rgb_keys = [k for k in rgb_keys if k in self.lam_camera_keys]
+        # Determine which rgb_keys are used for extra_raw_images
+        if self.extra_camera_keys is not None:
+            extra_rgb_keys = [k for k in rgb_keys if k in self.extra_camera_keys]
         else:
-            lam_rgb_keys = list(rgb_keys)
-        non_lam_rgb_keys = [k for k in rgb_keys if k not in lam_rgb_keys]
+            extra_rgb_keys = list(rgb_keys)
+        non_extra_rgb_keys = [k for k in rgb_keys if k not in extra_rgb_keys]
 
-        # BUG FIX: Only limit non-LAM keys to n_obs_steps.
-        # LAM camera keys need ALL horizon+1 frames (not just n_obs_steps),
+        # BUG FIX: Only limit non-extra keys to n_obs_steps.
+        # extra camera keys need ALL horizon+1 frames (not just n_obs_steps),
         # otherwise SequenceSampler fills frames beyond n_obs_steps with NaN.
         key_first_k = {}
         if n_obs_steps is not None:
-            for key in non_lam_rgb_keys + lowdim_keys:
+            for key in non_extra_rgb_keys + lowdim_keys:
                 key_first_k[key] = n_obs_steps
 
         self.sampler = SequenceSampler(
@@ -557,7 +556,7 @@ class RobomimicImageREPADataset(BaseDataset):
         self.shape_meta = shape_meta
         self.rgb_keys = rgb_keys
         self.lowdim_keys = lowdim_keys
-        self.lam_rgb_keys = lam_rgb_keys
+        self.extra_rgb_keys = extra_rgb_keys
         self.abs_action = abs_action
         self.horizon = horizon
         self.pad_before = pad_before
@@ -588,11 +587,11 @@ class RobomimicImageREPADataset(BaseDataset):
         T_slice = slice(self.n_obs_steps)
 
         obs_dict = {}
-        lam_raw_images = {}
+        extra_raw_images = {}
         for key in self.rgb_keys:
-            # For LAM cameras: extract all horizon+1 raw frames as float32/255
-            if key in self.lam_rgb_keys:
-                lam_raw_images[key] = sample[key].astype(np.float32) / 255.0  # (horizon+1, H, W, C)
+            # For extra cameras: extract all horizon+1 raw frames as float32/255
+            if key in self.extra_rgb_keys:
+                extra_raw_images[key] = np.moveaxis(sample[key], -1, 1).astype(np.float32) / 255.0  # (horizon+1, H, W, C)
 
             # For obs: first n_obs_steps frames, channel-first, normalized
             obs_dict[key] = (
@@ -613,7 +612,7 @@ class RobomimicImageREPADataset(BaseDataset):
         torch_data = {
             "obs": dict_apply(obs_dict, torch.tensor),
             "action": torch.tensor(action),
-            "lam_raw_images": dict_apply(lam_raw_images, torch.tensor),
+            "extra_raw_images": dict_apply(extra_raw_images, torch.tensor),
         }
         return torch_data
 
@@ -927,7 +926,7 @@ class RobomimicImageLAMDataset(BaseDataset):
         val_dataset_percentage=0.0,
         mode="train",
         lam_frame_skips=None,
-        lam_camera_keys=None,
+        camera_keys=None,
         lam_latent_type="prebn",
     ):
         super().__init__()
@@ -937,7 +936,7 @@ class RobomimicImageLAMDataset(BaseDataset):
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
         self.lam_frame_skips = lam_frame_skips or []
-        self.lam_camera_keys = lam_camera_keys
+        self.lam_camera_keys = camera_keys
         self.lam_latent_type = lam_latent_type
 
         self.replay_buffer = _convert_robomimic_lam_to_replay(
@@ -1311,7 +1310,7 @@ class RobomimicImageDINODataset(BaseDataset):
         mode="train",
         dino_model="vits16plus",
         dino_types=None,
-        dino_camera_keys=None,
+        camera_keys=None,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -1323,7 +1322,7 @@ class RobomimicImageDINODataset(BaseDataset):
             dino_types = ["cls"]
         self.dino_types = dino_types
         self.dino_model = dino_model
-        self.dino_camera_keys = dino_camera_keys
+        self.dino_camera_keys = camera_keys
 
         self.replay_buffer = _convert_robomimic_dino_to_replay(
             store=zarr.storage.MemoryStore(),

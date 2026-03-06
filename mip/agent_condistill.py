@@ -14,12 +14,16 @@ from mip.config import Config
 from mip.flow_map import FlowMap
 from mip.interpolant import Interpolant
 from mip.losses import get_loss_fn
-from mip.network_utils import get_dino, get_encoder, get_lam, get_network
+from mip.network_utils import (
+    get_encoder,
+    get_extra_cond_encoder,
+    get_network,
+)
 from mip.samplers import get_sampler
 from mip.torch_utils import report_parameters
 
 
-class TrainingAgentREG:
+class TrainingAgentCondistill:
     """Training agent for behavior cloning with flow matching."""
 
     def __init__(
@@ -43,30 +47,33 @@ class TrainingAgentREG:
         self.encoder = get_encoder(config.network, config.task).to(
             config.optimization.device
         )
+        self.extra_cond_encoder = get_extra_cond_encoder(config.network, config.task).to(
+            config.optimization.device
+        )
         report_parameters(self.encoder, model_name="Encoder Network")
+        report_parameters(self.extra_cond_encoder, model_name="Extra Cond Encoder Network")
         self.encoder_ema = deepcopy(self.encoder).requires_grad_(False)
+        self.extra_cond_encoder_ema = deepcopy(self.extra_cond_encoder).requires_grad_(False)
         self.flow_map_ema = deepcopy(self.flow_map).requires_grad_(False)
-
-        # REPA specific
-        if config.task.latent_type is not None and not config.task.use_precomputed:
-            self.lam = get_lam(config.lam).to(config.optimization.device) if config.task.latent_type == "lam" else get_dino(config.task).to(config.optimization.device)
-        else:
-            self.lam = None  # Not needed — either no LAM or targets come from HDF5
 
         # Create detached models for CUDA graphs (if enabled)
         self.use_cudagraphs = config.optimization.use_cudagraphs
         if self.use_cudagraphs:
             self.flow_map_detach = deepcopy(self.flow_map).requires_grad_(False)
             self.encoder_detach = deepcopy(self.encoder).requires_grad_(False)
+            self.extra_cond_encoder_detach = deepcopy(self.extra_cond_encoder).requires_grad_(False)
             self.flow_map_ema_detach = deepcopy(self.flow_map_ema).requires_grad_(False)
             self.encoder_ema_detach = deepcopy(self.encoder_ema).requires_grad_(False)
+            self.extra_cond_encoder_ema_detach = deepcopy(self.extra_cond_encoder_ema).requires_grad_(False)
         else:
             self.flow_map_detach = None
             self.encoder_detach = None
+            self.extra_cond_encoder_detach = None
             self.flow_map_ema_detach = None
             self.encoder_ema_detach = None
+            self.extra_cond_encoder_ema_detach = None
 
-        params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
+        params = list(self.encoder.parameters()) + list(self.extra_cond_encoder.parameters()) + list(self.flow_map.parameters())
         self.optimizer = torch.optim.AdamW(
             params,
             lr=config.optimization.lr,
@@ -106,8 +113,10 @@ class TrainingAgentREG:
             # Copy params to detached models without gradients
             from_module(self.flow_map).data.to_module(self.flow_map_detach)
             from_module(self.encoder).data.to_module(self.encoder_detach)
+            from_module(self.extra_cond_encoder).data.to_module(self.extra_cond_encoder_detach)
             from_module(self.flow_map_ema).data.to_module(self.flow_map_ema_detach)
             from_module(self.encoder_ema).data.to_module(self.encoder_ema_detach)
+            from_module(self.extra_cond_encoder_ema).data.to_module(self.extra_cond_encoder_ema_detach)
 
             # Wrap sampler with context manager to use detached models
             self._sample_fn = self._inference_mode()(self._sample_impl)
@@ -154,13 +163,17 @@ class TrainingAgentREG:
             # Swap to detached models for CUDA graphs
             flow_map_backup = self.flow_map
             encoder_backup = self.encoder
+            extra_cond_encoder_backup = self.extra_cond_encoder
             flow_map_ema_backup = self.flow_map_ema
             encoder_ema_backup = self.encoder_ema
+            extra_cond_encoder_ema_backup = self.extra_cond_encoder_ema
 
             self.flow_map = self.flow_map_detach
             self.encoder = self.encoder_detach
+            self.extra_cond_encoder = self.extra_cond_encoder_detach
             self.flow_map_ema = self.flow_map_ema_detach
             self.encoder_ema = self.encoder_ema_detach
+            self.extra_cond_encoder_ema = self.extra_cond_encoder_ema_detach
 
             try:
                 yield
@@ -168,22 +181,27 @@ class TrainingAgentREG:
                 # Restore original models
                 self.flow_map = flow_map_backup
                 self.encoder = encoder_backup
+                self.extra_cond_encoder = extra_cond_encoder_backup
                 self.flow_map_ema = flow_map_ema_backup
                 self.encoder_ema = encoder_ema_backup
+                self.extra_cond_encoder_ema = extra_cond_encoder_ema_backup
         else:
             # For regular mode, temporarily set to eval
             was_training = self.flow_map.training
             try:
                 self.flow_map.eval()
                 self.encoder.eval()
+                self.extra_cond_encoder.eval()
                 self.flow_map_ema.eval()
                 self.encoder_ema.eval()
+                self.extra_cond_encoder_ema.eval()
                 yield
             finally:
                 # Restore training mode if it was training
                 if was_training:
                     self.flow_map.train()
                     self.encoder.train()
+                    self.extra_cond_encoder.train()
 
     def _sync_detached_models(self):
         """Synchronize detached models with main models for CUDA graphs."""
@@ -193,8 +211,10 @@ class TrainingAgentREG:
             # Copy parameters without gradients using tensordict
             from_module(self.flow_map).data.to_module(self.flow_map_detach)
             from_module(self.encoder).data.to_module(self.encoder_detach)
+            from_module(self.extra_cond_encoder).data.to_module(self.extra_cond_encoder_detach)
             from_module(self.flow_map_ema).data.to_module(self.flow_map_ema_detach)
             from_module(self.encoder_ema).data.to_module(self.encoder_ema_detach)
+            from_module(self.extra_cond_encoder_ema).data.to_module(self.extra_cond_encoder_ema_detach)
 
     def _create_update_impl(self):
         """Create the update implementation function that will be compiled.
@@ -218,30 +238,32 @@ class TrainingAgentREG:
             # Extract from TensorDict
             act = data["act"]
             obs = data["obs"]
+            extra_cond = data["extra_cond"]
             delta_t = data["delta_t"]
-            cls_tokens = data["cls_tokens"]
-            tgt_act_reps = data["tgt_act_reps"]
 
             # Forward pass and compute loss
-            dp_loss, projection_loss, dp_cls_loss, _info = self.loss_fn(
+            dp_loss, projection_loss, _info = self.loss_fn(
                 self.config.optimization,
                 self.flow_map,
                 self.encoder,
+                self.extra_cond_encoder,
+                self.flow_map_ema,
+                self.encoder_ema,
+                self.extra_cond_encoder_ema,
                 self.interpolant,
                 act,
                 obs,
+                extra_cond,
                 delta_t,
-                cls_tokens,
-                tgt_act_reps.permute(1, 0, 2, 3), # N, B, T, z_dim
             )
 
-            loss = dp_loss + dp_cls_loss + projection_loss
+            loss = dp_loss + projection_loss
 
             # Backward pass
             loss.backward()
 
             # Gradient clipping
-            params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
+            params = list(self.encoder.parameters()) + list(self.extra_cond_encoder.parameters()) + list(self.flow_map.parameters())
             if self.config.optimization.grad_clip_norm:
                 grad_norm = nn.utils.clip_grad_norm_(
                     params, self.config.optimization.grad_clip_norm
@@ -261,7 +283,6 @@ class TrainingAgentREG:
             result = TensorDict(
                 {
                     "dp_loss": dp_loss.detach(),
-                    "dp_cls_loss": dp_cls_loss.detach(),
                     "repa_loss": projection_loss.detach(),
                     "loss": loss.detach(),
                     "grad_norm": grad_norm.detach(),
@@ -274,8 +295,8 @@ class TrainingAgentREG:
 
     def _ema_update_impl(self):
         """EMA update implementation (can be part of compiled function)."""
-        params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
-        params_ema = list(self.encoder_ema.parameters()) + list(
+        params = list(self.encoder.parameters()) + list(self.extra_cond_encoder.parameters()) + list(self.flow_map.parameters())
+        params_ema = list(self.encoder_ema.parameters()) + list(self.extra_cond_encoder_ema.parameters()) + list(
             self.flow_map_ema.parameters()
         )
         with torch.no_grad():
@@ -288,9 +309,8 @@ class TrainingAgentREG:
         self,
         act: torch.Tensor,
         obs: torch.Tensor | dict | TensorDict,
+        extra_cond: torch.Tensor | dict | TensorDict,
         delta_t: torch.Tensor,
-        cls_tokens: torch.Tensor,
-        tgt_act_reps: torch.Tensor
     ):
         """Update the model parameters with a training batch.
 
@@ -323,10 +343,8 @@ class TrainingAgentREG:
             {
                 "act": act,
                 "obs": obs,  # obs can be dict or tensor - TensorDict will handle it
+                "extra_cond": extra_cond,
                 "delta_t": delta_t,
-                "cls_tokens": cls_tokens,
-                "tgt_act_reps": tgt_act_reps,
-
             },
             batch_size=act.shape[0],
         )
@@ -335,7 +353,6 @@ class TrainingAgentREG:
         # Convert TensorDict to regular dict with scalar values
         return {
             "dp_loss": result["dp_loss"],
-            "dp_cls_loss": result["dp_cls_loss"],
             "repa_loss": result["repa_loss"],
             "loss": result["loss"],
             "grad_norm": result["grad_norm"],
@@ -343,8 +360,8 @@ class TrainingAgentREG:
 
     def ema_update(self):
         """Update exponential moving average parameters."""
-        params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
-        ema_params = list(self.encoder_ema.parameters()) + list(
+        params = list(self.encoder.parameters()) + list(self.extra_cond_encoder.parameters()) + list(self.flow_map.parameters())
+        ema_params = list(self.encoder_ema.parameters()) + list(self.extra_cond_encoder_ema.parameters()) + list(
             self.flow_map_ema.parameters()
         )
         with torch.no_grad():
@@ -360,7 +377,6 @@ class TrainingAgentREG:
         encoder,
         act_0: torch.Tensor,
         obs: torch.Tensor,
-        cls_token: torch.Tensor = None,
     ):
         """Internal sampling implementation (can be compiled).
 
@@ -374,13 +390,12 @@ class TrainingAgentREG:
         Returns:
             Sampled action tensor
         """
-        return self.sampler(config, flow_map, encoder, act_0, obs, cls_token)
+        return self.sampler(config, flow_map, encoder, act_0, obs)
 
     def sample(
         self,
         act_0: torch.Tensor,
         obs: torch.Tensor,
-        cls_token_0: torch.Tensor,
         num_steps: int = -1,
         use_ema: bool = True,
     ):
@@ -389,7 +404,6 @@ class TrainingAgentREG:
         Args:
             act_0: Initial action tensor of shape (batch_size, Ta, act_dim)
             obs: Observation tensor of shape (batch_size, To, obs_dim)
-            cls_token_0: cls token tensor of shape (batch_size, 1, z_dim)
             num_steps: Number of sampling steps (default: use config value)
             use_ema: Whether to use EMA parameters for sampling
 
@@ -426,9 +440,9 @@ class TrainingAgentREG:
             # For regular mode, we temporarily switch to eval mode
             if not self.use_cudagraphs:
                 with self._inference_mode():
-                    act = self._compiled_sampler(config, flow_map, encoder, act_0, obs, cls_token_0)
+                    act = self._compiled_sampler(config, flow_map, encoder, act_0, obs)
             else:
-                act = self._compiled_sampler(config, flow_map, encoder, act_0, obs, cls_token_0)
+                act = self._compiled_sampler(config, flow_map, encoder, act_0, obs)
         return act
 
     def save(self, path: str, training_state: dict = None):
@@ -442,7 +456,9 @@ class TrainingAgentREG:
         checkpoint = {
             "flow_map": self.flow_map.state_dict(),
             "encoder": self.encoder.state_dict(),
+            "extra_cond_encoder": self.extra_cond_encoder.state_dict(),
             "encoder_ema": self.encoder_ema.state_dict(),
+            "extra_cond_encoder_ema": self.extra_cond_encoder_ema.state_dict(),
             "flow_map_ema": self.flow_map_ema.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }
@@ -469,6 +485,8 @@ class TrainingAgentREG:
         )
         self.flow_map.load_state_dict(state_dict["flow_map"])
         self.encoder.load_state_dict(state_dict["encoder"])
+        self.extra_cond_encoder.load_state_dict(state_dict["extra_cond_encoder"])
+        self.extra_cond_encoder_ema.load_state_dict(state_dict["extra_cond_encoder_ema"])
         self.encoder_ema.load_state_dict(state_dict["encoder_ema"])
         self.flow_map_ema.load_state_dict(state_dict["flow_map_ema"])
 
@@ -493,12 +511,16 @@ class TrainingAgentREG:
         """Set all models to evaluation mode."""
         self.flow_map.eval()
         self.encoder.eval()
+        self.extra_cond_encoder.eval()
         self.flow_map_ema.eval()
         self.encoder_ema.eval()
+        self.extra_cond_encoder_ema.eval()
 
     def train(self):
         """Set all models to training mode."""
         self.flow_map.train()
         self.encoder.train()
+        self.extra_cond_encoder.train()
         self.flow_map_ema.train()
         self.encoder_ema.train()
+        self.extra_cond_encoder_ema.train()

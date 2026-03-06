@@ -26,16 +26,15 @@ use_group_norm: true
 use_seq: true
 
 # REPA specific settings
-latent_type: null
+latent_type: null  # "image", "lam", "dino"
 use_precomputed: false
+camera_keys: null
 
 # LAM
 lam_frame_skips: [1]
-lam_camera_keys: null
 lam_latent_type: null
 
 # DINO
 dino_model: null
 dino_types: null
-dino_camera_keys: null
 dino_align_target: null

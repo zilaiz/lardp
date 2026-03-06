@@ -32,6 +32,14 @@ def _with_pos_embed(tensor, pos=None):
     return tensor if pos is None else tensor + pos
 
 
+def build_mlp(hidden_size, projector_dim):
+    return nn.Sequential(
+            nn.Linear(hidden_size, projector_dim),
+            nn.SiLU(),
+            nn.Linear(projector_dim, hidden_size),
+        )
+
+
 class _PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -248,7 +256,7 @@ class _TransformerDecoder(_TransformerEncoder):
         return x
 
 
-class SudeepDiTOG(BaseNetwork):
+class SudeepDiTOGCondistill(BaseNetwork):
     def __init__(
         self,
         act_dim: int,
@@ -261,7 +269,7 @@ class SudeepDiTOG(BaseNetwork):
         dropout: float = 0.0,
         timestep_emb_type: str = "positional",
         timestep_emb_params: dict | None = None,
-        disable_time_embedding: bool = False,
+        disable_time_embedding: bool = False
     ):
         # BaseNetwork expects: act_dim, Ta, obs_dim, To, emb_dim, n_layers
         emb_dim = d_model  # Use d_model as embedding dimension
@@ -325,6 +333,9 @@ class SudeepDiTOG(BaseNetwork):
         )
         self.decoder = _TransformerDecoder(decoder_module, depth)
 
+        # REPA
+        self.projector = build_mlp(d_model, d_model * 2)
+
         # Output layers
         self.final_layer = _FinalLayer(d_model, act_dim)
 
@@ -345,6 +356,7 @@ class SudeepDiTOG(BaseNetwork):
         s: torch.Tensor,
         t: torch.Tensor,
         condition: torch.Tensor | None = None,
+        align_depth: int | None = None,
     ):
         """Input:
             x:          (b, Ta, act_dim)
@@ -384,7 +396,15 @@ class SudeepDiTOG(BaseNetwork):
         x_tokens = x_tokens + self.dec_pos[:Ta]
 
         # Decode: time embedding conditions the decoder, enc_cache provides obs context
-        y_tokens = self.decoder(x_tokens, time_emb, enc_cache)
+        # y_tokens = self.decoder(x_tokens, time_emb, enc_cache)
+        y_tokens = x_tokens
+        zs_tilde = None
+        for i, (layer, cond) in enumerate(zip(self.decoder.layers, enc_cache, strict=False)):
+            y_tokens = layer(y_tokens, time_emb, cond)
+            if (i + 1) == align_depth:
+                # y_tokens: (Ta, B, d_model)
+                # projector output: (Ta, B, z_dim) → transpose → (B, Ta, z_dim)
+                zs_tilde = [self.projector(y_tokens).transpose(0, 1)]
 
         # Final output layer
         y = self.final_layer(y_tokens, time_emb, enc_cache[-1])  # (b, Ta, act_dim)
@@ -399,29 +419,30 @@ class SudeepDiTOG(BaseNetwork):
         # )  # (b, 2*act_dim + d_model)
         # scalar = self.scalar_head(scalar_features)  # (b, 1)
 
-        return y, scalar
+        return y, scalar, zs_tilde
 
 
 def test_sudeepdit():
-    """Test SudeepDiT network"""
+    """Test SudeepDiTOGCondistill network"""
     print("=" * 50)
-    print("Testing SudeepDiT")
+    print("Testing SudeepDiTOGCondistill")
     print("=" * 50)
 
     act_dim = 2
     Ta = 4
-    obs_dim = 3
+    d_model = 128
+    obs_dim = d_model  # obs_dim must equal d_model (enforced by network_utils)
     To = 2
     batch_size = 4
 
-    model = SudeepDiTOG(
+    model = SudeepDiTOGCondistill(
         act_dim=act_dim,
         Ta=Ta,
         obs_dim=obs_dim,
         To=To,
-        d_model=128,
+        d_model=d_model,
         n_heads=4,
-        depth=2,  # Reduced for testing
+        depth=2,
         dropout=0.1,
         timestep_emb_type="positional",
     )
@@ -431,42 +452,60 @@ def test_sudeepdit():
     t = torch.randn(batch_size)
     condition = torch.randn(batch_size, To, obs_dim)
 
-    y, scalar_out = model(x, s, t, condition)
-
+    # align_depth=0 (default) -> zs_tilde is None
+    y, scalar_out, zs_tilde = model(x, s, t, condition)
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {y.shape}")
-    print(f"Scalar output shape: {scalar_out.shape}")
+    print(f"Scalar output: {scalar_out}")
+    print(f"zs_tilde (align_depth=0): {zs_tilde}")
 
     # Test without condition
-    y_no_cond, scalar_no_cond = model(x, s, t, None)
+    y_no_cond, _, zs_no_cond = model(x, s, t, None)
     print(f"Output without condition shape: {y_no_cond.shape}")
-    print(f"Scalar without condition shape: {scalar_no_cond.shape}")
+    print(f"zs_tilde without condition: {zs_no_cond}")
 
-    # Test with disable_time_embedding=True
-    print("\nTesting with disable_time_embedding=True:")
-    model_no_time = SudeepDiTOG(
+    # Test with align_depth=1
+    print("\nTesting with align_depth=1:")
+    model_align = SudeepDiTOGCondistill(
         act_dim=act_dim,
         Ta=Ta,
         obs_dim=obs_dim,
         To=To,
-        d_model=128,
+        d_model=d_model,
+        n_heads=4,
+        depth=2,
+        dropout=0.1,
+        align_depth=1,
+    )
+    y_a, _, zs_a = model_align(x, s, t, condition)
+    print(f"Output shape: {y_a.shape}, zs_tilde[0] shape: {zs_a[0].shape}")
+
+    # Test variable-length condition (condistill use case)
+    cond_long = torch.randn(batch_size, 11, obs_dim)
+    y_long, _, zs_long = model_align(x, s, t, cond_long)
+    print(f"Variable-length cond (11 tokens): y={y_long.shape}, zs_tilde[0]={zs_long[0].shape}")
+
+    # Test with disable_time_embedding=True
+    print("\nTesting with disable_time_embedding=True:")
+    model_no_time = SudeepDiTOGCondistill(
+        act_dim=act_dim,
+        Ta=Ta,
+        obs_dim=obs_dim,
+        To=To,
+        d_model=d_model,
         n_heads=4,
         depth=2,
         disable_time_embedding=True,
     )
 
-    y1, s1 = model_no_time(x, s, t, condition)
-    # Test with different time values - should give same output
-    y2, s2 = model_no_time(
+    y1, _, _ = model_no_time(x, s, t, condition)
+    y2, _, _ = model_no_time(
         x, torch.randn(batch_size), torch.randn(batch_size), condition
     )
-
-    print(
-        f"Time invariant: {torch.allclose(y1, y2, atol=1e-6) and torch.allclose(s1, s2, atol=1e-6)}"
-    )
+    print(f"Time invariant: {torch.allclose(y1, y2, atol=1e-6)}")
 
     print("=" * 50)
-    print("SudeepDiT test completed!")
+    print("SudeepDiTOGCondistill test completed!")
     print("=" * 50)
 
 

@@ -270,7 +270,6 @@ class SudeepDiTREPAAgg(BaseNetwork):
         timestep_emb_type: str = "positional",
         timestep_emb_params: dict | None = None,
         disable_time_embedding: bool = False,
-        align_depth: int = 0,
         projector_dim: int = 2048,
         z_dims: list[int] | None = None,
     ):
@@ -343,7 +342,6 @@ class SudeepDiTREPAAgg(BaseNetwork):
 
         # REPA
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        self.align_depth = align_depth
         if z_dims is None:
             z_dims = [1024]
         self.projectors = nn.ModuleList([
@@ -370,6 +368,7 @@ class SudeepDiTREPAAgg(BaseNetwork):
         s: torch.Tensor,
         t: torch.Tensor,
         condition: torch.Tensor | None = None,
+        align_depth: int | None = None,
     ):
         """Input:
             x:          (b, Ta, act_dim)
@@ -424,7 +423,7 @@ class SudeepDiTREPAAgg(BaseNetwork):
         zs_tilde = None
         for i, (layer, cond) in enumerate(zip(self.decoder.layers, enc_cache, strict=False)):
             y_tokens = layer(y_tokens, combined_emb, cond)
-            if (i + 1) == self.align_depth:
+            if (i + 1) == align_depth:
                 # y_tokens: (Ta, B, d_model)
                 # projector output: (Ta, B, z_dim) → transpose → (B, Ta, z_dim)
                 zs_tilde = [projector(y_tokens[:1]).transpose(0, 1) for projector in self.projectors]
@@ -474,16 +473,17 @@ def test_sudeepditrepa():
     t = torch.randn(batch_size)
     condition = torch.randn(batch_size, To, obs_dim)
 
-    y, scalar_out = model(x, s, t, condition)
+    y, scalar_out, zs_tilde = model(x, s, t, condition)
 
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {y.shape}")
-    print(f"Scalar output shape: {scalar_out.shape}")
+    print(f"Scalar output: {scalar_out}")
+    print(f"zs_tilde: {zs_tilde}")
 
     # Test without condition
-    y_no_cond, scalar_no_cond = model(x, s, t, None)
+    y_no_cond, _, zs_no_cond = model(x, s, t, None)
     print(f"Output without condition shape: {y_no_cond.shape}")
-    print(f"Scalar without condition shape: {scalar_no_cond.shape}")
+    print(f"zs_tilde without condition: {zs_no_cond}")
 
     # Test with disable_time_embedding=True
     print("\nTesting with disable_time_embedding=True:")
@@ -498,15 +498,13 @@ def test_sudeepditrepa():
         disable_time_embedding=True,
     )
 
-    y1, s1 = model_no_time(x, s, t, condition)
+    y1, _, _ = model_no_time(x, s, t, condition)
     # Test with different time values - should give same output
-    y2, s2 = model_no_time(
+    y2, _, _ = model_no_time(
         x, torch.randn(batch_size), torch.randn(batch_size), condition
     )
 
-    print(
-        f"Time invariant: {torch.allclose(y1, y2, atol=1e-6) and torch.allclose(s1, s2, atol=1e-6)}"
-    )
+    print(f"Time invariant: {torch.allclose(y1, y2, atol=1e-6)}")
 
     print("=" * 50)
     print("SudeepDiT test completed!")

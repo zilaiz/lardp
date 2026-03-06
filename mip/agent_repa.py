@@ -49,7 +49,7 @@ class TrainingAgentREPA:
 
         # REPA specific
         if config.task.latent_type is not None and not config.task.use_precomputed:
-            self.lam = get_lam(config.lam).to(config.optimization.device) if config.task.latent_type == "lam" else get_dino(config.task.dino_model).to(config.optimization.device)
+            self.lam = get_lam(config.lam).to(config.optimization.device) if config.task.latent_type == "lam" else get_dino(config.task).to(config.optimization.device)
         else:
             self.lam = None  # Not needed — either no LAM or targets come from HDF5
 
