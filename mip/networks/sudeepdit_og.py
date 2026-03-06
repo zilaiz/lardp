@@ -100,13 +100,16 @@ class _SelfAttnEncoder(nn.Module):
         self.activation = _get_activation_fn(activation)
 
     def forward(self, src, pos):
-        q = k = _with_pos_embed(src, pos)
-        src2, _ = self.self_attn(q, k, value=src, need_weights=False)
+        # Pre-LN: normalize before attention
+        src2 = self.norm1(src)
+        q = k = _with_pos_embed(src2, pos)
+        src2, _ = self.self_attn(q, k, value=src2, need_weights=False)
         src = src + self.dropout1(src2)
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src))))
+        # Pre-LN: normalize before FFN
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout2(self.activation(self.linear1(src2))))
         src = src + self.dropout3(src2)
-        src = self.norm2(src)
+        return src
         return src
 
     def reset_parameters(self):
@@ -211,7 +214,7 @@ class _FinalLayer(nn.Module):
         cond = cond + t
 
         shift, scale = self.adaLN_modulation(cond).chunk(2, dim=1)
-        x = x * scale[None] + shift[None]
+        x = self.norm_final(x) * scale[None] + shift[None]
         x = self.linear(x)
         return x.transpose(0, 1)
 
@@ -246,7 +249,7 @@ class _TransformerDecoder(_TransformerEncoder):
         return x
 
 
-class SudeepDiT(BaseNetwork):
+class SudeepDiTOG(BaseNetwork):
     def __init__(
         self,
         act_dim: int,
@@ -286,27 +289,22 @@ class SudeepDiT(BaseNetwork):
             self.map_s = None
             self.map_t = None
 
-        # Input projection
+        # Input projection (action tokens)
         self.x_proj = nn.Sequential(
             nn.Linear(act_dim, act_dim),
             nn.GELU(approximate="tanh"),
             nn.Linear(act_dim, d_model),
         )
 
-        # Condition projection (from obs_dim * To to d_model)
-        self.cond_proj = nn.Sequential(
-            nn.Linear(obs_dim * To, d_model),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(d_model, d_model),
-        )
+        # Positional encoding for encoder (observation tokens)
+        self.enc_pos = _PositionalEncoding(d_model)
 
-        # Positional encoding
-        self.pos_enc = _PositionalEncoding(d_model)
+        # Learned positional embedding for decoder (action tokens)
         self.register_parameter(
-            "pos_emb",
+            "dec_pos",
             nn.Parameter(torch.empty(Ta, 1, d_model), requires_grad=True),
         )
-        nn.init.xavier_uniform_(self.pos_emb.data)
+        nn.init.xavier_uniform_(self.dec_pos.data)
 
         # Encoder blocks
         encoder_module = _SelfAttnEncoder(
@@ -361,7 +359,7 @@ class SudeepDiT(BaseNetwork):
         batch_size, Ta, act_dim = x.shape
         device = x.device
 
-        # Process time embeddings
+        # Process time embeddings (passed only to decoder, not encoder)
         if self.map_s is not None and self.map_t is not None:
             s_emb = self.map_s(s)  # (b, d_model // 2)
             t_emb = self.map_t(t)  # (b, d_model // 2)
@@ -369,35 +367,28 @@ class SudeepDiT(BaseNetwork):
         else:
             time_emb = torch.zeros(batch_size, self.d_model, device=device)
 
-        # Process condition
+        # Encode observation tokens (original dit-policy mechanism)
+        # obs_dim = d_model (guaranteed by network_utils), so no projection needed
         if condition is not None:
-            cond_flat = torch.flatten(condition, 1)  # (b, To * obs_dim)
-            cond_emb = self.cond_proj(cond_flat)  # (b, d_model)
+            obs_tokens = condition.transpose(0, 1)  # (To, b, d_model)
         else:
-            # Use zero condition if none provided
-            cond_emb = torch.zeros(batch_size, self.d_model, device=device)
+            # Use a single zero token if no condition provided
+            obs_tokens = torch.zeros(1, batch_size, self.d_model, device=device)
 
-        # Combine time and condition embeddings
-        combined_emb = time_emb + cond_emb  # (b, d_model)
+        # Encode observation sequence with positional encoding
+        pos = self.enc_pos(obs_tokens)
+        enc_cache = self.encoder(obs_tokens, pos)
 
-        # Project input and add positional embeddings
+        # Project action tokens and add learned positional embeddings
         x_tokens = self.x_proj(x)  # (b, Ta, d_model)
         x_tokens = x_tokens.transpose(0, 1)  # (Ta, b, d_model)
-        x_tokens = x_tokens + self.pos_emb[:Ta]  # Add positional embeddings
+        x_tokens = x_tokens + self.dec_pos[:Ta]
 
-        # Create condition sequence for encoder (time embedding as "observation")
-        time_emb_expanded = combined_emb.unsqueeze(0)  # (1, b, d_model)
-        cond_seq = time_emb_expanded  # (1, b, d_model)
-
-        # Encode condition
-        pos = self.pos_enc(cond_seq)
-        enc_cache = self.encoder(cond_seq, pos)
-
-        # Decode
-        y_tokens = self.decoder(x_tokens, combined_emb, enc_cache)
+        # Decode: time embedding conditions the decoder, enc_cache provides obs context
+        y_tokens = self.decoder(x_tokens, time_emb, enc_cache)
 
         # Final output layer
-        y = self.final_layer(y_tokens, combined_emb, enc_cache[-1])  # (b, Ta, act_dim)
+        y = self.final_layer(y_tokens, time_emb, enc_cache[-1])  # (b, Ta, act_dim)
 
         # Compute scalar output
         # Use input mean, output mean, and time embedding
@@ -405,7 +396,7 @@ class SudeepDiT(BaseNetwork):
         # x_mean = x.mean(dim=1)  # (b, act_dim)
         # y_mean = y.mean(dim=1)  # (b, act_dim)
         # scalar_features = torch.cat(
-        #     [x_mean, y_mean, combined_emb], dim=1
+        #     [x_mean, y_mean, time_emb], dim=1
         # )  # (b, 2*act_dim + d_model)
         # scalar = self.scalar_head(scalar_features)  # (b, 1)
 
@@ -424,7 +415,7 @@ def test_sudeepdit():
     To = 2
     batch_size = 4
 
-    model = SudeepDiT(
+    model = SudeepDiTOG(
         act_dim=act_dim,
         Ta=Ta,
         obs_dim=obs_dim,
@@ -454,7 +445,7 @@ def test_sudeepdit():
 
     # Test with disable_time_embedding=True
     print("\nTesting with disable_time_embedding=True:")
-    model_no_time = SudeepDiT(
+    model_no_time = SudeepDiTOG(
         act_dim=act_dim,
         Ta=Ta,
         obs_dim=obs_dim,

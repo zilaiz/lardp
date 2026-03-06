@@ -3,14 +3,11 @@ defaults:
   - _base
   - _self_
 
-network_type: "sudeepdit_repa"
+network_type: "sudeepdit_og"
 emb_dim: 256  # Used as d_model
 num_layers: 8  # Used as depth
 dropout: 0.0
 timestep_emb_dim: 128
-align_depth: 2
-projector_dim: 384
-z_dims: [384]
 
 # SudeepDiT specific configs
 n_heads: 4  # Number of attention heads

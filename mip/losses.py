@@ -144,6 +144,11 @@ def flow_repa_loss(
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
     b_t, zs_tilde = flow_map.get_velocity_repa(t, act_t, obs_emb)
 
+    if zs_tilde is None:
+        raise ValueError(
+            "zs_tilde is None — set network.align_depth to a value in [1, depth] to enable REPA"
+        )
+
     # compute loss
     loss = get_norm(b_t - act_t_dot, config.norm_type)
     loss = config.loss_scale * torch.mean(loss)
@@ -183,7 +188,7 @@ def flow_reg_loss(
     act_0 = torch.empty_like(act).normal_(0, 1)
     act_1 = act
 
-    cls_0 = torch.empty_like(cls_token[:, 0]).normal_(0, 1)
+    cls_0 = torch.empty_like(cls_token[:, 0]).normal_(0, 1)  # NOTE: always uses cls_token from the first camera view
     cls_1 = cls_token[:, 0]
 
     # get condition
@@ -197,6 +202,11 @@ def flow_reg_loss(
     cls_t_dot = interp.calc_It_dot(t, cls_0, cls_1)
 
     b_t, zs_tilde, b_t_cls = flow_map.get_velocity_reg(t, act_t, obs_emb, cls_t)
+
+    if zs_tilde is None:
+        raise ValueError(
+            "zs_tilde is None — set network.align_depth to a value in [1, depth] to enable REPA"
+        )
 
     # compute loss
     loss = get_norm(b_t - act_t_dot, config.norm_type)

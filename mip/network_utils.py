@@ -25,8 +25,10 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
+    from mip.networks.sudeepdit_og import SudeepDiTOG
     from mip.networks.sudeepdit_reg import SudeepDiTREG
     from mip.networks.sudeepdit_repa import SudeepDiTREPA
+    from mip.networks.sudeepdit_repa_agg import SudeepDiTREPAAgg
 
     network_class = {
         "mlp": MLP,
@@ -37,8 +39,10 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "rnn": RNN,
         "vanilla_rnn": VanillaRNN,
         "sudeepdit": SudeepDiT,
+        "sudeepdit_og": SudeepDiTOG,
         "sudeepdit_repa": SudeepDiTREPA,
-        "sudeepdit_reg": SudeepDiTREG
+        "sudeepdit_reg": SudeepDiTREG,
+        "sudeepdit_repa_agg": SudeepDiTREPAAgg,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -113,7 +117,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
                 }
             )
         return network_class(**rnn_params)
-    elif network_config.network_type == "sudeepdit":
+    elif network_config.network_type == "sudeepdit" or network_config.network_type == 'sudeepdit_og':
         return network_class(
             **common_params,
             d_model=network_config.emb_dim,
@@ -123,7 +127,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             timestep_emb_type=network_config.timestep_emb_type,
         )
 
-    elif network_config.network_type == "sudeepdit_repa" or network_config.network_type == "sudeepdit_reg":
+    elif "sudeepdit_repa" in network_config.network_type  or "sudeepdit_reg" in network_config.network_type:
         loguru.logger.info(f"REPA config - align_depth: {network_config.align_depth} | projector_dim: {network_config.projector_dim} | z_dims: {network_config.z_dims}")
         return network_class(
             **common_params,

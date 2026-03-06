@@ -3,7 +3,7 @@ defaults:
   - _base
   - _self_
 
-network_type: "sudeepdit_repa"
+network_type: "sudeepdit_repa_agg"
 emb_dim: 256  # Used as d_model
 num_layers: 8  # Used as depth
 dropout: 0.0

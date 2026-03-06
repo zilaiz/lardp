@@ -32,6 +32,16 @@ def _with_pos_embed(tensor, pos=None):
     return tensor if pos is None else tensor + pos
 
 
+def build_mlp(hidden_size, projector_dim, z_dim):
+    return nn.Sequential(
+            nn.Linear(hidden_size, projector_dim),
+            nn.SiLU(),
+            nn.Linear(projector_dim, projector_dim),
+            nn.SiLU(),
+            nn.Linear(projector_dim, z_dim),
+        )
+
+
 class _PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
@@ -246,7 +256,7 @@ class _TransformerDecoder(_TransformerEncoder):
         return x
 
 
-class SudeepDiT(BaseNetwork):
+class SudeepDiTREPAAgg(BaseNetwork):
     def __init__(
         self,
         act_dim: int,
@@ -260,6 +270,9 @@ class SudeepDiT(BaseNetwork):
         timestep_emb_type: str = "positional",
         timestep_emb_params: dict | None = None,
         disable_time_embedding: bool = False,
+        align_depth: int = 0,
+        projector_dim: int = 2048,
+        z_dims: list[int] | None = None,
     ):
         # BaseNetwork expects: act_dim, Ta, obs_dim, To, emb_dim, n_layers
         emb_dim = d_model  # Use d_model as embedding dimension
@@ -304,7 +317,7 @@ class SudeepDiT(BaseNetwork):
         self.pos_enc = _PositionalEncoding(d_model)
         self.register_parameter(
             "pos_emb",
-            nn.Parameter(torch.empty(Ta, 1, d_model), requires_grad=True),
+            nn.Parameter(torch.empty(Ta + 1, 1, d_model), requires_grad=True),
         )
         nn.init.xavier_uniform_(self.pos_emb.data)
 
@@ -327,6 +340,15 @@ class SudeepDiT(BaseNetwork):
             activation="gelu",
         )
         self.decoder = _TransformerDecoder(decoder_module, depth)
+
+        # REPA
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+        self.align_depth = align_depth
+        if z_dims is None:
+            z_dims = [1024]
+        self.projectors = nn.ModuleList([
+            build_mlp(d_model, projector_dim, z_dim) for z_dim in z_dims
+        ])
 
         # Output layers
         self.final_layer = _FinalLayer(d_model, act_dim)
@@ -382,6 +404,9 @@ class SudeepDiT(BaseNetwork):
 
         # Project input and add positional embeddings
         x_tokens = self.x_proj(x)  # (b, Ta, d_model)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x_tokens = torch.cat([cls_tokens, x_tokens], dim=1)
+        Ta += 1
         x_tokens = x_tokens.transpose(0, 1)  # (Ta, b, d_model)
         x_tokens = x_tokens + self.pos_emb[:Ta]  # Add positional embeddings
 
@@ -394,10 +419,18 @@ class SudeepDiT(BaseNetwork):
         enc_cache = self.encoder(cond_seq, pos)
 
         # Decode
-        y_tokens = self.decoder(x_tokens, combined_emb, enc_cache)
+        # y_tokens = self.decoder(x_tokens, combined_emb, enc_cache)
+        y_tokens = x_tokens
+        zs_tilde = None
+        for i, (layer, cond) in enumerate(zip(self.decoder.layers, enc_cache, strict=False)):
+            y_tokens = layer(y_tokens, combined_emb, cond)
+            if (i + 1) == self.align_depth:
+                # y_tokens: (Ta, B, d_model)
+                # projector output: (Ta, B, z_dim) → transpose → (B, Ta, z_dim)
+                zs_tilde = [projector(y_tokens[:1]).transpose(0, 1) for projector in self.projectors]
 
         # Final output layer
-        y = self.final_layer(y_tokens, combined_emb, enc_cache[-1])  # (b, Ta, act_dim)
+        y = self.final_layer(y_tokens[1:], combined_emb, enc_cache[-1])  # (b, Ta, act_dim)
 
         # Compute scalar output
         # Use input mean, output mean, and time embedding
@@ -409,10 +442,10 @@ class SudeepDiT(BaseNetwork):
         # )  # (b, 2*act_dim + d_model)
         # scalar = self.scalar_head(scalar_features)  # (b, 1)
 
-        return y, scalar
+        return y, scalar, zs_tilde
 
 
-def test_sudeepdit():
+def test_sudeepditrepa():
     """Test SudeepDiT network"""
     print("=" * 50)
     print("Testing SudeepDiT")
@@ -424,7 +457,7 @@ def test_sudeepdit():
     To = 2
     batch_size = 4
 
-    model = SudeepDiT(
+    model = SudeepDiTREPAAgg(
         act_dim=act_dim,
         Ta=Ta,
         obs_dim=obs_dim,
@@ -454,7 +487,7 @@ def test_sudeepdit():
 
     # Test with disable_time_embedding=True
     print("\nTesting with disable_time_embedding=True:")
-    model_no_time = SudeepDiT(
+    model_no_time = SudeepDiTREPAAgg(
         act_dim=act_dim,
         Ta=Ta,
         obs_dim=obs_dim,
@@ -481,4 +514,4 @@ def test_sudeepdit():
 
 
 if __name__ == "__main__":
-    test_sudeepdit()
+    test_sudeepditrepa()

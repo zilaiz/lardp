@@ -353,11 +353,11 @@ class SudeepDiTREPA(BaseNetwork):
         self.final_layer = _FinalLayer(d_model, act_dim)
 
         # Scalar output head
-        self.scalar_head = nn.Sequential(
-            nn.Linear(act_dim * 2 + d_model, d_model),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(d_model, 1),
-        )
+        # self.scalar_head = nn.Sequential(
+        #     nn.Linear(act_dim * 2 + d_model, d_model),
+        #     nn.GELU(approximate="tanh"),
+        #     nn.Linear(d_model, 1),
+        # )
 
         print(
             f"number of DiT parameters: {sum(p.numel() for p in self.parameters()):e}"
@@ -421,19 +421,22 @@ class SudeepDiTREPA(BaseNetwork):
         for i, (layer, cond) in enumerate(zip(self.decoder.layers, enc_cache, strict=False)):
             y_tokens = layer(y_tokens, combined_emb, cond)
             if (i + 1) == self.align_depth:
-                zs_tilde = [projector(y_tokens.reshape(-1, self.d_model)).reshape(batch_size, Ta, -1) for projector in self.projectors]
+                # y_tokens: (Ta, B, d_model)
+                # projector output: (Ta, B, z_dim) → transpose → (B, Ta, z_dim)
+                zs_tilde = [projector(y_tokens).transpose(0, 1) for projector in self.projectors]
 
         # Final output layer
         y = self.final_layer(y_tokens, combined_emb, enc_cache[-1])  # (b, Ta, act_dim)
 
         # Compute scalar output
         # Use input mean, output mean, and time embedding
-        x_mean = x.mean(dim=1)  # (b, act_dim)
-        y_mean = y.mean(dim=1)  # (b, act_dim)
-        scalar_features = torch.cat(
-            [x_mean, y_mean, combined_emb], dim=1
-        )  # (b, 2*act_dim + d_model)
-        scalar = self.scalar_head(scalar_features)  # (b, 1)
+        scalar = None
+        # x_mean = x.mean(dim=1)  # (b, act_dim)
+        # y_mean = y.mean(dim=1)  # (b, act_dim)
+        # scalar_features = torch.cat(
+        #     [x_mean, y_mean, combined_emb], dim=1
+        # )  # (b, 2*act_dim + d_model)
+        # scalar = self.scalar_head(scalar_features)  # (b, 1)
 
         return y, scalar, zs_tilde
 
