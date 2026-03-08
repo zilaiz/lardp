@@ -219,7 +219,9 @@ def flow_condistill_loss(
         extra_cond_emb_ema = extra_cond_encoder_ema(extra_cond, None)  # make sure input masks have no dropout
         extra_cond_encoder_ema.train()
         full_obs_emb_ema = torch.cat([obs_emb_ema, extra_cond_emb_ema], dim=1)
+        flow_map_ema.eval()
         _, zs_tilde_teacher = flow_map_ema.get_velocity_repa(t, act_t, full_obs_emb_ema, align_depth=config.t_align_depth)
+        flow_map_ema.train()
 
     if zs_tilde_student is None or zs_tilde_teacher is None:
         raise ValueError(
@@ -284,7 +286,9 @@ def flow_fast_condistill_loss(
         extra_cond_emb_ema = extra_cond_encoder_ema(extra_cond, None)  # make sure input masks have no dropout
         extra_cond_encoder_ema.train()
         full_obs_emb_ema = torch.cat([obs_emb_ema, extra_cond_emb_ema], dim=1)
+        flow_map_ema.eval()
         _, zs_tilde_teacher = flow_map_ema.get_velocity_repa(t, act_t, full_obs_emb_ema, align_depth=config.t_align_depth)
+        flow_map_ema.train()
 
     if zs_tilde_student is None or zs_tilde_teacher is None:
         raise ValueError(

@@ -383,7 +383,10 @@ class SudeepDiTOGCondistillXAttn(BaseNetwork):
         for i, layer in enumerate(self.decoder):
             y_tokens = layer(y_tokens, time_emb, enc_out)
             if (i + 1) == align_depth:
-                zs_tilde = [self.projector(y_tokens).transpose(0, 1)]
+                if self.training:
+                    zs_tilde = [self.projector(y_tokens).transpose(0, 1)]
+                else:
+                    zs_tilde = [y_tokens.transpose(0, 1)]
 
         # Final output
         y = self.final_layer(y_tokens, time_emb, enc_out)  # (b, Ta, act_dim)

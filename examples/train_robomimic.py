@@ -64,12 +64,9 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
-        num_workers=4 if config.task.obs_type == "state" else 8,
+        num_workers=0,
         shuffle=True,
-        # accelerate cpu-gpu transfer
-        pin_memory=True,
-        # don't kill worker process after each epoch
-        persistent_workers=True,
+        pin_memory=False,
         # IMPORTANT: drop_last=True is required for CUDA graphs (static shapes)
         drop_last=True,
     )

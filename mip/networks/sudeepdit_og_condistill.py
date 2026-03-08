@@ -405,7 +405,10 @@ class SudeepDiTOGCondistill(BaseNetwork):
             if (i + 1) == align_depth:
                 # y_tokens: (Ta, B, d_model)
                 # projector output: (Ta, B, z_dim) → transpose → (B, Ta, z_dim)
-                zs_tilde = [self.projector(y_tokens).transpose(0, 1)]
+                if self.training:
+                    zs_tilde = [self.projector(y_tokens).transpose(0, 1)]
+                else:
+                    zs_tilde = [y_tokens.transpose(0, 1)]
 
         # Final output layer
         y = self.final_layer(y_tokens, time_emb, enc_cache[-1])  # (b, Ta, act_dim)
