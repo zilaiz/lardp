@@ -29,6 +29,8 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.sudeepdit import SudeepDiT
     from mip.networks.sudeepdit_og import SudeepDiTOG
     from mip.networks.sudeepdit_og_condistill import SudeepDiTOGCondistill
+    from mip.networks.sudeepdit_og_condistill_xattn import SudeepDiTOGCondistillXAttn
+    from mip.networks.sudeepdit_og_xattn import SudeepDiTOGXAttn
     from mip.networks.sudeepdit_reg import SudeepDiTREG
     from mip.networks.sudeepdit_repa import SudeepDiTREPA
     from mip.networks.sudeepdit_repa_agg import SudeepDiTREPAAgg
@@ -44,6 +46,8 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "sudeepdit": SudeepDiT,
         "sudeepdit_og": SudeepDiTOG,
         "sudeepdit_og_condistill": SudeepDiTOGCondistill,
+        "sudeepdit_og_condistill_xattn": SudeepDiTOGCondistillXAttn,
+        "sudeepdit_og_xattn": SudeepDiTOGXAttn,
         "sudeepdit_repa": SudeepDiTREPA,
         "sudeepdit_reg": SudeepDiTREG,
         "sudeepdit_repa_agg": SudeepDiTREPAAgg,
@@ -121,7 +125,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
                 }
             )
         return network_class(**rnn_params)
-    elif network_config.network_type == "sudeepdit" or network_config.network_type == 'sudeepdit_og' or network_config.network_type == "sudeepdit_og_condistill":
+    elif network_config.network_type in ("sudeepdit", "sudeepdit_og", "sudeepdit_og_xattn", "sudeepdit_og_condistill", "sudeepdit_og_condistill_xattn"):
         return network_class(
             **common_params,
             d_model=network_config.emb_dim,
@@ -242,6 +246,7 @@ def get_extra_cond_encoder(network_config: NetworkConfig, task_config: TaskConfi
             "crop_shape": task_config.crop_shape,
             "random_crop": task_config.random_crop,
             "use_group_norm": task_config.use_group_norm,
+            "dropout": network_config.extra_cond_encoder_dropout,
         }
         return MultiImageObsEncoder(**kwargs)
     elif extra_cond_encoder_type == "dino":

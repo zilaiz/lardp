@@ -218,3 +218,4 @@ cache/
 slurm/
 *lam_infer_output/
 tsne_output/
+MUJOCO_LOG.TXT

@@ -63,6 +63,8 @@ class DINOFeatureExtractor:
         for cam_key in self.camera_keys:
             images = obs_raw[cam_key]  # (num_envs, obs_steps, C, H, W)
             num_envs, obs_steps = images.shape[0], images.shape[1]
+            import pdb
+            pdb.set_trace()
 
             # Flatten to (num_envs * obs_steps, C, H, W)
             flat = images.reshape(-1, *images.shape[2:])

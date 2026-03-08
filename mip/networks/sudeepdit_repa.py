@@ -134,11 +134,11 @@ class _ShiftScaleMod(nn.Module):
 
     def forward(self, x, c):
         c = self.act(c)
-        return x * self.scale(c)[None] + self.shift(c)[None]
+        return x * (1 + self.scale(c)[None]) + self.shift(c)[None]
 
     def reset_parameters(self):
-        nn.init.xavier_uniform_(self.scale.weight)
-        nn.init.xavier_uniform_(self.shift.weight)
+        nn.init.zeros_(self.scale.weight)
+        nn.init.zeros_(self.shift.weight)
         nn.init.zeros_(self.scale.bias)
         nn.init.zeros_(self.shift.bias)
 
@@ -221,7 +221,7 @@ class _FinalLayer(nn.Module):
         cond = cond + t
 
         shift, scale = self.adaLN_modulation(cond).chunk(2, dim=1)
-        x = x * scale[None] + shift[None]
+        x = x * (1 + scale[None]) + shift[None]
         x = self.linear(x)
         return x.transpose(0, 1)
 
@@ -349,6 +349,7 @@ class SudeepDiTREPA(BaseNetwork):
 
         # Output layers
         self.final_layer = _FinalLayer(d_model, act_dim)
+        self.final_layer.reset_parameters()
 
         # Scalar output head
         # self.scalar_head = nn.Sequential(

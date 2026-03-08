@@ -31,3 +31,6 @@ use_compile: false
 compile_mode: null # Compile mode: null, "default", "reduce-overhead", "max-autotune"
 use_cudagraphs: false # Whether to use CUDA graphs (requires static shapes)
 auto_resume: true
+
+extra_cond_dropout_warmup_steps: 5000
+extra_cond_dropout_rampup_steps: 10000

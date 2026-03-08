@@ -80,6 +80,9 @@ class TrainingAgentCondistill:
             weight_decay=config.optimization.weight_decay,
         )
 
+        # Padding length for inference (updated during first training step)
+        self.padding_len = 0
+
         # Store obs keys if using image observations (for CUDA graph compatibility)
         if hasattr(config.task, "shape_meta") and "obs" in config.task.shape_meta:
             self.obs_keys = sorted(config.task.shape_meta["obs"].keys())
@@ -311,6 +314,7 @@ class TrainingAgentCondistill:
         obs: torch.Tensor | dict | TensorDict,
         extra_cond: torch.Tensor | dict | TensorDict,
         delta_t: torch.Tensor,
+        extra_cond_dropout: float = None,
     ):
         """Update the model parameters with a training batch.
 
@@ -318,11 +322,15 @@ class TrainingAgentCondistill:
             act: Action tensor of shape (batch_size, Ta, act_dim)
             obs: Observation tensor of shape (batch_size, To, obs_dim) or dict of tensors for images
             delta_t: Time step differences of shape (batch_size,)
-            tgt_act_reps: N target action representations of shape (batch_size, N, Ta, z_dim),
+            extra_cond_dropout: Dropout rate for extra_cond_encoder (annealed during training)
 
         Returns:
             Dictionary containing loss and gradient norm statistics
         """
+        # Apply annealed dropout to extra_cond_encoder
+        if extra_cond_dropout is not None:
+            self.extra_cond_encoder.dropout = extra_cond_dropout
+
         # Check batch size consistency for CUDA graphs
         if self.use_cudagraphs:
             if not hasattr(self, "_expected_batch_size"):
@@ -333,6 +341,15 @@ class TrainingAgentCondistill:
                     f"Expected {self._expected_batch_size}, got {act.shape[0]}. "
                     f"Make sure your dataloader has drop_last=True."
                 )
+
+        # Set padding_len from extra_cond on first call
+        if self.padding_len == 0:
+            if isinstance(extra_cond, dict):
+                first_val = next(iter(extra_cond.values()))
+            else:
+                first_val = extra_cond
+            self.padding_len = first_val.shape[1]
+            loguru.logger.info(f"Set padding_len={self.padding_len} from extra_cond shape")
 
         # Mark CUDA graph step boundary if using compile
         if self.use_compile:
@@ -390,7 +407,7 @@ class TrainingAgentCondistill:
         Returns:
             Sampled action tensor
         """
-        return self.sampler(config, flow_map, encoder, act_0, obs)
+        return self.sampler(config, flow_map, encoder, act_0, obs, padding_len=self.padding_len)
 
     def sample(
         self,
@@ -410,6 +427,10 @@ class TrainingAgentCondistill:
         Returns:
             Sampled action tensor of shape (batch_size, Ta, act_dim)
         """
+        if self.padding_len == 0:
+            loguru.logger.warning("padding_len is 0 during sampling — no zero-padding will be applied. "
+                                  "Load a checkpoint with padding_len or run update() first.")
+
         # Sync detached models if using CUDA graphs before inference
         if self.use_cudagraphs:
             self._sync_detached_models()
@@ -461,6 +482,7 @@ class TrainingAgentCondistill:
             "extra_cond_encoder_ema": self.extra_cond_encoder_ema.state_dict(),
             "flow_map_ema": self.flow_map_ema.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "padding_len": self.padding_len,
         }
 
         # Add training state if provided
@@ -489,6 +511,8 @@ class TrainingAgentCondistill:
         self.extra_cond_encoder_ema.load_state_dict(state_dict["extra_cond_encoder_ema"])
         self.encoder_ema.load_state_dict(state_dict["encoder_ema"])
         self.flow_map_ema.load_state_dict(state_dict["flow_map_ema"])
+        if "padding_len" in state_dict:
+            self.padding_len = state_dict["padding_len"]
 
         # Load optimizer state if requested and available
         if load_optimizer and "optimizer" in state_dict:

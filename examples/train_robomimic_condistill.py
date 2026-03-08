@@ -67,12 +67,9 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
-        num_workers=4 if config.task.obs_type == "state" else 8,
+        num_workers=0,
         shuffle=True,
-        # accelerate cpu-gpu transfer
-        pin_memory=True,
-        # don't kill worker process after each epoch
-        persistent_workers=True,
+        pin_memory=False,
         # IMPORTANT: drop_last=True is required for CUDA graphs (static shapes)
         drop_last=True,
     )
@@ -91,6 +88,15 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
         rampup_ratio=config.optimization.rampup_ratio,
         min_value=config.optimization.min_value,
         max_value=config.optimization.max_value,
+    )
+
+    # Dropout annealing scheduler for extra_cond_encoder
+    extra_cond_dropout_scheduler = WarmupAnnealingScheduler(
+        max_steps=config.optimization.gradient_steps,
+        warmup_ratio=config.optimization.extra_cond_dropout_warmup_steps / config.optimization.gradient_steps,
+        rampup_ratio=config.optimization.extra_cond_dropout_rampup_steps / config.optimization.gradient_steps,
+        min_value=0.0,
+        max_value=config.network.extra_cond_encoder_dropout,
     )
 
     # Resume from checkpoint if available
@@ -177,7 +183,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
 
                     if n_gradient_step == start_step:
                         loguru.logger.info(f"Using encoder type: {encoder_type}")
-                        loguru.logger.info(f"Using Extra Condition for Representation Alignment: {list(extra_cond_batch.keys())}")
+                        loguru.logger.info(f"Using extra cond for repa: {list(extra_cond_batch.keys())}")
 
                 elif config.task.obs_type == "state":
                     raise ValueError("obs_type is not image")
@@ -187,11 +193,12 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
             # update diffusion
             with timed("update", perf_times):
                 delta_t_scalar = warmup_scheduler(n_gradient_step)
+                extra_cond_dropout = extra_cond_dropout_scheduler(n_gradient_step)
                 batch_size = act.shape[0]
                 delta_t = torch.full(
                     (batch_size,), delta_t_scalar, device=config.optimization.device
                 )
-                info = agent.update(act, obs, extra_cond_dict, delta_t)
+                info = agent.update(act, obs, extra_cond_dict, delta_t, extra_cond_dropout=extra_cond_dropout)
                 lr_scheduler.step()
 
             for k, v in info.items():
@@ -206,6 +213,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
                 "total_time": time.time() - start_time,
                 "lr": lr_scheduler.get_last_lr()[0],
                 "delta_t": delta_t_scalar,
+                "extra_cond_dropout": extra_cond_dropout,
             }
             for key in info:
                 try:

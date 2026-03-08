@@ -647,8 +647,11 @@ class MultiImageObsEncoder(BaseEncoder):
         use_seq=False,
         # if True: (bs, seq_len, embed_dim)
         keep_horizon_dims=False,
+        # label dropout rate
+        dropout: float = 0.0,
     ):
         super().__init__()
+        self.dropout = dropout
         rgb_keys = []
         low_dim_keys = []
         key_model_map = nn.ModuleDict()
@@ -848,7 +851,17 @@ class MultiImageObsEncoder(BaseEncoder):
                 result = result.view(batch_size, seq_len, -1)
             else:
                 result = result.view(batch_size, -1)
-        return result
+        mask = at_least_ndim(
+            get_mask(
+                mask,
+                (batch_size,),
+                self.dropout,
+                self.training,
+                result.device,
+            ),
+            result.dim(),
+        )
+        return result * mask
 
     @torch.no_grad()
     def output_shape(self):

@@ -197,6 +197,7 @@ def flow_condistill_loss(
     # get condition
     obs_emb = encoder(obs, None)  # encoder_dropout: 0
     extra_cond_emb = extra_cond_encoder(extra_cond, None)  # extra_cond_encoder_dropout > 0
+    dummy_cond_emb = torch.zeros_like(extra_cond_emb)
 
     full_obs_emb = torch.cat([obs_emb, extra_cond_emb], dim=1)
 
@@ -210,7 +211,7 @@ def flow_condistill_loss(
     loss = config.loss_scale * torch.mean(loss)
 
     # condition-guided distillation
-    _, zs_tilde_student = flow_map.get_velocity_repa(t, act_t, obs_emb, align_depth=config.s_align_depth)
+    _, zs_tilde_student = flow_map.get_velocity_repa(t, act_t, torch.cat([obs_emb, dummy_cond_emb], dim=1), align_depth=config.s_align_depth)
 
     with torch.no_grad():
         obs_emb_ema = encoder_ema(obs, None)  # encoder dropout is already 0

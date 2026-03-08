@@ -43,6 +43,7 @@ def ode_sampler(
     encoder: BaseEncoder,
     act_0: torch.Tensor,
     obs: torch.Tensor,
+    padding_len: int = 0,
 ):
     num_steps = config.num_steps
     sample_mode = config.sample_mode
@@ -52,6 +53,9 @@ def ode_sampler(
     else:
         act_s = torch.zeros_like(act_0, device=act_0.device)
     obs_emb = encoder(obs, None)
+    if padding_len > 0:
+        padding = torch.zeros(obs_emb.shape[0], padding_len, obs_emb.shape[2], device=obs_emb.device)
+        obs_emb = torch.cat([obs_emb, padding], dim=1)
     bs = act_0.shape[0]
     for i in range(num_steps):
         s_val = t_schedule[i]
