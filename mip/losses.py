@@ -196,7 +196,7 @@ def flow_condistill_loss(
 
     # get condition
     obs_emb = encoder(obs, None)  # encoder_dropout: 0
-    extra_cond_emb = extra_cond_encoder(extra_cond, None)  # extra_cond_encoder_dropout > 0
+    extra_cond_emb = extra_cond_encoder(extra_cond, None)  # extra_cond_encoder_dropout: annealed from 0
     dummy_cond_emb = torch.zeros_like(extra_cond_emb)
 
     full_obs_emb = torch.cat([obs_emb, extra_cond_emb], dim=1)
@@ -266,7 +266,7 @@ def flow_fast_condistill_loss(
 
     # get condition
     obs_emb = encoder(obs, None)  # encoder_dropout: 0
-    extra_cond_emb = extra_cond_encoder(extra_cond, None)  # extra_cond_encoder_dropout > 0.5 NOTE: set a high extra_cond_encoder_dropout
+    extra_cond_emb = extra_cond_encoder(extra_cond, None)  # extra_cond_encoder_dropout: annealed from 0
 
     full_obs_emb = torch.cat([obs_emb, extra_cond_emb], dim=1)
 

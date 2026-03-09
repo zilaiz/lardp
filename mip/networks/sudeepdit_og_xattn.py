@@ -122,9 +122,9 @@ class _DiTXAttnDecoder(nn.Module):
     """Decoder block with cross-attention to encoder output and AdaLN.
 
     Each block does:
-    1. AdaLN-modulated self-attention (modulated by timestep + mean-pooled encoder)
-    2. Cross-attention to final encoder output (plain residual)
-    3. AdaLN-modulated FFN (modulated by timestep + mean-pooled encoder)
+    1. AdaLN-modulated self-attention (modulated by timestep)
+    2. Cross-attention to final encoder output (zero-gated)
+    3. AdaLN-modulated FFN (modulated by timestep)
     """
 
     def __init__(
@@ -149,6 +149,7 @@ class _DiTXAttnDecoder(nn.Module):
 
         self.attn_mod1 = _ShiftScaleMod(d_model)
         self.attn_mod2 = _ZeroScaleMod(d_model)
+        self.xattn_mod = _ZeroScaleMod(d_model)
         self.mlp_mod1 = _ShiftScaleMod(d_model)
         self.mlp_mod2 = _ZeroScaleMod(d_model)
 
@@ -158,29 +159,27 @@ class _DiTXAttnDecoder(nn.Module):
         t:      (B, d_model)     - timestep embedding
         memory: (S, B, d_model)  - final encoder layer output
         """
-        c = t + torch.mean(memory, dim=0)
-
-        # 1. AdaLN-modulated self-attention
-        x2 = self.attn_mod1(self.norm1(x), c)
+        # 1. AdaLN-modulated self-attention (conditioned on timestep only)
+        x2 = self.attn_mod1(self.norm1(x), t)
         x2, _ = self.self_attn(x2, x2, x2, need_weights=False)
-        x = self.attn_mod2(self.dropout1(x2), c) + x
+        x = self.attn_mod2(self.dropout1(x2), t) + x
 
-        # 2. Cross-attention to encoder output (plain residual)
+        # 2. Cross-attention to encoder output (zero-gated)
         x2 = self.norm2(x)
         x2, _ = self.cross_attn(query=x2, key=memory, value=memory, need_weights=False)
-        x = self.dropout2(x2) + x
+        x = self.xattn_mod(self.dropout2(x2), t) + x
 
-        # 3. AdaLN-modulated FFN
-        x2 = self.mlp_mod1(self.norm3(x), c)
+        # 3. AdaLN-modulated FFN (conditioned on timestep only)
+        x2 = self.mlp_mod1(self.norm3(x), t)
         x2 = self.linear2(self.dropout3(self.activation(self.linear1(x2))))
-        x2 = self.mlp_mod2(self.dropout4(x2), c)
+        x2 = self.mlp_mod2(self.dropout4(x2), t)
         return x + x2
 
     def reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-        for s in (self.attn_mod1, self.attn_mod2, self.mlp_mod1, self.mlp_mod2):
+        for s in (self.attn_mod1, self.attn_mod2, self.xattn_mod, self.mlp_mod1, self.mlp_mod2):
             s.reset_parameters()
 
 
