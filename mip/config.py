@@ -51,6 +51,8 @@ class OptimizationConfig:
     # Dropout annealing for condistill extra_cond_encoder
     extra_cond_dropout_warmup_steps: int = 5000  # number of steps to keep dropout at 0
     extra_cond_dropout_rampup_steps: int = 10000  # number of steps to linearly ramp dropout from 0 to max
+    # Diagnostic: measure how much extra_cond affects teacher representations
+    diagnose_teacher_delta: bool = False
 
 
 @dataclass

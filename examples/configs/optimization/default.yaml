@@ -34,3 +34,4 @@ auto_resume: true
 
 extra_cond_dropout_warmup_steps: 5000
 extra_cond_dropout_rampup_steps: 10000
+diagnose_teacher_delta: false

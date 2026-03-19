@@ -35,6 +35,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_condistill_loss
     elif loss_type == "flow_fast_condistill":
         return flow_fast_condistill_loss
+    elif loss_type == "flow_dual_condistill":
+        return flow_dual_condistill_loss
     elif loss_type == "flow_reg":
         return flow_reg_loss
     elif loss_type == "regression":
@@ -297,6 +299,91 @@ def flow_fast_condistill_loss(
     projection_loss = repa_loss(zs_tilde_student, zs_tilde_teacher)
     projection_loss *= config.repa_scale
     return loss, projection_loss, {}
+
+
+def flow_dual_condistill_loss(
+    config: OptimizationConfig,
+    flow_map_teacher: FlowMap,
+    encoder_teacher: BaseEncoder,
+    extra_cond_encoder: BaseEncoder,
+    flow_map_student: FlowMap,
+    encoder_student: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    extra_cond: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """Dual-network condistill loss.
+
+    Teacher (trainable) sees full condition (obs + extra_cond).
+    Student (trainable) sees only obs (no extra_cond, no zero padding).
+    REPA aligns student reps to detached teacher reps.
+    """
+    # sample - use empty+uniform_/normal_ for CUDA graph compatibility
+    t = torch.empty_like(delta_t).uniform_(0, 1)
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    # predict
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+
+    # Teacher forward (eval mode disables projector, but gradients still flow)
+    flow_map_teacher.eval()
+    obs_emb_t = encoder_teacher(obs, None)
+    extra_cond_emb = extra_cond_encoder(extra_cond, None)
+    full_obs_emb = torch.cat([obs_emb_t, extra_cond_emb], dim=1)
+    b_t_teacher, zs_teacher = flow_map_teacher.get_velocity_repa(
+        t, act_t, full_obs_emb, align_depth=config.t_align_depth
+    )
+    flow_map_teacher.train()
+
+    teacher_loss = config.loss_scale * torch.mean(
+        get_norm(b_t_teacher - act_t_dot, config.norm_type)
+    )
+
+    # Student forward (train mode, projector applied)
+    obs_emb_s = encoder_student(obs, None)
+    b_t_student, zs_student = flow_map_student.get_velocity_repa(
+        t, act_t, obs_emb_s, align_depth=config.s_align_depth
+    )
+
+    student_loss = config.loss_scale * torch.mean(
+        get_norm(b_t_student - act_t_dot, config.norm_type)
+    )
+
+    # REPA loss: student projected reps vs detached teacher raw reps
+    if zs_student is None or zs_teacher is None:
+        raise ValueError(
+            "zs_tilde is None — set network.align_depth to a value in [1, depth] to enable representation extraction"
+        )
+    projection_loss = repa_loss(zs_student, [z.detach() for z in zs_teacher])
+    projection_loss *= config.repa_scale
+
+    info = {}
+
+    # Diagnostic: measure how much extra_cond affects teacher representations
+    if config.diagnose_teacher_delta:
+        with torch.no_grad():
+            dummy_cond_emb = torch.zeros_like(extra_cond_emb)
+            dummy_obs_emb = torch.cat([obs_emb_t, dummy_cond_emb], dim=1)
+            flow_map_teacher.eval()
+            _, zs_teacher_base = flow_map_teacher.get_velocity_repa(
+                t, act_t, dummy_obs_emb, align_depth=config.t_align_depth
+            )
+            flow_map_teacher.train()
+            delta_norm = torch.mean(torch.stack(
+                [torch.norm(zf - zb, dim=-1).mean() for zf, zb in zip(zs_teacher, zs_teacher_base)]
+            ))
+            full_norm = torch.mean(torch.stack(
+                [torch.norm(zf, dim=-1).mean() for zf in zs_teacher]
+            ))
+            info["teacher_delta_ratio"] = (delta_norm / full_norm).item()
+            info["teacher_delta_norm"] = delta_norm.item()
+            info["teacher_full_norm"] = full_norm.item()
+
+    return teacher_loss, student_loss, projection_loss, info
 
 
 def flow_reg_loss(
