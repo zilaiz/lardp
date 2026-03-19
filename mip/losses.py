@@ -329,13 +329,21 @@ def flow_dual_condistill_loss(
     act_t = interp.calc_It(t, act_0, act_1)
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
 
-    # Teacher forward (eval mode disables projector, but gradients still flow)
+    # Always extract at all decoder depths; only optimize target depths via REPA.
+    n_decoder_layers = flow_map_teacher.net.n_layers
+    all_depths = list(range(1, n_decoder_layers + 1))
+
+    # Normalize target depths to index sets for filtering
+    s_depths = [config.s_align_depth] if isinstance(config.s_align_depth, int) else list(config.s_align_depth)
+    t_depths = [config.t_align_depth] if isinstance(config.t_align_depth, int) else list(config.t_align_depth)
+
+    # Teacher forward (eval mode, all depths)
     flow_map_teacher.eval()
     obs_emb_t = encoder_teacher(obs, None)
     extra_cond_emb = extra_cond_encoder(extra_cond, None)
     full_obs_emb = torch.cat([obs_emb_t, extra_cond_emb], dim=1)
-    b_t_teacher, zs_teacher = flow_map_teacher.get_velocity_repa(
-        t, act_t, full_obs_emb, align_depth=config.t_align_depth
+    b_t_teacher, zs_teacher_all = flow_map_teacher.get_velocity_repa(
+        t, act_t, full_obs_emb, align_depth=all_depths
     )
     flow_map_teacher.train()
 
@@ -343,45 +351,71 @@ def flow_dual_condistill_loss(
         get_norm(b_t_teacher - act_t_dot, config.norm_type)
     )
 
-    # Student forward (train mode, projector applied)
+    # Student forward (train mode, all depths)
     obs_emb_s = encoder_student(obs, None)
-    b_t_student, zs_student = flow_map_student.get_velocity_repa(
-        t, act_t, obs_emb_s, align_depth=config.s_align_depth
+    b_t_student, zs_student_all = flow_map_student.get_velocity_repa(
+        t, act_t, obs_emb_s, align_depth=all_depths
     )
 
     student_loss = config.loss_scale * torch.mean(
         get_norm(b_t_student - act_t_dot, config.norm_type)
     )
 
-    # REPA loss: student projected reps vs detached teacher raw reps
-    if zs_student is None or zs_teacher is None:
+    # REPA loss: only on target depths
+    # depth i is at index i-1 in the all_depths list
+    zs_student_target = [zs_student_all[d - 1] for d in s_depths]
+    zs_teacher_target = [zs_teacher_all[d - 1] for d in t_depths]
+
+    if zs_student_target is None or zs_teacher_target is None:
         raise ValueError(
             "zs_tilde is None — set network.align_depth to a value in [1, depth] to enable representation extraction"
         )
-    projection_loss = repa_loss(zs_student, [z.detach() for z in zs_teacher])
+    projection_loss = repa_loss(zs_student_target, [z.detach() for z in zs_teacher_target])
     projection_loss *= config.repa_scale
 
     info = {}
 
-    # Diagnostic: measure how much extra_cond affects teacher representations
+    # Diagnostic: per-depth REPA loss with matched vs shuffled extra_cond.
+    # Reuses already-extracted teacher/student all-depth reps; only extra cost
+    # is one shuffled teacher forward pass.
+    # repa_gap = repa_shuffled - repa_matched tells us how much signal each depth has.
     if config.diagnose_teacher_delta:
         with torch.no_grad():
-            dummy_cond_emb = torch.zeros_like(extra_cond_emb)
-            dummy_obs_emb = torch.cat([obs_emb_t, dummy_cond_emb], dim=1)
+            perm = torch.randperm(extra_cond_emb.shape[0], device=extra_cond_emb.device)
+            shuffled_cond_emb = extra_cond_emb[perm]
+            shuffled_obs_emb = torch.cat([obs_emb_t, shuffled_cond_emb], dim=1)
             flow_map_teacher.eval()
-            _, zs_teacher_base = flow_map_teacher.get_velocity_repa(
-                t, act_t, dummy_obs_emb, align_depth=config.t_align_depth
+            _, zs_shuf = flow_map_teacher.get_velocity_repa(
+                t, act_t, shuffled_obs_emb, align_depth=all_depths
             )
             flow_map_teacher.train()
-            delta_norm = torch.mean(torch.stack(
-                [torch.norm(zf - zb, dim=-1).mean() for zf, zb in zip(zs_teacher, zs_teacher_base)]
-            ))
-            full_norm = torch.mean(torch.stack(
-                [torch.norm(zf, dim=-1).mean() for zf in zs_teacher]
-            ))
-            info["teacher_delta_ratio"] = (delta_norm / full_norm).item()
-            info["teacher_delta_norm"] = delta_norm.item()
-            info["teacher_full_norm"] = full_norm.item()
+            # Stack all: (n_depths, B, Ta, d_model)
+            zs_s = torch.stack([z.detach() for z in zs_student_all])
+            zs_t = torch.stack(zs_teacher_all)
+            zs_sh = torch.stack(zs_shuf)
+
+            # REPA (cosine): -mean(cos_sim) per depth → (n_depths,)
+            zs_s_n = F.normalize(zs_s, dim=-1)
+            zs_t_n = F.normalize(zs_t, dim=-1)
+            zs_sh_n = F.normalize(zs_sh, dim=-1)
+            repa_m = -(zs_s_n * zs_t_n).sum(dim=-1).mean(dim=(1, 2))
+            repa_sh = -(zs_s_n * zs_sh_n).sum(dim=-1).mean(dim=(1, 2))
+
+            # Smooth L1: per depth → (n_depths,)
+            sl1_m = F.smooth_l1_loss(
+                zs_s, zs_t, reduction="none"
+            ).mean(dim=(1, 2, 3))
+            sl1_sh = F.smooth_l1_loss(
+                zs_s, zs_sh, reduction="none"
+            ).mean(dim=(1, 2, 3))
+
+            for depth_idx, d in enumerate(all_depths):
+                info[f"diag/repa_matched_d{d}"] = repa_m[depth_idx].item()
+                info[f"diag/repa_shuffled_d{d}"] = repa_sh[depth_idx].item()
+                info[f"diag/repa_gap_d{d}"] = (repa_sh - repa_m)[depth_idx].item()
+                info[f"diag/sl1_matched_d{d}"] = sl1_m[depth_idx].item()
+                info[f"diag/sl1_shuffled_d{d}"] = sl1_sh[depth_idx].item()
+                info[f"diag/sl1_gap_d{d}"] = (sl1_sh - sl1_m)[depth_idx].item()
 
     return teacher_loss, student_loss, projection_loss, info
 

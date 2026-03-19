@@ -400,11 +400,19 @@ class SudeepDiTOGCondistill(BaseNetwork):
         # y_tokens = self.decoder(x_tokens, time_emb, enc_cache)
         y_tokens = x_tokens
         zs_tilde = None
+        # Normalize align_depth to a set for efficient lookup
+        if align_depth is None:
+            align_depths = set()
+        elif isinstance(align_depth, int):
+            align_depths = {align_depth}
+        else:
+            align_depths = set(align_depth)
+        if align_depths:
+            zs_tilde = []
         for i, (layer, cond) in enumerate(zip(self.decoder.layers, enc_cache, strict=False)):
             y_tokens = layer(y_tokens, time_emb, cond)
-            if (i + 1) == align_depth:
-                # y_tokens: (Ta, B, d_model)
-                # projector output: (Ta, B, z_dim) → transpose → (B, Ta, z_dim)
+            if (i + 1) in align_depths:
+                # zs_tilde.append(y_tokens.transpose(0, 1))
                 if self.training:
                     zs_tilde = [self.projector(y_tokens).transpose(0, 1)]
                 else:

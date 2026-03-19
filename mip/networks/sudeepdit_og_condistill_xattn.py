@@ -379,9 +379,19 @@ class SudeepDiTOGCondistillXAttn(BaseNetwork):
         # Decode with cross-attention to final encoder output
         y_tokens = x_tokens
         zs_tilde = None
+        # Normalize align_depth to a set for efficient lookup
+        if align_depth is None:
+            align_depths = set()
+        elif isinstance(align_depth, int):
+            align_depths = {align_depth}
+        else:
+            align_depths = set(align_depth)
+        if align_depths:
+            zs_tilde = []
         for i, layer in enumerate(self.decoder):
             y_tokens = layer(y_tokens, time_emb, enc_out)
-            if (i + 1) == align_depth:
+            if (i + 1) in align_depths:
+                # zs_tilde.append(y_tokens.transpose(0, 1))
                 if self.training:
                     zs_tilde = [self.projector(y_tokens).transpose(0, 1)]
                 else:

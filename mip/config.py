@@ -22,8 +22,8 @@ class OptimizationConfig:
     loss_scale: float = 100.0
     cls_loss_scale: float = 0.03
     repa_scale: float = 0.0 # REPA loss coefficient
-    s_align_depth: int = 2
-    t_align_depth: int = 2
+    s_align_depth: int | list[int] = 2
+    t_align_depth: int | list[int] = 2
     norm_type: str = "l2"
     lr: float = 1e-4
     weight_decay: float = 1e-5
