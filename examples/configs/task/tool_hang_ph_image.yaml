@@ -14,7 +14,7 @@ env_type: "ph"
 # dataset_repo: "amandlek/robomimic"
 # dataset_filename: "v1.5/tool_hang/ph/demo_v15.hdf5"
 
-dataset_path: "data/robomimic/tool_hang/ph/image_v15.hdf5"
+dataset_path: "data/robomimic/tool_hang/ph/image_v15_abs.hdf5"
 
 max_episode_steps: 700
 render_obs_key: "sideview_image"

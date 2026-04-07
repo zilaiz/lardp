@@ -14,19 +14,21 @@ env_type: "ph"
 # dataset_repo: "amandlek/robomimic"
 # dataset_filename: "v1.5/transport/ph/demo_v15.hdf5"
 
-dataset_path: "data/robomimic/transport/ph/image_v15_abs.hdf5"
+dataset_path: "data/robomimic/transport/ph/image_v15.hdf5"
 
 max_episode_steps: 700
 render_obs_key: "shouldercamera0_image"
+abs_action: false
+action_type: "delta"
 
 # Required keys
 horizon: 10
-act_dim: 20  # Dual-arm abs_action uses 6D rotation (2 * (3 pos + 6 rot + 1 grip))
+act_dim: 14  # Dual-arm delta uses raw 7D per arm (2 * (3 pos + 3 rot + 1 grip))
 
 shape_meta:
   action:
     shape:
-      - 20
+      - 14
   obs:
     shouldercamera0_image:
       shape:

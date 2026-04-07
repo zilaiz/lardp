@@ -13,3 +13,4 @@ log_freq: 1000
 save_freq: 10000
 eval_episodes: 50
 save_video: False
+save_rollouts: False

@@ -19,16 +19,17 @@ def make_env(task_config: TaskConfig, idx, render=False, seed=None):
         raise ValueError(f"Environment {task_config.env_name} not supported")
 
 
-def make_vec_env(task_config: TaskConfig, seed=None):
+def make_vec_env(task_config: TaskConfig, seed=None, save_rollouts=False):
     # Suppress output by redirecting stdout temporarily
     original_stdout = sys.stdout
     sys.stdout = io.StringIO()  # Redirect stdout to a string buffer
     # Use SyncVectorEnv for image-based tasks (rendering contexts can't be pickled)
-    # or when num_envs=1 or save_video=True
+    # or when num_envs=1 or save_video=True or save_rollouts=True
     if (
         task_config.num_envs == 1
         or task_config.save_video
         or task_config.obs_type == "image"
+        or save_rollouts
     ):
         vnc_env_class = gym.vector.SyncVectorEnv
     else:
@@ -109,7 +110,8 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
             # disable object state observation for image mode
             env_meta["env_kwargs"]["use_object_obs"] = False
         abs_action = task_config.abs_action
-        if abs_action:
+        action_type = getattr(task_config, "action_type", "absolute")
+        if abs_action and action_type != "delta":
             # robosuite v1.5+: set input_type in nested body_parts config
             ctrl_cfg = env_meta["env_kwargs"]["controller_configs"]
             if "body_parts" in ctrl_cfg:

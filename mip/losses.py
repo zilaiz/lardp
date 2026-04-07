@@ -39,6 +39,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_dual_condistill_loss
     elif loss_type == "flow_reg":
         return flow_reg_loss
+    elif loss_type == "flow_beta":
+        return flow_beta_loss
     elif loss_type == "regression":
         return regression_loss
     elif loss_type == "straight_flow":
@@ -97,6 +99,52 @@ def flow_loss(
     """
     # sample - use empty+uniform_/normal_ for CUDA graph compatibility
     t = torch.empty_like(delta_t).uniform_(0, 1)
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    # get condition
+    obs_emb = encoder(obs, None)
+
+    # predict
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+
+    # compute loss
+    loss = get_norm(b_t - act_t_dot, config.norm_type)
+    loss = config.loss_scale * torch.mean(loss)
+    return loss, {}
+
+
+def flow_beta_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """Flow model loss with Beta distribution timestep sampling.
+
+    Samples t ~ Beta(1.5, 1.0) instead of Uniform(0, 1), biasing training
+    toward lower timesteps (higher noise) for improved sample quality.
+    Inspired by PI-0 (Physical Intelligence).
+
+    Args:
+        config: optimization config
+        flow_map (FlowMap): the flow map
+        encoder (BaseEncoder): the encoder
+        interp (Interpolant): the interpolant
+        act (torch.Tensor): the target action
+        obs (torch.Tensor): the observation
+        delta_t (torch.Tensor): the time step difference
+
+    Returns:
+        float: the loss
+    """
+    # sample t from Beta(1.5, 1.0) instead of Uniform(0, 1)
+    t = torch.distributions.Beta(1.5, 1.0).sample(delta_t.shape).to(delta_t.device)
     act_0 = torch.empty_like(act).normal_(0, 1)
     act_1 = act
 

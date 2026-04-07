@@ -14,19 +14,21 @@ env_type: "ph"
 # dataset_repo: "amandlek/robomimic"
 # dataset_filename: "v1.5/can/ph/demo_v15.hdf5"
 
-dataset_path: "data/robomimic/can/ph/image_v15_abs.hdf5"
+dataset_path: "data/robomimic/can/ph/image_v15.hdf5"
+abs_action: false
+action_type: "delta"
 
 max_episode_steps: 400
 render_obs_key: "agentview_image"
 
 # Required keys
 horizon: 10
-act_dim: 10
+act_dim: 7
 
 shape_meta:
   action:
     shape:
-      - 10
+      - 7
   obs:
     agentview_image:
       shape:

@@ -6,6 +6,7 @@ defaults:
 # Common dataset configuration
 # dataset_repo: "ChaoyiPan/mip-dataset"
 abs_action: true
+action_type: "absolute"  # "absolute" or "delta"
 
 # Common required keys
 obs_steps: 2

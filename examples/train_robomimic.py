@@ -221,8 +221,15 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
             agent.eval()
             metrics = {"step": n_gradient_step}
             num_steps_list = get_default_step_list(config.optimization.loss_type)
+            # Compute rollout path once if saving rollouts
+            _rollout_path = None
+            if getattr(config.log, "save_rollouts", False):
+                from pathlib import Path
+                _obs_tag = "image" if config.task.obs_type == "image" else "low_dim"
+                _rollout_path = str(Path("data/robomimic") / config.task.env_name / f"{_obs_tag}_rollouts.hdf5")
             for num_steps in num_steps_list:
-                metrics.update(eval(config, envs, dataset, agent, logger, num_steps, dino_extractor=dino_extractor))
+                _save = getattr(config.log, "save_rollouts", False) and num_steps == 9
+                metrics.update(eval(config, envs, dataset, agent, logger, num_steps, dino_extractor=dino_extractor, save_rollouts=_save, rollout_path=_rollout_path))
 
             # Update best metrics and average metrics
             old_best_metrics = best_metrics.copy()
@@ -285,7 +292,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
             agent.train()
 
 
-def eval(config: Config, envs, dataset, agent, logger, num_steps=1, dino_extractor=None):
+def eval(config: Config, envs, dataset, agent, logger, num_steps=1, dino_extractor=None, save_rollouts=False, rollout_path=None):
     """Standalone inference function to evaluate a trained agent and optionally save a video.
 
     Args:
@@ -295,6 +302,8 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1, dino_extract
         agent: Trained agent
         logger: Logger for metrics
         num_steps: Number of steps for sampling
+        save_rollouts: Whether to collect and save rollout trajectories
+        rollout_path: Path to the HDF5 file for appending rollouts
 
     Returns:
         dict: Metrics including mean step, reward, and success rate
@@ -312,6 +321,25 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1, dino_extract
         "unnormalize": [],
         "env_step": [],
     }
+
+    # Setup rollout recording
+    recorders = None
+    if save_rollouts and rollout_path is not None:
+        from mip.rollout_recorder import RolloutRecorder
+
+        if config.task.obs_type == "state":
+            rec_obs_keys = list(config.task.obs_keys)
+        else:
+            rec_obs_keys = list(config.task.shape_meta["obs"].keys())
+        recorders = []
+        for env_idx in range(config.task.num_envs):
+            recorder = RolloutRecorder(
+                obs_keys=rec_obs_keys,
+                obs_type=config.task.obs_type,
+                shape_meta=config.task.shape_meta if config.task.obs_type == "image" else None,
+            )
+            envs.envs[env_idx].recorder = recorder
+            recorders.append(recorder)
 
     for i in range(config.log.eval_episodes // config.task.num_envs):
         ep_reward = [0.0] * config.task.num_envs
@@ -453,6 +481,27 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1, dino_extract
         metrics.update(kit_metrics)
         loguru.logger.info(f"Kit metrics: {kit_metrics}")
 
+    # Finalize and save rollout recordings
+    if recorders is not None:
+        from mip.rollout_recorder import RolloutRecorder
+
+        for recorder in recorders:
+            recorder.end_episode()
+
+        # Merge all recorders and append to a single HDF5 file
+        combined = RolloutRecorder(
+            obs_keys=recorders[0].obs_keys,
+            obs_type=recorders[0].obs_type,
+            shape_meta=recorders[0].shape_meta,
+        )
+        for recorder in recorders:
+            combined.episodes.extend(recorder.episodes)
+        combined.append_hdf5(rollout_path)
+
+        # Detach recorders from envs
+        for env_idx in range(config.task.num_envs):
+            envs.envs[env_idx].recorder = None
+
     return metrics
 
 
@@ -482,7 +531,7 @@ def main(config):
         )
 
     # env setup
-    envs = make_vec_env(config.task, seed=config.optimization.seed)
+    envs = make_vec_env(config.task, seed=config.optimization.seed, save_rollouts=getattr(config.log, "save_rollouts", False))
     obs, info = envs.reset()
     if config.task.obs_type == "state":
         config.task.obs_dim = obs.shape[-1]
@@ -555,10 +604,18 @@ def main(config):
     elif config.mode == "eval":
         agent.eval()
 
+        # Compute rollout path if saving rollouts
+        _rollout_path = None
+        if getattr(config.log, "save_rollouts", False):
+            from pathlib import Path
+            _obs_tag = "image" if config.task.obs_type == "image" else "low_dim"
+            _rollout_path = str(Path("data/robomimic") / config.task.env_name / f"{_obs_tag}_rollouts.hdf5")
+
         num_steps_list = get_default_step_list(config.optimization.loss_type)
         for num_steps in num_steps_list:
+            _save = getattr(config.log, "save_rollouts", False) and num_steps == 9
             metrics = {"step": num_steps}
-            metrics.update(eval(config, envs, dataset, agent, logger, num_steps, dino_extractor=dino_extractor))
+            metrics.update(eval(config, envs, dataset, agent, logger, num_steps, dino_extractor=dino_extractor, save_rollouts=_save, rollout_path=_rollout_path))
             logger.log(metrics, category="eval")
 
         # print result in easy to read format

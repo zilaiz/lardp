@@ -123,6 +123,7 @@ class MultiStepWrapper:
         self.reward = []
         self.done = []
         self.info = defaultdict(lambda: deque(maxlen=n_obs_steps + 1))
+        self.recorder = None  # Set externally to enable rollout recording
 
     @property
     def observation_space(self):
@@ -182,6 +183,18 @@ class MultiStepWrapper:
         self.done = []
         self.info = defaultdict(lambda: deque(maxlen=self.n_obs_steps + 1))
 
+        # Rollout recording: finalize previous episode and start a new one
+        if self.recorder is not None:
+            self.recorder.end_episode()
+            self.recorder.start_episode()
+            # Record initial observation
+            if hasattr(self.env, "last_raw_obs"):
+                # State obs: per-key dict cached on the inner wrapper
+                self.recorder.record_initial_obs(self.env.last_raw_obs)
+            elif isinstance(obs, dict):
+                # Image obs: observation is already a dict
+                self.recorder.record_initial_obs(obs)
+
         obs = self._get_obs(self.n_obs_steps)
         return obs, info
 
@@ -208,6 +221,17 @@ class MultiStepWrapper:
                 # truncation
                 done = True
             self.done.append(done)
+
+            # Rollout recording: capture per-inner-step data (after truncation check)
+            if self.recorder is not None and self.recorder._recording:
+                if hasattr(self.env, "last_raw_obs"):
+                    obs_dict = self.env.last_raw_obs
+                elif isinstance(observation, dict):
+                    obs_dict = observation
+                else:
+                    obs_dict = None
+                if obs_dict is not None:
+                    self.recorder.record_step(act, obs_dict, reward, done)
             self._add_info(info)
 
         observation = self._get_obs(self.n_obs_steps)

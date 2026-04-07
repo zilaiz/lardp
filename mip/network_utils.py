@@ -24,6 +24,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.chitfm import ChiTransformer
     from mip.networks.chiunet import ChiUNet
     from mip.networks.jannerunet import JannerUNet
+    from mip.networks.lbmdit import LBMDiT
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
@@ -51,6 +52,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "sudeepdit_repa": SudeepDiTREPA,
         "sudeepdit_reg": SudeepDiTREG,
         "sudeepdit_repa_agg": SudeepDiTREPAAgg,
+        "lbmdit": LBMDiT,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -135,6 +137,19 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             timestep_emb_type=network_config.timestep_emb_type,
         )
 
+    elif network_config.network_type == "lbmdit":
+        lbmdit_params = dict(common_params)
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        lbmdit_params["obs_dim"] = enc_out_dim
+        return network_class(
+            **lbmdit_params,
+            d_model=network_config.emb_dim,
+            n_heads=network_config.n_heads,
+            depth=network_config.num_layers,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+        )
+
     elif "sudeepdit_repa" in network_config.network_type  or "sudeepdit_reg" in network_config.network_type:
         loguru.logger.info(f"REPA config - projector_dim: {network_config.projector_dim} | z_dims: {network_config.z_dims}")
         return network_class(
@@ -149,7 +164,13 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         )
 
 
+def _get_encoder_out_dim(network_config: NetworkConfig) -> int:
+    """Get the encoder output dimension (encoder_out_dim if set, else emb_dim)."""
+    return network_config.encoder_out_dim or network_config.emb_dim
+
+
 def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
+    enc_out_dim = _get_encoder_out_dim(network_config)
     if task_config.obs_type == "image":
         # Force image encoder for image observations
         encoder_type = getattr(network_config, "encoder_type", "image") or "image"
@@ -158,7 +179,7 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
         encoder_type = getattr(network_config, "encoder_type", "mlp") or "mlp"
     else:
         raise ValueError(f"Invalid observation type: {task_config.obs_type}")
-    loguru.logger.info(f"Using encoder type: {encoder_type}")
+    loguru.logger.info(f"Using encoder type: {encoder_type} | encoder_out_dim: {enc_out_dim}")
 
     if encoder_type == "identity":
         return IdentityEncoder(dropout=network_config.encoder_dropout)
@@ -181,7 +202,7 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
         kwargs = {
             "shape_meta": task_config.shape_meta,
             "rgb_model_name": network_config.rgb_model_name,
-            "emb_dim": network_config.emb_dim,
+            "emb_dim": enc_out_dim,
             "use_seq": network_config.use_seq,
             "keep_horizon_dims": network_config.keep_horizon_dims,
             "resize_shape": task_config.resize_shape,
@@ -215,7 +236,7 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
         return PrecomputedDINOEncoder(
             num_views=num_views,
             dino_embed_dim=dino_embed_dim,
-            emb_dim=network_config.emb_dim,
+            emb_dim=enc_out_dim,
             dropout=network_config.encoder_dropout,
             low_dim_keys=low_dim_keys,
             low_dim_total_dim=low_dim_total_dim,

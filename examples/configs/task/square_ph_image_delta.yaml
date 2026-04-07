@@ -3,30 +3,32 @@ defaults:
   - robomimic_base
   - _self_
 
-env_name: "can"
+env_name: "square"
 obs_type: "image"
 env_type: "ph"
 
 # HuggingFace dataset configuration - auto-downloads from the repository
-# dataset_filename: "robomimic/can/ph/image.hdf5"
+# dataset_filename: "robomimic/square/ph/image.hdf5"
 
 # Alternative: Use original repo with demo dataset (requires local processing)
 # dataset_repo: "amandlek/robomimic"
-# dataset_filename: "v1.5/can/ph/demo_v15.hdf5"
+# dataset_filename: "v1.5/square/ph/demo_v15.hdf5"
 
-dataset_path: "data/robomimic/can/ph/image_v15_abs.hdf5"
+dataset_path: "data/robomimic/square/ph/image_v15.hdf5"
 
 max_episode_steps: 400
 render_obs_key: "agentview_image"
+abs_action: false
+action_type: "delta"
 
 # Required keys
 horizon: 10
-act_dim: 10
+act_dim: 7
 
 shape_meta:
   action:
     shape:
-      - 10
+      - 7
   obs:
     agentview_image:
       shape:

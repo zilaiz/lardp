@@ -42,6 +42,7 @@ class RobomimicLowdimWrapper(gym.Env):
 
     def get_observation(self):
         raw_obs = self.env.get_observation()
+        self.last_raw_obs = {key: raw_obs[key] for key in self.obs_keys}
         obs = np.concatenate([raw_obs[key] for key in self.obs_keys], axis=0)
         return obs
 
@@ -82,6 +83,7 @@ class RobomimicLowdimWrapper(gym.Env):
 
     def step(self, action):
         raw_obs, reward, done, info = self.env.step(action)
+        self.last_raw_obs = {key: raw_obs[key] for key in self.obs_keys}
         obs = np.concatenate([raw_obs[key] for key in self.obs_keys], axis=0)
         return obs, reward, done, info
 

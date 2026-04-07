@@ -13,6 +13,7 @@ class LogConfig:
     save_freq: int = 10000
     eval_episodes: int = 10
     save_video: bool = False
+    save_rollouts: bool = False
 
 
 @dataclass
@@ -88,6 +89,8 @@ class NetworkConfig:
     # RNN specific configs
     rnn_type: str = "LSTM"  # "LSTM" or "GRU"
     max_freq: float = 100.0
+    # Encoder output dimension override (None = use emb_dim)
+    encoder_out_dim: int | None = None
     # REPA specific
     projector_dim: int = 2048
     z_dims: list[int] | None = None
@@ -99,6 +102,7 @@ class TaskConfig:
     obs_type: str = "state"
     env_type: str = "ph"
     abs_action: bool = True
+    action_type: str = "absolute"  # "absolute" or "delta"
     # Dataset configuration - either HuggingFace or local path
     dataset_repo: str | None = (
         None  # HuggingFace repository ID (e.g., "ChaoyiPan/mip-dataset")
