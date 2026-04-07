@@ -98,8 +98,10 @@ def make_robomimic_env(task_config: TaskConfig, idx, render=False, seed=None):
                 filename=task_config.dataset_filename,
                 repo_type="dataset",
             )
-        elif hasattr(task_config, "dataset_path"):
+        elif hasattr(task_config, "dataset_path") and task_config.dataset_path:
             dataset_path = os.path.expanduser(task_config.dataset_path)
+        elif hasattr(task_config, "dataset_paths") and task_config.dataset_paths:
+            dataset_path = os.path.expanduser(task_config.dataset_paths[0])
         else:
             raise ValueError(
                 "Either dataset_repo/dataset_filename or dataset_path must be provided"

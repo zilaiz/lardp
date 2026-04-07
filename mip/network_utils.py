@@ -24,7 +24,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.chitfm import ChiTransformer
     from mip.networks.chiunet import ChiUNet
     from mip.networks.jannerunet import JannerUNet
-    from mip.networks.lbmdit import LBMDiT
+    from mip.networks.lbmdit import LBMDiT, LBMDiTIDM
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
@@ -53,6 +53,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "sudeepdit_reg": SudeepDiTREG,
         "sudeepdit_repa_agg": SudeepDiTREPAAgg,
         "lbmdit": LBMDiT,
+        "lbmidm": LBMDiTIDM,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -143,6 +144,20 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         lbmdit_params["obs_dim"] = enc_out_dim
         return network_class(
             **lbmdit_params,
+            d_model=network_config.emb_dim,
+            n_heads=network_config.n_heads,
+            depth=network_config.num_layers,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+        )
+
+    elif network_config.network_type == "lbmidm":
+        lbmidm_params = dict(common_params)
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        lbmidm_params["obs_dim"] = enc_out_dim
+        lbmidm_params["To"] = task_config.obs_steps + 1  # +1 for goal frame
+        return network_class(
+            **lbmidm_params,
             d_model=network_config.emb_dim,
             n_heads=network_config.n_heads,
             depth=network_config.num_layers,

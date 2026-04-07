@@ -481,6 +481,178 @@ class RobomimicImageDataset(BaseDataset):
         return uaction
 
 
+class RobomimicImageIDMDataset(RobomimicImageDataset):
+    """Image dataset for inverse dynamics model training.
+
+    Returns current obs (To frames), goal obs (1 frame after action chunk),
+    and action sequence. Supports sharing a normalizer from another dataset
+    (e.g., expert normalizer for rollout data).
+    """
+
+    def __init__(
+        self,
+        dataset_dir,
+        shape_meta: dict,
+        n_obs_steps=None,
+        horizon=1,
+        pad_before=0,
+        pad_after=0,
+        abs_action=False,
+        rotation_rep="rotation_6d",
+        val_dataset_percentage=0.0,
+        mode="train",
+        normalizer=None,
+    ):
+        # We need to override the parent's __init__ because:
+        # 1. sequence_length must be horizon+1 (extra frame for goal)
+        # 2. pad_after must be act_steps (= pad_after+1 from caller) to allow goal frame
+        # 3. No key_first_k optimization (need obs at both [0:obs_steps] and [horizon])
+        BaseDataset.__init__(self)
+        self.rotation_transformer = RotationTransformer(
+            from_rep="axis_angle", to_rep=rotation_rep
+        )
+        self.val_dataset_percentage = val_dataset_percentage
+        self.mode = mode
+
+        self.replay_buffer = _convert_robomimic_to_replay(
+            store=zarr.storage.MemoryStore(),
+            shape_meta=shape_meta,
+            dataset_path=dataset_dir,
+            abs_action=abs_action,
+            rotation_transformer=self.rotation_transformer,
+            val_dataset_percentage=val_dataset_percentage,
+            mode=mode,
+        )
+
+        rgb_keys = []
+        lowdim_keys = []
+        obs_shape_meta = shape_meta["obs"]
+        for key, attr in obs_shape_meta.items():
+            type = attr.get("type", "low_dim")
+            if type == "rgb":
+                rgb_keys.append(key)
+            elif type == "low_dim":
+                lowdim_keys.append(key)
+
+        # No key_first_k — we need obs at [0:n_obs_steps] AND [horizon]
+        self.sampler = SequenceSampler(
+            replay_buffer=self.replay_buffer,
+            sequence_length=horizon + 1,  # +1 for goal frame
+            pad_before=pad_before,
+            pad_after=pad_after + 1,  # +1 to allow goal frame at end
+        )
+
+        self.shape_meta = shape_meta
+        self.rgb_keys = rgb_keys
+        self.lowdim_keys = lowdim_keys
+        self.abs_action = abs_action
+        self.horizon = horizon
+        self.pad_before = pad_before
+        self.pad_after = pad_after
+        self.n_obs_steps = n_obs_steps
+
+        if normalizer is not None:
+            self.normalizer = normalizer
+        else:
+            self.normalizer = self.get_normalizer()
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        sample = self.sampler.sample_sequence(idx)
+
+        # Current obs: first n_obs_steps frames
+        obs_dict = {}
+        for key in self.rgb_keys:
+            obs_dict[key] = (
+                np.moveaxis(sample[key][: self.n_obs_steps], -1, 1).astype(np.float32)
+                / 255.0
+            )
+            obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
+
+        for key in self.lowdim_keys:
+            obs_dict[key] = sample[key][: self.n_obs_steps].astype(np.float32)
+            obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
+
+        # Goal obs: frame at index `horizon` (right after the action chunk)
+        goal_dict = {}
+        for key in self.rgb_keys:
+            goal_dict[key] = (
+                np.moveaxis(
+                    sample[key][self.horizon : self.horizon + 1], -1, 1
+                ).astype(np.float32)
+                / 255.0
+            )
+            goal_dict[key] = self.normalizer["obs"][key].normalize(goal_dict[key])
+
+        for key in self.lowdim_keys:
+            goal_dict[key] = sample[key][self.horizon : self.horizon + 1].astype(
+                np.float32
+            )
+            goal_dict[key] = self.normalizer["obs"][key].normalize(goal_dict[key])
+
+        # Action: first `horizon` frames
+        action = sample["action"][: self.horizon].astype(np.float32)
+        action = self.normalizer["action"].normalize(action)
+
+        torch_data = {
+            "obs": dict_apply(obs_dict, torch.tensor),
+            "goal_obs": dict_apply(goal_dict, torch.tensor),
+            "action": torch.tensor(action),
+        }
+        return torch_data
+
+
+def make_idm_dataset(task_config, mode="train"):
+    """Create IDM dataset(s) from one or more HDF5 files.
+
+    Uses task_config.dataset_paths (list) or falls back to task_config.dataset_path.
+    The first dataset's normalizer is shared with all subsequent datasets.
+    Returns a ConcatDataset if multiple paths, or a single dataset otherwise.
+    """
+    paths = task_config.dataset_paths
+    if paths is None:
+        # Fall back to single path
+        if hasattr(task_config, "dataset_path") and task_config.dataset_path:
+            paths = [os.path.expanduser(task_config.dataset_path)]
+        else:
+            raise ValueError(
+                "Either dataset_paths or dataset_path must be provided for IDM training"
+            )
+    else:
+        paths = [os.path.expanduser(p) for p in paths]
+
+    logger.info(f"IDM dataset paths: {paths}")
+
+    common_kwargs = dict(
+        shape_meta=task_config.shape_meta,
+        n_obs_steps=task_config.obs_steps,
+        horizon=task_config.horizon,
+        pad_before=task_config.obs_steps - 1,
+        pad_after=task_config.act_steps - 1,
+        abs_action=task_config.abs_action,
+        val_dataset_percentage=task_config.val_dataset_percentage,
+        mode=mode,
+    )
+
+    # Create primary (expert) dataset
+    datasets = []
+    primary_ds = RobomimicImageIDMDataset(dataset_dir=paths[0], **common_kwargs)
+    datasets.append(primary_ds)
+    logger.info(f"Primary IDM dataset: {primary_ds}")
+
+    # Create additional datasets sharing the expert normalizer
+    for path in paths[1:]:
+        ds = RobomimicImageIDMDataset(
+            dataset_dir=path, normalizer=primary_ds.normalizer, **common_kwargs
+        )
+        datasets.append(ds)
+        logger.info(f"Additional IDM dataset: {ds}")
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    return torch.utils.data.ConcatDataset(datasets)
+
+
 class RobomimicImageREPADataset(BaseDataset):
     """Image dataset for on-the-fly LAM inference.
 

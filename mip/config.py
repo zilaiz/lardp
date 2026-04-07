@@ -113,6 +113,7 @@ class TaskConfig:
     dataset_path: str | None = (
         None  # Local path (deprecated, use dataset_repo/dataset_filename)
     )
+    dataset_paths: list[str] | None = None  # Multiple HDF5 paths [expert, rollout1, ...]
     max_episode_steps: int = 400
     obs_keys: list[str] = field(
         default_factory=lambda: [

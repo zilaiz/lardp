@@ -320,6 +320,12 @@ class LBMDiT(BaseNetwork):
         return y, None
 
 
+class LBMDiTIDM(LBMDiT):
+    """LBMDiT for inverse dynamics: obs (To) + goal (1) = To+1 conditioning frames."""
+
+    pass
+
+
 def test_lbmdit():
     """Test LBMDiT network."""
     print("=" * 50)

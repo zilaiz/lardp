@@ -3,13 +3,13 @@ defaults:
   - _base
   - _self_
 
-network_type: "lbmdit"
+network_type: "lbmidm"
 emb_dim: 256  # Used as d_model
 num_layers: 8  # Used as depth
 dropout: 0.0
 timestep_emb_dim: 128
 encoder_out_dim: 256
 
-# LBMDiT specific configs
+# LBMDiTIDM specific configs
 n_heads: 8  # Number of attention heads
 timestep_emb_type: "positional"  # Options: positional, sinusoidal, fourier
