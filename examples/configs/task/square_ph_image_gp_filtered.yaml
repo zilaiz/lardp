@@ -9,9 +9,11 @@ env_type: "ph"
 
 dataset_paths:
   - data/robomimic/square/ph/image_v15.hdf5
-  - data/robomimic/square/image_rollouts_clipped.hdf5
+  - data/robomimic/square/image_rollouts_clipped_truncate.hdf5
 abs_action: false
 action_type: "delta"
+filter_success: true
+
 
 max_episode_steps: 400
 render_obs_key: "agentview_image"

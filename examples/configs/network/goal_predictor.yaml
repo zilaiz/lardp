@@ -1,0 +1,8 @@
+# @package network
+defaults:
+  - lbmidm
+  - _self_
+
+# Goal predictor MLP architecture
+goal_predictor_hidden_dims: [1024, 1024]
+goal_predictor_dropout: 0.1

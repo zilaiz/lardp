@@ -9,7 +9,7 @@ env_type: "ph"
 
 dataset_paths:
   - data/robomimic/tool_hang/ph/image_v15.hdf5
-  - data/robomimic/tool_hang/image_rollouts.hdf5
+  - data/robomimic/tool_hang/image_rollouts_clipped.hdf5
 abs_action: false
 action_type: "delta"
 

@@ -350,6 +350,50 @@ class BaseEncoder(nn.Module):
         raise NotImplementedError
 
 
+class GoalDropoutEncoder(BaseEncoder):
+    """Wraps an encoder to apply per-sample goal frame dropout on the embedding.
+
+    After encoding, randomly replaces the last temporal frame (goal) with a
+    learnable unconditional embedding for a fraction of samples.
+    Used for classifier-free guidance style IDM training.
+    """
+
+    def __init__(self, encoder: BaseEncoder, emb_dim: int, obs_steps: int, goal_dropout_prob: float = 0.0):
+        super().__init__()
+        self.encoder = encoder
+        self.obs_steps = obs_steps
+        self.goal_dropout_prob = goal_dropout_prob
+        self.uncond_emb = nn.Parameter(torch.zeros(emb_dim))
+
+    def apply_goal_dropout(self, obs_emb: torch.Tensor) -> torch.Tensor:
+        """Randomly replace the goal slot (last temporal frame) with uncond_emb.
+
+        No-op outside training or when goal_dropout_prob == 0. This is the
+        single source of truth for IDM goal dropout — callers that bypass
+        `forward` (e.g. to run the inner encoder on a `(B, To+2, ...)` stack)
+        should call this instead of reimplementing the rule.
+        """
+        if not (self.training and self.goal_dropout_prob > 0):
+            return obs_emb
+        B = obs_emb.shape[0]
+        drop_mask = torch.rand(B, device=obs_emb.device) < self.goal_dropout_prob
+        obs_emb = obs_emb.clone()
+        obs_emb[drop_mask, -1, :] = self.uncond_emb
+        return obs_emb
+
+    def forward(self, obs, mask=None):
+        obs_emb = self.encoder(obs, mask)  # (B, T, emb_dim) where T is To or To+1
+        if obs_emb.shape[1] == self.obs_steps:
+            # No goal provided (T == To): pad with unconditional embedding
+            uncond = self.uncond_emb.expand(obs_emb.shape[0], 1, -1)
+            obs_emb = torch.cat([obs_emb, uncond], dim=1)  # (B, To+1, emb_dim)
+            return obs_emb
+        assert obs_emb.shape[1] == self.obs_steps + 1, (
+            f"Expected T={self.obs_steps} or {self.obs_steps + 1}, got {obs_emb.shape[1]}"
+        )
+        return self.apply_goal_dropout(obs_emb)
+
+
 class IdentityEncoder(BaseEncoder):
     """Identity encoder does not change the input condition.
 

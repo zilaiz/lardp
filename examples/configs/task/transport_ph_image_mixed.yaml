@@ -12,6 +12,7 @@ dataset_paths:
   - data/robomimic/transport/image_rollouts_clipped.hdf5
 abs_action: false
 action_type: "delta"
+filter_success: false
 
 max_episode_steps: 700
 render_obs_key: "shouldercamera0_image"

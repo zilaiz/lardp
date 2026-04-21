@@ -25,6 +25,11 @@ rampup_ratio: 0.5
 min_value: 0.0
 max_value: 1.0
 model_path: null
+# Load encoder weights from a pretrained IDM checkpoint (lbmdit ablation).
+# freeze=true  -> encoder + encoder_ema both seeded from IDM's encoder_ema (teacher), encoder frozen
+# freeze=false -> encoder <- IDM encoder, encoder_ema <- IDM encoder_ema, finetune continues
+pretrained_encoder_path: null
+freeze_encoder: false
 interp_type: "linear"
 device: "cuda"
 use_compile: false
@@ -35,3 +40,19 @@ auto_resume: true
 extra_cond_dropout_warmup_steps: 5000
 extra_cond_dropout_rampup_steps: 10000
 diagnose_teacher_delta: false
+
+# IDM goal dropout (classifier-free guidance style)
+goal_dropout_prob: 0.0
+# IDM encoder local-linearity regularizer weight (0 disables)
+local_linearity_coef: 0.0
+
+# Goal predictor specific
+idm_checkpoint_path: null
+state_matching_weight: 0.0
+cfg_scale: 1.0
+
+# Goal predictor DiT specific
+goal_flow_num_steps: 5
+goal_flow_loss_scale: 1.0
+action_reg_weight: 1.0
+goal_stats_path: null

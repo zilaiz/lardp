@@ -3,13 +3,12 @@ defaults:
   - robomimic_base
   - _self_
 
-env_name: "square"
+env_name: "can"
 obs_type: "image"
 env_type: "ph"
 
 dataset_paths:
-  - data/robomimic/square/ph/image_v15.hdf5
-  - data/robomimic/square/image_rollouts_clipped.hdf5
+  - data/robomimic/can/ph/image_v15.hdf5
 abs_action: false
 action_type: "delta"
 

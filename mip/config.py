@@ -1,5 +1,10 @@
 from dataclasses import dataclass, field
 
+from omegaconf import OmegaConf
+
+if not OmegaConf.has_resolver("suffix"):
+    OmegaConf.register_new_resolver("suffix", lambda s: f"_{s}" if s else "")
+
 
 @dataclass
 class LogConfig:
@@ -8,12 +13,15 @@ class LogConfig:
     project: str
     group: str
     exp_name: str
+    exp_note: str = ""
     eval_freq: int = 20000
     log_freq: int = 1000
     save_freq: int = 10000
     eval_episodes: int = 10
     save_video: bool = False
     save_rollouts: bool = False
+    rollout_noise_std: float = 0.0  # Gaussian noise std injected into actions during rollout collection
+    max_rollout_demos: int = 0  # Max rollout episodes to save (0 = unlimited)
 
 
 @dataclass
@@ -41,6 +49,9 @@ class OptimizationConfig:
     min_value: float = 0.0
     max_value: float = 1.0
     model_path: str | None = None
+    # Load encoder weights from a pretrained IDM checkpoint (ablation)
+    pretrained_encoder_path: str | None = None
+    freeze_encoder: bool = False
     interp_type: str = "linear"  # "linear" or "trig"
     device: str = "cuda"
     use_compile: bool = True  # Whether to use torch.compile for acceleration
@@ -49,6 +60,19 @@ class OptimizationConfig:
     )
     use_cudagraphs: bool = False  # Whether to use CUDA graphs (requires static shapes)
     auto_resume: bool = True  # Whether to automatically resume from checkpoint
+    # IDM goal dropout (classifier-free guidance style)
+    goal_dropout_prob: float = 0.0  # Probability of zeroing out goal frame during IDM training
+    # IDM encoder local-linearity regularizer weight (0 disables)
+    local_linearity_coef: float = 0.0
+    # Goal predictor specific
+    idm_checkpoint_path: str | None = None  # Path to pretrained IDM checkpoint (for goal predictor training)
+    state_matching_weight: float = 0.0  # Lambda for state-matching loss ||g_hat - encoder(s_{t+k})||^2
+    cfg_scale: float = 1.0  # CFG scale for goal predictor inference (1.0 = no guidance)
+    # Goal predictor DiT specific
+    goal_flow_num_steps: int = 5  # ODE steps for goal generation at inference
+    goal_flow_loss_scale: float = 1.0  # weight for state flow loss
+    action_reg_weight: float = 1.0  # weight for action regularization loss
+    goal_stats_path: str | None = None  # path to precomputed goal normalization stats (.pt)
     # Dropout annealing for condistill extra_cond_encoder
     extra_cond_dropout_warmup_steps: int = 5000  # number of steps to keep dropout at 0
     extra_cond_dropout_rampup_steps: int = 10000  # number of steps to linearly ramp dropout from 0 to max
@@ -94,6 +118,24 @@ class NetworkConfig:
     # REPA specific
     projector_dim: int = 2048
     z_dims: list[int] | None = None
+    # Goal predictor MLP architecture
+    goal_predictor_hidden_dims: list[int] | None = None  # e.g., [512, 512]
+    goal_predictor_dropout: float = 0.1
+    # Goal predictor DiT architecture
+    goal_dit_depth: int = 6
+    goal_dit_n_heads: int = 6
+    goal_dit_d_model: int | None = None  # None = use emb_dim
+    goal_dit_dropout: float = 0.1
+    goal_dit_projector_dim: int | None = None  # None = 2 * d_model
+    goal_align_depth: int | list[int] | None = 3
+    # Goal predictor DiT with DDT head (encoder-decoder split)
+    goal_ddt_enc_depth: int = 8
+    goal_ddt_dec_depth: int = 2
+    goal_ddt_d_model_enc: int | None = None  # None = use emb_dim
+    goal_ddt_d_model_dec: int | None = None  # None = same as d_model_enc
+    goal_ddt_n_heads_enc: int = 8
+    goal_ddt_n_heads_dec: int = 8
+    goal_ddt_dropout: float = 0.0
 
 
 @dataclass
@@ -114,6 +156,7 @@ class TaskConfig:
         None  # Local path (deprecated, use dataset_repo/dataset_filename)
     )
     dataset_paths: list[str] | None = None  # Multiple HDF5 paths [expert, rollout1, ...]
+    filter_success: bool = False  # Filter secondary datasets to keep only successful demos (reward > 0)
     max_episode_steps: int = 400
     obs_keys: list[str] = field(
         default_factory=lambda: [

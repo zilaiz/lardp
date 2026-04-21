@@ -7,6 +7,7 @@ defaults:
 # dataset_repo: "ChaoyiPan/mip-dataset"
 abs_action: true
 action_type: "absolute"  # "absolute" or "delta"
+dataset_paths: null  # List of HDF5 paths for multi-dataset training (null = use dataset_path)
 
 # Common required keys
 obs_steps: 2

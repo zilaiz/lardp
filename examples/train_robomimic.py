@@ -228,7 +228,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
                 _obs_tag = "image" if config.task.obs_type == "image" else "low_dim"
                 _rollout_path = str(Path("data/robomimic") / config.task.env_name / f"{_obs_tag}_rollouts.hdf5")
             for num_steps in num_steps_list:
-                _save = getattr(config.log, "save_rollouts", False) and num_steps == 9
+                _save = getattr(config.log, "save_rollouts", False) and num_steps == 3
                 metrics.update(eval(config, envs, dataset, agent, logger, num_steps, dino_extractor=dino_extractor, save_rollouts=_save, rollout_path=_rollout_path))
 
             # Update best metrics and average metrics
@@ -414,6 +414,14 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1, dino_extract
                 ]:
                     act = dataset.undo_transform_action(act)
 
+            # Inject Gaussian noise for diverse rollout collection
+            rollout_noise_std = getattr(config.log, "rollout_noise_std", 0.0)
+            if save_rollouts and rollout_noise_std > 0:
+                act = act + np.random.normal(0, rollout_noise_std, size=act.shape).astype(act.dtype)
+                # Clip to robosuite's controller input range so recorded actions
+                # match what the env actually executes (see controller.py scale_action).
+                act = np.clip(act, -1.0, 1.0)
+
             with timed("env_step", inference_times):
                 obs, reward, terminated, truncated, info = envs.step(act)
                 _ = terminated | truncated
@@ -496,7 +504,8 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1, dino_extract
         )
         for recorder in recorders:
             combined.episodes.extend(recorder.episodes)
-        combined.append_hdf5(rollout_path)
+        max_demos = getattr(config.log, "max_rollout_demos", 0) or None
+        combined.append_hdf5(rollout_path, max_demos=max_demos)
 
         # Detach recorders from envs
         for env_idx in range(config.task.num_envs):
@@ -547,6 +556,15 @@ def main(config):
 
     agent = TrainingAgent(config)
     resume_state = None
+
+    pretrained_encoder_path = getattr(
+        config.optimization, "pretrained_encoder_path", None
+    )
+    if pretrained_encoder_path and pretrained_encoder_path != "None":
+        agent.load_pretrained_encoder(
+            pretrained_encoder_path,
+            freeze=getattr(config.optimization, "freeze_encoder", False),
+        )
 
     if config.optimization.model_path and config.optimization.model_path != "None":
         loguru.logger.info(f"Loading model from {config.optimization.model_path}")
@@ -613,7 +631,7 @@ def main(config):
 
         num_steps_list = get_default_step_list(config.optimization.loss_type)
         for num_steps in num_steps_list:
-            _save = getattr(config.log, "save_rollouts", False) and num_steps == 9
+            _save = getattr(config.log, "save_rollouts", False) and num_steps == 3
             metrics = {"step": num_steps}
             metrics.update(eval(config, envs, dataset, agent, logger, num_steps, dino_extractor=dino_extractor, save_rollouts=_save, rollout_path=_rollout_path))
             logger.log(metrics, category="eval")

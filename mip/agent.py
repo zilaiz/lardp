@@ -60,6 +60,7 @@ class TrainingAgent:
             self.flow_map_ema_detach = None
             self.encoder_ema_detach = None
 
+        self.encoder_frozen = False
         params = list(self.encoder.parameters()) + list(self.flow_map.parameters())
         self.optimizer = torch.optim.AdamW(
             params,
@@ -177,7 +178,8 @@ class TrainingAgent:
                 # Restore training mode if it was training
                 if was_training:
                     self.flow_map.train()
-                    self.encoder.train()
+                    if not self.encoder_frozen:
+                        self.encoder.train()
 
     def _sync_detached_models(self):
         """Synchronize detached models with main models for CUDA graphs."""
@@ -472,6 +474,117 @@ class TrainingAgent:
     def train(self):
         """Set all models to training mode."""
         self.flow_map.train()
-        self.encoder.train()
+        if not self.encoder_frozen:
+            self.encoder.train()
         self.flow_map_ema.train()
         self.encoder_ema.train()
+
+    @staticmethod
+    def _unwrap_goal_dropout_encoder(
+        sd: dict, label: str = "encoder"
+    ) -> dict:
+        """Unwrap a GoalDropoutEncoder state dict into a plain-encoder state dict.
+
+        IDM training always wraps its encoder in ``GoalDropoutEncoder`` (see
+        ``train_robomimic_idm.py``), which produces state dicts of the form::
+
+            encoder.<inner params...>
+            uncond_emb
+
+        Our lbmdit encoder is the plain inner encoder, so we need to drop
+        ``uncond_emb`` and strip the leading ``encoder.`` prefix. A state dict
+        that is already flat (no prefix) is passed through unchanged.
+        """
+        has_uncond = "uncond_emb" in sd
+        keys = [k for k in sd.keys() if k != "uncond_emb"]
+        wrapped = bool(keys) and all(k.startswith("encoder.") for k in keys)
+
+        if not wrapped and not has_uncond:
+            return sd  # already flat
+
+        unwrapped = {}
+        for k, v in sd.items():
+            if k == "uncond_emb":
+                continue
+            if k.startswith("encoder."):
+                unwrapped[k[len("encoder.") :]] = v
+            else:
+                # Mixed state dict — shouldn't happen with GoalDropoutEncoder,
+                # but keep the key so strict-load flags it.
+                unwrapped[k] = v
+
+        loguru.logger.info(
+            f"Unwrapped {label} state dict from GoalDropoutEncoder "
+            f"(dropped uncond_emb={has_uncond}, stripped 'encoder.' prefix from "
+            f"{len(unwrapped)} keys)"
+        )
+        return unwrapped
+
+    def load_pretrained_encoder(self, path: str, freeze: bool = False):
+        """Load encoder weights from a pretrained IDM checkpoint.
+
+        Loading strategy depends on ``freeze``:
+
+        * ``freeze=True``  — the encoder will be constant during lbmdit training,
+          so we want the best deployed features. Seed **both** ``encoder`` and
+          ``encoder_ema`` from the IDM's ``encoder_ema`` (the teacher that IDM
+          actually uses at inference). This also keeps EMA and non-EMA sampling
+          paths consistent throughout training.
+        * ``freeze=False`` — the encoder will continue to be finetuned, so each
+          branch continues in its natural role: ``encoder`` <- IDM's raw
+          ``encoder`` (the SGD iterate), ``encoder_ema`` <- IDM's ``encoder_ema``
+          (the smoothed teacher). This preserves the IDM's EMA history instead
+          of throwing it away.
+
+        Args:
+            path: Path to an IDM checkpoint saved via ``TrainingAgent.save``.
+            freeze: If True, also freeze the encoder — grads are disabled, the
+                optimizer is rebuilt with flow_map params only, and the encoder
+                is pinned to eval mode.
+        """
+        loguru.logger.info(
+            f"Loading pretrained encoder from {path} (freeze={freeze})"
+        )
+        state_dict = torch.load(
+            path, map_location=self.config.optimization.device, weights_only=False
+        )
+        if "encoder" not in state_dict or "encoder_ema" not in state_dict:
+            raise KeyError(
+                f"Checkpoint at {path} is missing 'encoder'/'encoder_ema' keys "
+                f"(found: {list(state_dict.keys())}). Expected a TrainingAgent-style "
+                f"IDM checkpoint."
+            )
+
+        if freeze:
+            # Both slots get the teacher — constant across training.
+            teacher_sd = state_dict["encoder_ema"]
+            enc_sd, enc_ema_sd = teacher_sd, teacher_sd
+        else:
+            # Preserve IDM's student/teacher split for continued finetuning.
+            enc_sd = state_dict["encoder"]
+            enc_ema_sd = state_dict["encoder_ema"]
+
+        # The IDM training pipeline (train_robomimic_idm.py) always wraps its
+        # encoder in a GoalDropoutEncoder even when goal_dropout_prob=0. That
+        # wrapper structure is { encoder.* : inner params, uncond_emb : param }.
+        # Our lbmdit encoder is the plain inner encoder, so we unwrap here.
+        enc_sd = self._unwrap_goal_dropout_encoder(enc_sd, "encoder")
+        enc_ema_sd = self._unwrap_goal_dropout_encoder(enc_ema_sd, "encoder_ema")
+
+        # After unwrapping we expect an exact match — fail loudly on real mismatches.
+        self.encoder.load_state_dict(enc_sd, strict=True)
+        self.encoder_ema.load_state_dict(enc_ema_sd, strict=True)
+
+        if freeze:
+            self.encoder_frozen = True
+            for p in self.encoder.parameters():
+                p.requires_grad_(False)
+            self.encoder.eval()
+            self.optimizer = torch.optim.AdamW(
+                list(self.flow_map.parameters()),
+                lr=self.config.optimization.lr,
+                weight_decay=self.config.optimization.weight_decay,
+            )
+
+        # Recompile so detached/compiled modules pick up the new weights.
+        self.__compile__()

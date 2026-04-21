@@ -14,7 +14,7 @@ from mip.torch_utils import at_least_ndim
 
 
 def get_default_step_list(loss_type: str):
-    if loss_type in ["flow", "flow_beta", "flow_repa", "flow_reg", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "ctm", "lmd", "psd", "lsd", "esd", "mf"]:
+    if loss_type in ["flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_reg", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "ctm", "lmd", "psd", "lsd", "esd", "mf", "goal_predictor", "goal_predictor_dit"]:
         return 3 ** np.arange(2, -1, -1)
     elif loss_type in ["regression", "mip", "tsd"]:
         return [1]
@@ -23,7 +23,7 @@ def get_default_step_list(loss_type: str):
 
 
 def get_sampler(loss_type: str):
-    if loss_type in {"flow", "flow_beta", "flow_repa", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill"}:
+    if loss_type in {"flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "goal_predictor", "goal_predictor_dit"}:
         return ode_sampler
     elif loss_type == "flow_reg":
         return ode_reg_sampler

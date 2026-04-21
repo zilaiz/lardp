@@ -30,12 +30,20 @@ from mip.datasets.imagecodecs import register_codecs
 register_codecs()
 
 
-def make_dataset(task_config, mode="train"):
-    # Check if we should download from HuggingFace
+class MultiImageDataset(torch.utils.data.ConcatDataset):
+    """ConcatDataset that exposes normalizer and undo_transform_action from the primary dataset."""
+
+    def __init__(self, datasets):
+        super().__init__(datasets)
+        self.normalizer = datasets[0].normalizer
+        self.undo_transform_action = datasets[0].undo_transform_action
+
+
+def _resolve_dataset_path(task_config):
+    """Resolve a single dataset path from config (HuggingFace or local)."""
     if hasattr(task_config, "dataset_repo") and hasattr(
         task_config, "dataset_filename"
     ):
-        # Auto-download from HuggingFace
         logger.info(
             f"Downloading dataset from {task_config.dataset_repo}/{task_config.dataset_filename}"
         )
@@ -45,11 +53,26 @@ def make_dataset(task_config, mode="train"):
             repo_type="dataset",
         )
         logger.info(f"Downloaded dataset to: {dataset_path}")
-    elif hasattr(task_config, "dataset_path"):
-        # Use explicit path if provided
+        return dataset_path
+    elif hasattr(task_config, "dataset_path") and task_config.dataset_path:
         dataset_path = os.path.expanduser(task_config.dataset_path)
         logger.info(f"Loading dataset from {dataset_path}")
-    else:
+        return dataset_path
+    return None
+
+
+def make_dataset(task_config, mode="train"):
+    # Check for multi-dataset image training
+    if (
+        task_config.dataset_paths is not None
+        and task_config.obs_type == "image"
+        and task_config.latent_type is None
+    ):
+        return _make_multi_image_dataset(task_config, mode)
+
+    # Single dataset path resolution
+    dataset_path = _resolve_dataset_path(task_config)
+    if dataset_path is None:
         raise ValueError(
             "Either dataset_repo/dataset_filename or dataset_path must be provided"
         )
@@ -134,6 +157,61 @@ def make_dataset(task_config, mode="train"):
             raise ValueError(f"Invalid observation type: {task_config.obs_type}")
     else:
         raise ValueError(f"Environment {task_config.env_name} not supported")
+
+
+def _make_multi_image_dataset(task_config, mode="train"):
+    """Create image dataset(s) from one or more HDF5 files.
+
+    Uses task_config.dataset_paths (list). The first dataset's normalizer is
+    shared with all subsequent datasets. Returns a MultiImageDataset if multiple
+    paths, or a single RobomimicImageDataset otherwise.
+    """
+    paths = [os.path.expanduser(p) for p in task_config.dataset_paths]
+    logger.info(f"Multi-dataset paths: {paths}")
+
+    filter_success = getattr(task_config, "filter_success", False)
+
+    common_kwargs = dict(
+        shape_meta=task_config.shape_meta,
+        n_obs_steps=task_config.obs_steps,
+        horizon=task_config.horizon,
+        pad_before=task_config.obs_steps - 1,
+        pad_after=task_config.act_steps - 1,
+        abs_action=task_config.abs_action,
+        mode=mode,
+    )
+
+    # Primary (expert) dataset with val split
+    datasets = []
+    primary_ds = RobomimicImageDataset(
+        dataset_dir=paths[0],
+        val_dataset_percentage=task_config.val_dataset_percentage,
+        **common_kwargs,
+    )
+    datasets.append(primary_ds)
+    logger.info(f"Primary dataset: {len(primary_ds)} samples")
+
+    # Secondary (rollout) datasets — each with own normalizer first
+    for path in paths[1:]:
+        ds = RobomimicImageDataset(
+            dataset_dir=path,
+            val_dataset_percentage=0.0,
+            filter_success=filter_success,
+            **common_kwargs,
+        )
+        datasets.append(ds)
+        logger.info(f"Secondary dataset: {len(ds)} samples")
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    # Merge normalizers: take global min/max across all datasets
+    merged_normalizer = _merge_normalizers([ds.normalizer for ds in datasets])
+    for ds in datasets:
+        ds.normalizer = merged_normalizer
+    logger.info("Merged normalizers across all image datasets")
+
+    return MultiImageDataset(datasets)
 
 
 class RobomimicDataset(BaseDataset):
@@ -356,6 +434,8 @@ class RobomimicImageDataset(BaseDataset):
         rotation_rep="rotation_6d",
         val_dataset_percentage=0.0,
         mode="train",
+        normalizer=None,
+        filter_success=False,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -372,6 +452,7 @@ class RobomimicImageDataset(BaseDataset):
             rotation_transformer=self.rotation_transformer,
             val_dataset_percentage=val_dataset_percentage,
             mode=mode,
+            filter_success=filter_success,
         )
 
         rgb_keys = []
@@ -406,7 +487,10 @@ class RobomimicImageDataset(BaseDataset):
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
 
-        self.normalizer = self.get_normalizer()
+        if normalizer is not None:
+            self.normalizer = normalizer
+        else:
+            self.normalizer = self.get_normalizer()
 
     def get_normalizer(self):
         normalizer = defaultdict(dict)
@@ -502,6 +586,7 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
         val_dataset_percentage=0.0,
         mode="train",
         normalizer=None,
+        filter_success=False,
     ):
         # We need to override the parent's __init__ because:
         # 1. sequence_length must be horizon+1 (extra frame for goal)
@@ -522,6 +607,7 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
             rotation_transformer=self.rotation_transformer,
             val_dataset_percentage=val_dataset_percentage,
             mode=mode,
+            filter_success=filter_success,
         )
 
         rgb_keys = []
@@ -550,6 +636,10 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
+        assert self.horizon > self.n_obs_steps, (
+            "IDM dataset needs horizon > n_obs_steps so an intermediate frame "
+            "strictly between To_1 and goal exists."
+        )
 
         if normalizer is not None:
             self.normalizer = normalizer
@@ -589,6 +679,29 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
             )
             goal_dict[key] = self.normalizer["obs"][key].normalize(goal_dict[key])
 
+        # Intermediate obs: uniformly sample a real frame strictly between
+        # To_1 (index n_obs_steps - 1) and goal (index horizon), with a
+        # margin m=2 away from both endpoints so neither segment collapses
+        # to a near-zero embedding displacement.
+        m = 2
+        k_low = self.n_obs_steps + m
+        k_high = self.horizon - m
+        assert k_high > k_low, (
+            f"inter_obs sampling range empty: n_obs_steps={self.n_obs_steps}, "
+            f"horizon={self.horizon}, m={m}"
+        )
+        k = int(np.random.randint(k_low, k_high))
+        inter_dict = {}
+        for key in self.rgb_keys:
+            inter_dict[key] = (
+                np.moveaxis(sample[key][k : k + 1], -1, 1).astype(np.float32) / 255.0
+            )
+            inter_dict[key] = self.normalizer["obs"][key].normalize(inter_dict[key])
+
+        for key in self.lowdim_keys:
+            inter_dict[key] = sample[key][k : k + 1].astype(np.float32)
+            inter_dict[key] = self.normalizer["obs"][key].normalize(inter_dict[key])
+
         # Action: first `horizon` frames
         action = sample["action"][: self.horizon].astype(np.float32)
         action = self.normalizer["action"].normalize(action)
@@ -596,17 +709,58 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
         torch_data = {
             "obs": dict_apply(obs_dict, torch.tensor),
             "goal_obs": dict_apply(goal_dict, torch.tensor),
+            "inter_obs": dict_apply(inter_dict, torch.tensor),
             "action": torch.tensor(action),
         }
         return torch_data
 
 
-def make_idm_dataset(task_config, mode="train"):
+def _merge_normalizers(normalizers):
+    """Merge multiple normalizers by taking global min/max across all.
+
+    For MinMaxNormalizer keys, computes element-wise min/max across datasets.
+    ImageNormalizer keys are passed through unchanged (stateless).
+    """
+    merged = defaultdict(dict)
+    # Merge obs normalizers
+    all_obs_keys = set()
+    for norm in normalizers:
+        all_obs_keys.update(norm["obs"].keys())
+    for key in all_obs_keys:
+        sub_norms = [n["obs"][key] for n in normalizers if key in n["obs"]]
+        if all(isinstance(n, ImageNormalizer) for n in sub_norms):
+            merged["obs"][key] = sub_norms[0]
+        elif all(isinstance(n, MinMaxNormalizer) for n in sub_norms):
+            global_min = np.minimum.reduce([n.min for n in sub_norms])
+            global_max = np.maximum.reduce([n.max for n in sub_norms])
+            dummy = np.stack([global_min, global_max])
+            merged["obs"][key] = MinMaxNormalizer(dummy)
+        else:
+            raise ValueError(
+                f"Inconsistent normalizer types for obs key '{key}': "
+                f"{[type(n).__name__ for n in sub_norms]}"
+            )
+    # Merge action normalizer
+    act_norms = [n["action"] for n in normalizers]
+    global_min = np.minimum.reduce([n.min for n in act_norms])
+    global_max = np.maximum.reduce([n.max for n in act_norms])
+    dummy = np.stack([global_min, global_max])
+    merged["action"] = MinMaxNormalizer(dummy)
+    return merged
+
+
+def make_idm_dataset(task_config, mode="train", normalizer=None):
     """Create IDM dataset(s) from one or more HDF5 files.
 
     Uses task_config.dataset_paths (list) or falls back to task_config.dataset_path.
-    The first dataset's normalizer is shared with all subsequent datasets.
     Returns a ConcatDataset if multiple paths, or a single dataset otherwise.
+
+    Args:
+        task_config: Task configuration.
+        mode: "train" or "val".
+        normalizer: If provided, use this normalizer for all datasets instead of
+            computing a new one. Useful for ensuring downstream tasks (e.g., goal
+            predictor) use the same normalizer as the pretrained IDM.
     """
     paths = task_config.dataset_paths
     if paths is None:
@@ -622,6 +776,8 @@ def make_idm_dataset(task_config, mode="train"):
 
     logger.info(f"IDM dataset paths: {paths}")
 
+    filter_success = getattr(task_config, "filter_success", False)
+
     common_kwargs = dict(
         shape_meta=task_config.shape_meta,
         n_obs_steps=task_config.obs_steps,
@@ -629,23 +785,40 @@ def make_idm_dataset(task_config, mode="train"):
         pad_before=task_config.obs_steps - 1,
         pad_after=task_config.act_steps - 1,
         abs_action=task_config.abs_action,
-        val_dataset_percentage=task_config.val_dataset_percentage,
         mode=mode,
     )
 
-    # Create primary (expert) dataset
+    # Create primary (expert) dataset with val split applied
     datasets = []
-    primary_ds = RobomimicImageIDMDataset(dataset_dir=paths[0], **common_kwargs)
+    primary_ds = RobomimicImageIDMDataset(
+        dataset_dir=paths[0],
+        val_dataset_percentage=task_config.val_dataset_percentage,
+        **common_kwargs,
+    )
     datasets.append(primary_ds)
-    logger.info(f"Primary IDM dataset: {primary_ds}")
+    logger.info(f"Primary IDM dataset: {len(primary_ds)} samples")
 
-    # Create additional datasets sharing the expert normalizer
+    # Create additional (rollout) datasets — each with own normalizer first
     for path in paths[1:]:
         ds = RobomimicImageIDMDataset(
-            dataset_dir=path, normalizer=primary_ds.normalizer, **common_kwargs
+            dataset_dir=path,
+            val_dataset_percentage=0.0,
+            filter_success=filter_success,
+            **common_kwargs,
         )
         datasets.append(ds)
-        logger.info(f"Additional IDM dataset: {ds}")
+        logger.info(f"Additional IDM dataset: {len(ds)} samples")
+
+    # Apply normalizer: use provided one, or merge across all datasets
+    if normalizer is not None:
+        for ds in datasets:
+            ds.normalizer = normalizer
+        logger.info("Using provided normalizer for all IDM datasets")
+    elif len(datasets) > 1:
+        merged_normalizer = _merge_normalizers([ds.normalizer for ds in datasets])
+        for ds in datasets:
+            ds.normalizer = merged_normalizer
+        logger.info("Merged normalizers across all IDM datasets")
 
     if len(datasets) == 1:
         return datasets[0]
@@ -839,6 +1012,7 @@ def _convert_robomimic_to_replay(
     max_inflight_tasks=None,
     val_dataset_percentage=0.0,
     mode="train",
+    filter_success=False,
 ):
     """Convert Robomimic dataset to ReplayBuffer.
 
@@ -966,6 +1140,26 @@ def _convert_robomimic_to_replay(
         else:
             # Use all data for training when no validation split
             demo_indices = list(range(total_demos))
+
+        # Filter demos by binary reward (keep only successful episodes)
+        if filter_success:
+            filtered = []
+            for i in demo_indices:
+                demo = demos[f"demo_{i}"]
+                if "rewards" in demo:
+                    if np.sum(demo["rewards"][:]) > 0:
+                        filtered.append(i)
+                else:
+                    logger.warning(f"demo_{i} has no rewards key, keeping it")
+                    filtered.append(i)
+            logger.info(
+                f"Reward filter: kept {len(filtered)}/{len(demo_indices)} successful demos"
+            )
+            if len(filtered) == 0:
+                raise ValueError(
+                    f"All {len(demo_indices)} demos filtered out by reward filter in {dataset_path}"
+                )
+            demo_indices = filtered
 
         episode_ends = []
         prev_end = 0

@@ -84,11 +84,15 @@ class RolloutRecorder:
 
         self.episodes.append(ep)
 
-    def append_hdf5(self, path):
+    def append_hdf5(self, path, max_demos=None):
         """Append collected episodes to an HDF5 file in robomimic format.
 
         Creates the file if it doesn't exist, otherwise appends new demos
         with incrementing indices.
+
+        Args:
+            path: Path to the HDF5 file.
+            max_demos: If set, stop appending once total demos reaches this cap.
         """
         if len(self.episodes) == 0:
             return
@@ -107,7 +111,16 @@ class RolloutRecorder:
             existing_demos = int(data_grp.attrs["num_demos"])
             total_samples = int(data_grp.attrs["total"])
 
-            for i, ep in enumerate(self.episodes):
+            # Cap the number of episodes to append
+            episodes = self.episodes
+            if max_demos is not None and existing_demos >= max_demos:
+                logger.info(f"Rollout cap reached ({existing_demos}/{max_demos}), skipping append")
+                return
+            if max_demos is not None:
+                remaining = max_demos - existing_demos
+                episodes = episodes[:remaining]
+
+            for i, ep in enumerate(episodes):
                 demo_idx = existing_demos + i
                 demo_grp = data_grp.create_group(f"demo_{demo_idx}")
 
@@ -133,12 +146,13 @@ class RolloutRecorder:
                 demo_grp.attrs["num_samples"] = T
                 total_samples += T
 
-            data_grp.attrs["num_demos"] = existing_demos + len(self.episodes)
+            data_grp.attrs["num_demos"] = existing_demos + len(episodes)
             data_grp.attrs["total"] = total_samples
 
         logger.info(
-            f"Appended {len(self.episodes)} rollout episodes to {path} "
-            f"(total demos: {existing_demos + len(self.episodes)})"
+            f"Appended {len(episodes)} rollout episodes to {path} "
+            f"(total demos: {existing_demos + len(episodes)}"
+            f"{f', cap: {max_demos}' if max_demos else ''})"
         )
 
     def clear(self):

@@ -41,6 +41,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_reg_loss
     elif loss_type == "flow_beta":
         return flow_beta_loss
+    elif loss_type == "flow_beta_ll":
+        return flow_beta_ll_loss
     elif loss_type == "regression":
         return regression_loss
     elif loss_type == "straight_flow":
@@ -61,6 +63,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return esd_loss
     elif loss_type == "mf":
         return mf_loss
+    elif loss_type == "goal_predictor":
+        return flow_loss  # actual loss computed inline in GoalPredictorAgent
     else:
         raise NotImplementedError(f"Loss type {loss_type} not implemented.")
 
@@ -114,6 +118,81 @@ def flow_loss(
     loss = get_norm(b_t - act_t_dot, config.norm_type)
     loss = config.loss_scale * torch.mean(loss)
     return loss, {}
+
+
+def flow_beta_ll_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs,
+    delta_t: torch.Tensor,
+) -> tuple[torch.Tensor, dict]:
+    """Flow-Beta loss plus local-linearity regularizer for IDM training.
+
+    When `config.local_linearity_coef > 0` the training script builds obs per
+    image key as `[To_0, ..., To_{n-1}, o_k, goal]` (shape `(B, To+2, ...)`).
+    We run one forward through the raw inner encoder on all `To+2` frames,
+    then:
+
+    - For action decoding, we drop the intermediate slot and feed the
+      `(B, To+1, D)` stack `[To_0, ..., To_{n-1}, goal]` to the flow map —
+      identical conditioning to standard `flow_beta_loss`.
+    - For the regularizer, we reuse the last three embedding slots
+      `[To_{n-1}, o_k, goal]` and push the two segment velocities
+      `v1 = enc(o_k) - enc(To_{n-1})`, `v2 = enc(goal) - enc(o_k)` toward
+      alignment by minimizing `1 - cos(v1, v2)`.
+
+    Goal dropout from a wrapping `GoalDropoutEncoder` is applied manually
+    here (the main forward bypasses that wrap since it can't accept
+    `To + 2` frames). When `coef == 0` we fall back to `flow_beta_loss`.
+    """
+    coef = config.local_linearity_coef
+    if coef <= 0:
+        return flow_beta_loss(
+            config, flow_map, encoder, interp, act, obs, delta_t
+        )
+
+    # sample t from Beta(1.5, 1.0) and noise
+    t = torch.distributions.Beta(1.5, 1.0).sample(delta_t.shape).to(delta_t.device)
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    # raw encoder forward on all To+2 frames (bypass GoalDropoutEncoder wrap)
+    raw_encoder = encoder.encoder if hasattr(encoder, "encoder") else encoder
+    full_emb = raw_encoder(obs, None)  # (B, To+2, D)
+
+    # action-decoding branch: drop the intermediate slot
+    obs_emb = torch.cat([full_emb[:, :-2], full_emb[:, -1:]], dim=1)  # (B, To+1, D)
+
+    # delegate goal dropout to GoalDropoutEncoder (single source of truth);
+    # no-op when encoder isn't a GoalDropoutEncoder or dropout is disabled.
+    if hasattr(encoder, "apply_goal_dropout"):
+        obs_emb = encoder.apply_goal_dropout(obs_emb)
+
+    # flow prediction
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+    flow_l = config.loss_scale * torch.mean(
+        get_norm(b_t - act_t_dot, config.norm_type)
+    )
+
+    # local-linearity branch: last three slots are [To_{n-1}, o_k, goal]
+    to1_emb = full_emb[:, -3]
+    inter_emb = full_emb[:, -2]
+    goal_emb = full_emb[:, -1]
+    v1 = inter_emb - to1_emb
+    v2 = goal_emb - inter_emb
+    ll_l = coef * (1.0 - F.cosine_similarity(v1, v2, dim=-1)).mean()
+
+    total = flow_l + ll_l
+    info = {
+        "flow_loss": flow_l.detach(),
+        "local_linearity_loss": ll_l.detach(),
+    }
+    return total, info
 
 
 def flow_beta_loss(

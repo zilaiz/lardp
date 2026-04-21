@@ -219,4 +219,5 @@ slurm/
 *lam_infer_output/
 tsne_output/
 .claude/
+viz/
 MUJOCO_LOG.TXT
