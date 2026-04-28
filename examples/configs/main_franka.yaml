@@ -1,0 +1,14 @@
+defaults:
+  - log: default
+  - optimization: default
+  - network: lbmdit
+  - lam: default
+  - task: franka_coffee_pod_cog_image
+  - launcher: basic
+  - _self_
+
+mode: "train"
+
+log:
+  exp_name: "${task.env_name}_${task.env_type}_${task.obs_type}_${optimization.loss_type}_${network.network_type}_${network.emb_dim}_seed${optimization.seed}${suffix:${log.exp_note}}"
+  log_dir: "logs/${log.exp_name}/${now:%Y_%m_%d_%H_%M_%S}"

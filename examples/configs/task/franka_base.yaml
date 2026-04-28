@@ -1,0 +1,53 @@
+# @package task
+# Shared base configuration for all Franka real-robot tasks.
+# Data is stored in HDF5 with actions pre-expanded to 10-dim
+# [pos(3), rot6d(6), gripper(1)] — NO axis-angle -> 6D expansion happens
+# in the dataset, so we leave `abs_action=false` (the flag only gates that
+# expansion in robomimic's path; it is a no-op here).
+defaults:
+  - _self_
+
+# Action semantics
+abs_action: false                # keep false: actions are pre-expanded to 10-dim
+action_type: "absolute"          # informational — real-robot driver consumes absolute target
+act_dim: 10                      # [pos(3), rot6d(6), gripper(1)]
+
+# Observation / horizon schedule — matches robomimic defaults
+obs_type: "image"
+obs_steps: 2
+act_steps: 8
+horizon: 10
+obs_dim: -1                      # unused by image encoder; placeholder so struct mode is happy
+
+# Dataset
+dataset_path: null
+dataset_paths: null              # not used by Franka pipeline yet; kept for TaskConfig compatibility
+val_dataset_percentage: 0.1
+
+# Image encoder defaults (reused by MultiImageObsEncoder)
+rgb_model: resnet18
+resize_shape: null
+crop_shape: [128, 128]           # mild random crop: 136x136 inputs -> 128x128 window
+                                 # (~6% trim per side = ~12% area). Provides translation-
+                                 # jitter regularization without clipping out task objects
+                                 # near the frame edges on the overhead cams.
+random_crop: true
+use_group_norm: true
+use_seq: true
+
+# Env placeholder fields — required by TaskConfig dataclass but unused in train_franka.py
+env_type: "real"
+max_episode_steps: 500
+num_envs: 0
+save_video: false
+render_obs_key: "front_cam_image"
+
+# REPA / LAM / DINO — unused for Franka baseline
+latent_type: null
+use_precomputed: false
+camera_keys: null
+lam_frame_skips: [1]
+lam_latent_type: null
+dino_model: null
+dino_types: null
+dino_align_target: null

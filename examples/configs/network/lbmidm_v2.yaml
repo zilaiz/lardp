@@ -1,0 +1,20 @@
+# @package network
+defaults:
+  - _base
+  - _self_
+
+network_type: "lbmidm_v2"
+emb_dim: 256                # d_model of action trunk
+num_layers: 8               # depth (transformer blocks)
+dropout: 0.0
+timestep_emb_dim: 128       # decoupled from d_model (now actually used)
+encoder_out_dim: 256        # encoder output dim (= obs_dim fed to network)
+
+# DiT specific
+n_heads: 8
+timestep_emb_type: "positional"
+
+# LBMDiTIDMv2 hidden dims (null -> 2 * obs_dim)
+obs_summarizer_hidden: null
+action_proj_hidden: null
+fdm_hidden: null

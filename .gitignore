@@ -220,4 +220,5 @@ slurm/
 tsne_output/
 .claude/
 viz/
+examples/analysis/
 MUJOCO_LOG.TXT

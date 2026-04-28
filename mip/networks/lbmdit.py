@@ -326,6 +326,203 @@ class LBMDiTIDM(LBMDiT):
     pass
 
 
+class LBMDiTIDMv2(BaseNetwork):
+    """IDM with obs summarizer, decoupled timestep_emb_dim, and an FDM auxiliary head.
+
+    Differences from LBMDiTIDM:
+    - Single time embedding (no dual map_s / map_t).
+    - timestep_emb_dim is independent of d_model.
+    - To observation frames are first summarized by an MLP into a single
+      vector of size obs_dim (= encoder output dim) before being concatenated
+      with the goal embedding for AdaLN conditioning.
+    - Adds a forward-dynamics (FDM) head: given (obs summary, projected clean
+      action), predict the goal embedding. Used for encoder shaping at training.
+
+    Conditioning vector for AdaLN:
+        cond = concat(time_emb, obs_summary, goal_emb)
+        cond_dim = timestep_emb_dim + 2 * obs_dim
+    """
+
+    def __init__(
+        self,
+        act_dim: int,
+        Ta: int,
+        obs_dim: int,
+        To: int,
+        To_obs: int,
+        d_model: int = 256,
+        timestep_emb_dim: int = 128,
+        n_heads: int = 8,
+        depth: int = 8,
+        dropout: float = 0.0,
+        timestep_emb_type: str = "positional",
+        timestep_emb_params: dict | None = None,
+        disable_time_embedding: bool = False,
+        obs_summarizer_hidden: int | None = None,
+        action_proj_hidden: int | None = None,
+        fdm_hidden: int | None = None,
+    ):
+        super().__init__(act_dim, Ta, obs_dim, To, d_model, depth)
+
+        assert To == To_obs + 1, (
+            f"To ({To}) must equal To_obs ({To_obs}) + 1 (single goal frame)"
+        )
+
+        self.d_model = d_model
+        self.timestep_emb_dim = timestep_emb_dim
+        self.disable_time_embedding = disable_time_embedding
+        self.To_obs = To_obs
+
+        # --- Time embedding (single t, projected to timestep_emb_dim) ---
+        timestep_emb_params = timestep_emb_params or {}
+        if not disable_time_embedding:
+            self.time_embedder = SUPPORTED_TIMESTEP_EMBEDDING[timestep_emb_type](
+                timestep_emb_dim, **timestep_emb_params,
+            )
+        else:
+            self.time_embedder = None
+
+        self.time_mlp = nn.Sequential(
+            nn.Linear(timestep_emb_dim, 2 * timestep_emb_dim),
+            nn.GELU(),
+            nn.Linear(2 * timestep_emb_dim, timestep_emb_dim),
+            nn.GELU(),
+        )
+
+        # --- Obs summarizer: (To_obs, obs_dim) -> (obs_dim) ---
+        os_hidden = obs_summarizer_hidden or (2 * obs_dim)
+        self.obs_summarizer = nn.Sequential(
+            nn.Linear(To_obs * obs_dim, os_hidden),
+            nn.GELU(),
+            nn.Linear(os_hidden, obs_dim),
+        )
+
+        # --- AdaLN conditioning dim ---
+        cond_dim = timestep_emb_dim + 2 * obs_dim  # time + obs_summary + goal
+
+        # --- Action trunk (DiT-style) ---
+        self.input_proj = nn.Linear(act_dim, d_model)
+        self.pos_embedding = nn.Parameter(
+            torch.empty(1, Ta, d_model).normal_(std=0.02),
+        )
+        self.blocks = nn.ModuleList([
+            _TransformerBlock(
+                hidden_size=d_model,
+                num_heads=n_heads,
+                cond_dim=cond_dim,
+                dropout=dropout,
+            )
+            for _ in range(depth)
+        ])
+        self.output_proj = nn.Linear(d_model, act_dim)
+
+        # --- FDM head: (obs_summary, action_proj(action_chunk)) -> goal_pred ---
+        ap_hidden = action_proj_hidden or (2 * obs_dim)
+        self.action_proj = nn.Sequential(
+            nn.Linear(Ta * act_dim, ap_hidden),
+            nn.GELU(),
+            nn.Linear(ap_hidden, obs_dim),
+        )
+        fh = fdm_hidden or (2 * obs_dim)
+        self.fdm_head = nn.Sequential(
+            nn.Linear(2 * obs_dim, fh),
+            nn.GELU(),
+            nn.Linear(fh, obs_dim),
+        )
+
+        self._initialize_weights()
+
+        print(
+            f"number of LBMDiTIDMv2 parameters: "
+            f"{sum(p.numel() for p in self.parameters()):e}"
+        )
+
+    def _initialize_weights(self):
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+    def _summarize(self, condition: Tensor) -> tuple[Tensor, Tensor]:
+        """Split condition into (obs_summary, goal_emb).
+
+        Args:
+            condition: (B, To, obs_dim) where the first To_obs frames are obs
+                and the last frame is the goal.
+        Returns:
+            obs_summary: (B, obs_dim) — pooled obs context.
+            goal_emb:    (B, obs_dim) — goal frame embedding.
+        """
+        obs_part = condition[:, : self.To_obs]                  # (B, To_obs, obs_dim)
+        obs_summary = self.obs_summarizer(obs_part.flatten(1))  # (B, obs_dim)
+        goal_emb = condition[:, -1]                              # (B, obs_dim)
+        return obs_summary, goal_emb
+
+    def forward(
+        self,
+        x: Tensor,
+        s: Tensor,
+        t: Tensor,
+        condition: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Standard IDM forward.
+
+        Args:
+            x:         (B, Ta, act_dim) noisy action sequence.
+            s:         (B,) — unused (kept for FlowMap compatibility).
+            t:         (B,) flow-matching time.
+            condition: (B, To, obs_dim) encoded obs+goal stack, or None.
+        Returns:
+            y:      (B, Ta, act_dim) predicted velocity.
+            scalar: None.
+        """
+        B = x.shape[0]
+        device = x.device
+
+        # Time
+        if self.time_embedder is not None:
+            t_raw = self.time_embedder(t)
+        else:
+            t_raw = torch.zeros(B, self.timestep_emb_dim, device=device)
+        t_emb = self.time_mlp(t_raw)  # (B, timestep_emb_dim)
+
+        # Obs + goal
+        if condition is None:
+            condition = torch.zeros(
+                B, self.To_obs + 1, self.obs_dim, device=device,
+            )
+        obs_summary, goal_emb = self._summarize(condition)
+
+        cond_vec = torch.cat([t_emb, obs_summary, goal_emb], dim=-1)
+
+        # Action trunk
+        h = self.input_proj(x) + self.pos_embedding[:, : x.shape[1], :]
+        for block in self.blocks:
+            h = block(h, cond_vec)
+        y = self.output_proj(h)
+        return y, None
+
+    def forward_predict(
+        self,
+        condition: Tensor,
+        clean_action: Tensor,
+    ) -> Tensor:
+        """FDM head: predict the goal embedding from obs + clean action chunk.
+
+        The goal slot of `condition` is *not* used; only the first To_obs
+        frames are read via the obs summarizer.
+
+        Args:
+            condition:    (B, To, obs_dim) encoded stack — only first To_obs read.
+            clean_action: (B, Ta, act_dim) clean expert actions (normalized).
+        Returns:
+            predicted_goal: (B, obs_dim).
+        """
+        obs_part = condition[:, : self.To_obs]
+        obs_summary = self.obs_summarizer(obs_part.flatten(1))      # (B, obs_dim)
+        action_emb = self.action_proj(clean_action.flatten(1))      # (B, obs_dim)
+        return self.fdm_head(torch.cat([obs_summary, action_emb], dim=-1))
+
+
 def test_lbmdit():
     """Test LBMDiT network."""
     print("=" * 50)

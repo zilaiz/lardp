@@ -56,3 +56,6 @@ goal_flow_num_steps: 5
 goal_flow_loss_scale: 1.0
 action_reg_weight: 1.0
 goal_stats_path: null
+
+# IDM + FDM joint training (lbmidm_v2 / IDMFDMAgent)
+fdm_loss_scale: 0.0  # weight for forward-dynamics auxiliary (0 = disabled)

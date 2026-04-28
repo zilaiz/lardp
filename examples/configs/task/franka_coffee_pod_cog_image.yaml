@@ -1,0 +1,40 @@
+# @package task
+defaults:
+  - franka_base
+  - _self_
+
+env_name: "franka_coffee_pod"
+dataset_path: "data/franka_coffee_pod_cog/image.hdf5"
+
+# Default camera selection: front (scene) + wrist (eye-in-hand).
+# All four cams are written to the HDF5 (left/right/front/wrist); to swap
+# the selection, copy this file and change the image keys below.
+shape_meta:
+  action:
+    shape:
+      - 10
+  obs:
+    front_cam_image:
+      shape:
+        - 3
+        - 136
+        - 136
+      type: rgb
+    wrist_cam_image:
+      shape:
+        - 3
+        - 136
+        - 136
+      type: rgb
+    robot0_eef_pos:
+      shape:
+        - 3
+      type: low_dim
+    robot0_eef_quat:
+      shape:
+        - 4
+      type: low_dim
+    robot0_gripper_qpos:
+      shape:
+        - 1
+      type: low_dim

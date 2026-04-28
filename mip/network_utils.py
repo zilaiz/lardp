@@ -24,7 +24,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.chitfm import ChiTransformer
     from mip.networks.chiunet import ChiUNet
     from mip.networks.jannerunet import JannerUNet
-    from mip.networks.lbmdit import LBMDiT, LBMDiTIDM
+    from mip.networks.lbmdit import LBMDiT, LBMDiTIDM, LBMDiTIDMv2
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
@@ -54,6 +54,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "sudeepdit_repa_agg": SudeepDiTREPAAgg,
         "lbmdit": LBMDiT,
         "lbmidm": LBMDiTIDM,
+        "lbmidm_v2": LBMDiTIDMv2,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -163,6 +164,25 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             depth=network_config.num_layers,
             dropout=network_config.dropout,
             timestep_emb_type=network_config.timestep_emb_type,
+        )
+
+    elif network_config.network_type == "lbmidm_v2":
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            obs_dim=enc_out_dim,
+            To=task_config.obs_steps + 1,  # obs frames + 1 goal frame
+            To_obs=task_config.obs_steps,
+            d_model=network_config.emb_dim,
+            timestep_emb_dim=network_config.timestep_emb_dim,
+            n_heads=network_config.n_heads,
+            depth=network_config.num_layers,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+            obs_summarizer_hidden=network_config.obs_summarizer_hidden,
+            action_proj_hidden=network_config.action_proj_hidden,
+            fdm_hidden=network_config.fdm_hidden,
         )
 
     elif "sudeepdit_repa" in network_config.network_type  or "sudeepdit_reg" in network_config.network_type:

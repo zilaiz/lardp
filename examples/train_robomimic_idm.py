@@ -52,9 +52,10 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
-        num_workers=0,
+        num_workers=4,
         shuffle=True,
-        pin_memory=False,
+        pin_memory=True,
+        persistent_workers=True,
         drop_last=True,
     )
     loop_loader = loop_dataloader(dataloader)

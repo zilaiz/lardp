@@ -73,6 +73,8 @@ class OptimizationConfig:
     goal_flow_loss_scale: float = 1.0  # weight for state flow loss
     action_reg_weight: float = 1.0  # weight for action regularization loss
     goal_stats_path: str | None = None  # path to precomputed goal normalization stats (.pt)
+    # IDM + FDM joint training (lbmidm_v2 / IDMFDMAgent)
+    fdm_loss_scale: float = 0.0  # weight for forward-dynamics auxiliary loss (0 = disabled)
     # Dropout annealing for condistill extra_cond_encoder
     extra_cond_dropout_warmup_steps: int = 5000  # number of steps to keep dropout at 0
     extra_cond_dropout_rampup_steps: int = 10000  # number of steps to linearly ramp dropout from 0 to max
@@ -136,6 +138,10 @@ class NetworkConfig:
     goal_ddt_n_heads_enc: int = 8
     goal_ddt_n_heads_dec: int = 8
     goal_ddt_dropout: float = 0.0
+    # LBMDiTIDMv2 (IDM with obs summarizer + FDM head)
+    obs_summarizer_hidden: int | None = None  # None -> 2 * obs_dim
+    action_proj_hidden: int | None = None  # None -> 2 * obs_dim
+    fdm_hidden: int | None = None  # None -> 2 * obs_dim
 
 
 @dataclass
