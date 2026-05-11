@@ -41,6 +41,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_reg_loss
     elif loss_type == "flow_beta":
         return flow_beta_loss
+    elif loss_type == "flow_ns":
+        return flow_ns_loss
     elif loss_type == "flow_beta_ll":
         return flow_beta_ll_loss
     elif loss_type == "regression":
@@ -154,8 +156,9 @@ def flow_beta_ll_loss(
             config, flow_map, encoder, interp, act, obs, delta_t
         )
 
-    # sample t from Beta(1.5, 1.0) and noise
-    t = torch.distributions.Beta(1.5, 1.0).sample(delta_t.shape).to(delta_t.device)
+    # t = 0.999 * (1 - u), u ~ Beta(1.5, 1.0); biases toward t=0 (noise).
+    u = torch.distributions.Beta(1.5, 1.0).sample(delta_t.shape).to(delta_t.device)
+    t = 0.999 * (1.0 - u)
     act_0 = torch.empty_like(act).normal_(0, 1)
     act_1 = act
 
@@ -195,6 +198,82 @@ def flow_beta_ll_loss(
     return total, info
 
 
+def _ns_apply_t_shift(t: torch.Tensor, alpha: float) -> torch.Tensor:
+    """SD3-style time shift t' = a*t / (1 + (a-1)*t). Identity at a=1."""
+    if alpha == 1.0:
+        return t
+    return alpha * t / (1.0 + (alpha - 1.0) * t)
+
+
+def _ns_sample_base_t(
+    delta_t: torch.Tensor,
+    lo: float,
+    hi: float,
+    t_dist: str,
+    mu: float,
+    sigma: float,
+) -> torch.Tensor:
+    """Sample base flow time before per-stream shift is applied.
+
+    Uses ``empty + uniform_/normal_`` so the call is CUDA-graph compatible
+    (matches the pattern in ``flow_loss`` / ``flow_beta_loss``).
+    """
+    if t_dist == "uniform":
+        return torch.empty_like(delta_t).uniform_(lo, hi)
+    if t_dist == "logit_normal":
+        z = torch.empty_like(delta_t).normal_(mu, sigma)
+        return torch.sigmoid(z).clamp(lo, hi)
+    raise ValueError(
+        f"policy_t_dist must be 'uniform' or 'logit_normal'; got {t_dist!r}"
+    )
+
+
+def flow_ns_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """Flow matching loss with SD3-style noise-shift on the flow time.
+
+    Identical to ``flow_loss`` except ``t`` is drawn from a configurable
+    base distribution (``policy_t_dist``: "uniform" | "logit_normal"),
+    clamped to ``[policy_t_eps, 1 - policy_t_eps]``, then warped through
+    the SD3 shift ``t' = a*t / (1 + (a-1)*t)`` with ``a = policy_t_shift``.
+    Identity defaults (``shift=1.0``, ``dist=uniform``, ``eps=0.0``) recover
+    plain ``flow_loss`` exactly.
+
+    Pairs with ``ode_ns_sampler`` so inference walks the same shift-warped
+    grid the trunk was trained on.
+    """
+    eps = float(config.policy_t_eps)
+    lo, hi = eps, 1.0 - eps
+    t_base = _ns_sample_base_t(
+        delta_t,
+        lo, hi,
+        config.policy_t_dist,
+        float(config.policy_t_dist_mu),
+        float(config.policy_t_dist_sigma),
+    )
+    t = _ns_apply_t_shift(t_base, float(config.policy_t_shift))
+
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    obs_emb = encoder(obs, None)
+
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+
+    loss = get_norm(b_t - act_t_dot, config.norm_type)
+    loss = config.loss_scale * torch.mean(loss)
+    return loss, {"t_flow_mean": t.mean().detach()}
+
+
 def flow_beta_loss(
     config: OptimizationConfig,
     flow_map: FlowMap,
@@ -206,9 +285,10 @@ def flow_beta_loss(
 ) -> float:
     """Flow model loss with Beta distribution timestep sampling.
 
-    Samples t ~ Beta(1.5, 1.0) instead of Uniform(0, 1), biasing training
-    toward lower timesteps (higher noise) for improved sample quality.
-    Inspired by PI-0 (Physical Intelligence).
+    Samples t = 0.999 * (1 - u),  u ~ Beta(1.5, 1.0). Biases training toward
+    small t = noise end (mip's interpolant is (1-t)*noise + t*data, so t=0
+    is pure noise). The 0.999 cap keeps a sliver of noise mixed in at the
+    data end for numerical stability. Matches PI-0 / multitask_dit_policy.
 
     Args:
         config: optimization config
@@ -222,8 +302,10 @@ def flow_beta_loss(
     Returns:
         float: the loss
     """
-    # sample t from Beta(1.5, 1.0) instead of Uniform(0, 1)
-    t = torch.distributions.Beta(1.5, 1.0).sample(delta_t.shape).to(delta_t.device)
+    # u ~ Beta(1.5, 1.0) is biased toward 1; 0.999*(1-u) puts mass near t=0
+    # (noise end under mip's (1-t)*noise + t*data interpolant).
+    u = torch.distributions.Beta(1.5, 1.0).sample(delta_t.shape).to(delta_t.device)
+    t = 0.999 * (1.0 - u)
     act_0 = torch.empty_like(act).normal_(0, 1)
     act_1 = act
 

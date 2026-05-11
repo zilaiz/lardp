@@ -501,6 +501,50 @@ class LBMDiTIDMv2(BaseNetwork):
         y = self.output_proj(h)
         return y, None
 
+    def forward_with_summary(
+        self,
+        x: Tensor,
+        s: Tensor,
+        t: Tensor,
+        obs_summary: Tensor,
+        goal_emb: Tensor,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Action-trunk forward with a precomputed (obs_summary, goal_emb)
+        pair, bypassing ``self.obs_summarizer`` and ``self._summarize``.
+
+        Used by retrieval-based goal predictors that already hold both halves
+        of the AdaLN conditioning in the same space the IDM saw at training,
+        and would otherwise round-trip through the encoder + summarizer
+        unnecessarily.
+
+        Args:
+            x:           (B, Ta, act_dim) noisy action sequence.
+            s:           (B,) — unused (kept for FlowMap compatibility).
+            t:           (B,) flow-matching time.
+            obs_summary: (B, obs_dim) precomputed obs summary.
+            goal_emb:    (B, obs_dim) precomputed goal embedding.
+        Returns:
+            y:      (B, Ta, act_dim) predicted velocity.
+            scalar: None.
+        """
+        del s
+        B = x.shape[0]
+        device = x.device
+
+        if self.time_embedder is not None:
+            t_raw = self.time_embedder(t)
+        else:
+            t_raw = torch.zeros(B, self.timestep_emb_dim, device=device)
+        t_emb = self.time_mlp(t_raw)  # (B, timestep_emb_dim)
+
+        cond_vec = torch.cat([t_emb, obs_summary, goal_emb], dim=-1)
+
+        h = self.input_proj(x) + self.pos_embedding[:, : x.shape[1], :]
+        for block in self.blocks:
+            h = block(h, cond_vec)
+        y = self.output_proj(h)
+        return y, None
+
     def forward_predict(
         self,
         condition: Tensor,

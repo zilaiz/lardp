@@ -32,7 +32,13 @@ from mip.losses import get_norm
 
 
 class IDMFDMAgent(TrainingAgent):
-    """IDM training with auxiliary FDM head for encoder shaping."""
+    """IDM training with auxiliary FDM head for encoder shaping.
+
+    If the encoder is wrapped in ``GoalDropoutEncoder`` (CFG path), goal
+    dropout is applied only to the IDM input — the FDM auxiliary always
+    targets the *real* (pre-dropout) goal embedding so encoder shaping is
+    not contaminated by uncond_emb targets.
+    """
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -43,6 +49,14 @@ class IDMFDMAgent(TrainingAgent):
             )
 
     def _create_update_impl(self):
+        # Resolve once (encoder identity is fixed for the agent's lifetime).
+        encoder_is_wrapped = (
+            hasattr(self.encoder, "apply_goal_dropout")
+            and hasattr(self.encoder, "encoder")
+            and hasattr(self.encoder, "uncond_emb")
+        )
+        ortho_reg_enabled = self.config.optimization.ortho_reg_weight > 0
+
         def update_impl(data: TensorDict):
             act = data["act"]
             obs = data["obs"]
@@ -50,7 +64,21 @@ class IDMFDMAgent(TrainingAgent):
             cfg = self.config.optimization
 
             # --- Encode obs+goal stack once (B, To+1, emb_dim) ---
-            encoded = self.encoder(obs, None)
+            if encoder_is_wrapped:
+                # Run inner encoder to get raw (pre-dropout) embeddings, then
+                # apply dropout only to the IDM-input copy. FDM target and
+                # ortho regularizer always use raw (real goal) embeddings.
+                raw_encoded = self.encoder.encoder(obs, None)
+                if raw_encoded.shape[1] == self.encoder.obs_steps:
+                    uncond = self.encoder.uncond_emb.expand(
+                        raw_encoded.shape[0], 1, -1,
+                    )
+                    raw_encoded = torch.cat([raw_encoded, uncond], dim=1)
+                encoded = self.encoder.apply_goal_dropout(raw_encoded)
+            else:
+                raw_encoded = self.encoder(obs, None)
+                encoded = raw_encoded
+            target_z_goal = raw_encoded[:, -1].detach()
 
             # --- IDM (action flow matching) loss ---
             t = torch.empty_like(delta_t).uniform_(0, 1)
@@ -63,13 +91,36 @@ class IDMFDMAgent(TrainingAgent):
             )
 
             # --- FDM (forward-dynamics) auxiliary loss ---
-            # Target: un-normalized goal embedding, stop-grad to prevent collapse.
-            target_z_goal = encoded[:, -1].detach()  # (B, emb_dim)
+            # Target: real (pre-dropout) goal embedding, stop-grad.
             predicted_goal = self.flow_map.net.forward_predict(encoded, act)
             fdm_loss_unscaled = F.mse_loss(predicted_goal, target_z_goal)
             fdm_loss = cfg.fdm_loss_scale * fdm_loss_unscaled
 
-            loss = idm_loss + fdm_loss
+            # --- Ortho regularizer: hinge on cos_sim(last_obs, goal) ---
+            # Penalizes per-sample cos_sim above `ortho_reg_threshold`; below
+            # the threshold the gradient is zero, giving FDM full control of
+            # the encoder. This stable equilibrium avoids the runaway
+            # orthogonality / FDM divergence observed with no-threshold form.
+            # Both inputs are raw encoder outputs (no MLP in between).
+            # `ortho_loss_unscaled` is the raw mean cos_sim (the diagnostic
+            # metric, comparable across runs); `ortho_loss` is the gradient-
+            # bearing hinge term scaled by `ortho_reg_weight`.
+            if ortho_reg_enabled:
+                last_obs_raw = raw_encoded[:, -2]
+                goal_raw = raw_encoded[:, -1]
+                cos_sim_per_sample = F.cosine_similarity(
+                    last_obs_raw, goal_raw, dim=-1,
+                )
+                ortho_loss_unscaled = cos_sim_per_sample.mean()
+                hinge = F.relu(
+                    cos_sim_per_sample - cfg.ortho_reg_threshold
+                ).mean()
+                ortho_loss = cfg.ortho_reg_weight * hinge
+            else:
+                ortho_loss_unscaled = torch.zeros((), device=encoded.device)
+                ortho_loss = torch.zeros((), device=encoded.device)
+
+            loss = idm_loss + fdm_loss + ortho_loss
             loss.backward()
 
             # --- Grad clip + step + zero_grad ---
@@ -93,6 +144,8 @@ class IDMFDMAgent(TrainingAgent):
                     "idm_loss": idm_loss.detach(),
                     "fdm_loss": fdm_loss.detach(),
                     "fdm_loss_unscaled": fdm_loss_unscaled.detach(),
+                    "ortho_loss": ortho_loss.detach(),
+                    "ortho_loss_unscaled": ortho_loss_unscaled.detach(),
                     "grad_norm": grad_norm.detach(),
                 },
                 batch_size=(),
@@ -136,5 +189,7 @@ class IDMFDMAgent(TrainingAgent):
             "idm_loss": result["idm_loss"],
             "fdm_loss": result["fdm_loss"],
             "fdm_loss_unscaled": result["fdm_loss_unscaled"],
+            "ortho_loss": result["ortho_loss"],
+            "ortho_loss_unscaled": result["ortho_loss_unscaled"],
             "grad_norm": result["grad_norm"],
         }

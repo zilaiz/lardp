@@ -25,6 +25,9 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.chiunet import ChiUNet
     from mip.networks.jannerunet import JannerUNet
     from mip.networks.lbmdit import LBMDiT, LBMDiTIDM, LBMDiTIDMv2
+    from mip.networks.lbmdit_ddt import LBMDiTDDT
+    from mip.networks.lbmdit_joint import LBMDiTJoint
+    from mip.networks.lbmdit_joint_ddt import LBMDiTJointDDT
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
@@ -53,8 +56,11 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "sudeepdit_reg": SudeepDiTREG,
         "sudeepdit_repa_agg": SudeepDiTREPAAgg,
         "lbmdit": LBMDiT,
+        "lbmdit_ddt": LBMDiTDDT,
         "lbmidm": LBMDiTIDM,
         "lbmidm_v2": LBMDiTIDMv2,
+        "lbmdit_joint": LBMDiTJoint,
+        "lbmdit_joint_ddt": LBMDiTJointDDT,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -152,6 +158,28 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             timestep_emb_type=network_config.timestep_emb_type,
         )
 
+    elif network_config.network_type == "lbmdit_ddt":
+        # Action-only DDT trunk (encoder/decoder width split, global cond,
+        # single t). Paired with ``flow_ns`` for noise-shift A/Bs.
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        d_model_enc = network_config.policy_ddt_d_model_enc or network_config.emb_dim
+        d_model_dec = network_config.policy_ddt_d_model_dec or 2 * d_model_enc
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            obs_dim=enc_out_dim,
+            To=task_config.obs_steps,
+            d_model_enc=d_model_enc,
+            d_model_dec=d_model_dec,
+            n_heads_enc=network_config.policy_ddt_n_heads_enc,
+            n_heads_dec=network_config.policy_ddt_n_heads_dec,
+            enc_depth=network_config.policy_ddt_enc_depth,
+            dec_depth=network_config.policy_ddt_dec_depth,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+            timestep_emb_dim=network_config.policy_ddt_timestep_emb_dim,
+        )
+
     elif network_config.network_type == "lbmidm":
         lbmidm_params = dict(common_params)
         enc_out_dim = _get_encoder_out_dim(network_config)
@@ -183,6 +211,43 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             obs_summarizer_hidden=network_config.obs_summarizer_hidden,
             action_proj_hidden=network_config.action_proj_hidden,
             fdm_hidden=network_config.fdm_hidden,
+        )
+
+    elif network_config.network_type == "lbmdit_joint":
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            obs_dim=enc_out_dim,
+            To=task_config.obs_steps,
+            d_model=network_config.emb_dim,
+            n_heads=network_config.n_heads,
+            depth=network_config.num_layers,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+            timestep_emb_dim=network_config.timestep_emb_dim,
+            opt_emb_dim=network_config.joint_opt_emb_dim,
+        )
+
+    elif network_config.network_type == "lbmdit_joint_ddt":
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        enc_hidden = network_config.joint_ddt_d_model_enc or network_config.emb_dim
+        dec_hidden = network_config.joint_ddt_d_model_dec or 2 * enc_hidden
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            obs_dim=enc_out_dim,
+            To=task_config.obs_steps,
+            enc_hidden=enc_hidden,
+            enc_depth=network_config.joint_ddt_enc_depth,
+            enc_n_heads=network_config.joint_ddt_n_heads_enc,
+            dec_hidden=dec_hidden,
+            dec_depth=network_config.joint_ddt_dec_depth,
+            dec_n_heads=network_config.joint_ddt_n_heads_dec,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+            timestep_emb_dim=network_config.timestep_emb_dim,
+            opt_emb_dim=network_config.joint_opt_emb_dim,
         )
 
     elif "sudeepdit_repa" in network_config.network_type  or "sudeepdit_reg" in network_config.network_type:

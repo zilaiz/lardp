@@ -1,0 +1,22 @@
+# @package network
+# Single-stage joint flow matching DiT over (next_state, action_chunk).
+# Conditioned on (time, encoded current obs, optimality). Runs on top of
+# a frozen IDM-pretrained encoder loaded from optimization.idm_checkpoint_path.
+defaults:
+  - _base
+  - _self_
+
+network_type: "lbmdit_joint"
+emb_dim: 256                # d_model of the joint trunk
+num_layers: 8               # depth (transformer blocks)
+dropout: 0.0
+timestep_emb_dim: 128       # decoupled from d_model
+encoder_out_dim: 256        # encoder output dim (= obs_dim fed to network)
+
+# DiT specific
+n_heads: 8
+timestep_emb_type: "positional"
+
+# Optimality embedding width (null -> obs_dim, keeps AdaLN cond components
+# roughly balanced)
+joint_opt_emb_dim: null

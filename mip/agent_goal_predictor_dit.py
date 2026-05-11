@@ -4,8 +4,9 @@ The frozen IDM (encoder + flow_map) is loaded from a pretrained checkpoint.
 A DiT generates goal embeddings via flow matching in the frozen encoder's
 embedding space. Training uses two losses:
   1. State flow loss: velocity matching in standardized goal embedding space
-  2. Action regularization loss: intermediate DiT representations fed as goal
-     embeddings into the frozen IDM to predict expert actions
+  2. Action flow matching loss: one-step Euler-denoised goal embedding
+     (x_t + (1 - t_flow) * v_pred) is denormalized and fed to the frozen IDM
+     as the goal token to compute an action flow matching loss.
 
 Goal embeddings are standardized using precomputed per-element z-score stats
 (following RAE). At inference, generated goals are denormalized back to raw
@@ -38,7 +39,8 @@ class GoalPredictorDiTEncoderWrapper(BaseEncoder):
 
     At inference, this wrapper:
     1. Encodes obs with frozen encoder -> z_t
-    2. Runs goal DiT ODE to generate goal embedding in normalized space
+    2. Runs goal DiT ODE conditioned on z_t to generate goal embedding
+       in normalized space
     3. Denormalizes goal embedding back to raw encoder space
     4. Concatenates [z_t, g_hat] for the IDM
     """
@@ -51,6 +53,7 @@ class GoalPredictorDiTEncoderWrapper(BaseEncoder):
         goal_mean: torch.Tensor | None,
         goal_var: torch.Tensor | None,
         norm_eps: float = 1e-5,
+        sample_mode: str = "stochastic",
     ):
         super().__init__()
         self.encoder = encoder
@@ -59,6 +62,7 @@ class GoalPredictorDiTEncoderWrapper(BaseEncoder):
         self.register_buffer("goal_mean", goal_mean)
         self.register_buffer("goal_var", goal_var)
         self.norm_eps = norm_eps
+        self.sample_mode = sample_mode
 
     def _denormalize(self, z_norm: torch.Tensor) -> torch.Tensor:
         if self.goal_mean is None:
@@ -67,11 +71,15 @@ class GoalPredictorDiTEncoderWrapper(BaseEncoder):
 
     def forward(self, obs, mask=None):
         z_t = self.encoder(obs, mask)  # (B, To, emb_dim)
-        B, To, emb_dim = z_t.shape
+        B, _, emb_dim = z_t.shape
         device = z_t.device
 
-        # ODE integration for goal generation
-        g_s = torch.randn(B, 1, emb_dim, device=device)
+        # ODE integration for goal generation. Source matches sample_mode:
+        # "stochastic" -> Gaussian noise, otherwise -> zeros (deterministic).
+        if self.sample_mode == "stochastic":
+            g_s = torch.randn(B, 1, emb_dim, device=device)
+        else:
+            g_s = torch.zeros(B, 1, emb_dim, device=device)
         t_schedule = np.linspace(0, 1, self.goal_num_steps + 1)
 
         for i in range(self.goal_num_steps):
@@ -127,9 +135,15 @@ class GoalPredictorDiTAgent:
         loguru.logger.info("Pretrained IDM loaded successfully")
 
         # --- Freeze IDM ---
+        # Note: requires_grad_(False) freezes the WEIGHTS. The .train()/.eval()
+        # mode flag is independent and controls augmentation behavior inside
+        # MultiImageObsEncoder's CropRandomizer (random crop in train mode,
+        # center crop in eval mode). We keep the encoder in train mode so that
+        # random crops continue to fire during GP training — matching how the
+        # IDM was trained — and only switch to eval mode for inference (see the
+        # eval() method below). flow_map has no augmentors, so eval() is fine.
         self.encoder.requires_grad_(False)
         self.flow_map.requires_grad_(False)
-        self.encoder.eval()
         self.flow_map.eval()
 
         # --- Get inner encoder (bypass GoalDropoutEncoder if present) ---
@@ -141,6 +155,16 @@ class GoalPredictorDiTAgent:
         else:
             self._inner_encoder = self.encoder
             self._uncond_emb = None
+
+        # If loaded a v2 IDM, the GP must feed it To_obs obs frames so the
+        # IDM's internal obs_summarizer doesn't shape-mismatch.
+        idm_net = self.flow_map.net
+        if hasattr(idm_net, "To_obs") and config.task.obs_steps != idm_net.To_obs:
+            raise ValueError(
+                f"task.obs_steps ({config.task.obs_steps}) must match the IDM's "
+                f"To_obs ({idm_net.To_obs}); the v2 IDM's obs_summarizer expects "
+                f"exactly To_obs frames."
+            )
 
         # --- Load precomputed goal normalization stats ---
         self._norm_eps = 1e-5
@@ -162,6 +186,11 @@ class GoalPredictorDiTAgent:
         # --- Create Goal Predictor DiT ---
         self._goal_loss_scale = config.optimization.goal_flow_loss_scale / enc_out_dim
         self._action_reg_scale = config.optimization.action_reg_weight / config.task.act_dim
+        # Number of Euler steps used when refining x_t -> g_hat for the action-reg
+        # loss. 1 = the original one-step shortcut x_pred = x_t + (1-t_flow)·v_pred.
+        # K > 1 = K-step Euler from x_t at t_flow up to t=1, with K-1 additional
+        # goal_dit forward passes per training step.
+        self._action_reg_num_steps = config.optimization.action_reg_num_steps
         d_model = config.network.goal_dit_d_model or enc_out_dim
 
         self.goal_dit = GoalPredictorDiT(
@@ -175,6 +204,7 @@ class GoalPredictorDiTAgent:
             dropout=config.network.goal_dit_dropout,
             timestep_emb_type=config.network.timestep_emb_type,
             projector_dim=config.network.goal_dit_projector_dim,
+            timestep_emb_dim=config.network.goal_dit_timestep_emb_dim,
         ).to(device)
         report_parameters(self.goal_dit, model_name="Goal Predictor DiT")
 
@@ -184,6 +214,19 @@ class GoalPredictorDiTAgent:
         self.goal_dit_ema = deepcopy(self.goal_dit).requires_grad_(False)
         self.goal_flow_map_ema = FlowMap(self.goal_dit_ema).to(device)
 
+        # Goal-ODE source mode: defaults to the IDM's sample_mode but can be
+        # set independently (e.g. expert-only goals -> "zero" while IDM
+        # actions trained on expert+play stay "stochastic").
+        self._goal_sample_mode = (
+            config.optimization.goal_sample_mode
+            if config.optimization.goal_sample_mode is not None
+            else config.optimization.sample_mode
+        )
+        loguru.logger.info(
+            f"Goal sample_mode: {self._goal_sample_mode} "
+            f"(IDM action sample_mode: {config.optimization.sample_mode})"
+        )
+
         # --- Encoder wrappers for sampling (main + ema) ---
         self.wrapper_encoder = GoalPredictorDiTEncoderWrapper(
             self._inner_encoder,
@@ -192,6 +235,7 @@ class GoalPredictorDiTAgent:
             self._goal_mean,
             self._goal_var,
             self._norm_eps,
+            sample_mode=self._goal_sample_mode,
         )
         self.wrapper_encoder_ema = GoalPredictorDiTEncoderWrapper(
             self._inner_encoder,
@@ -200,6 +244,7 @@ class GoalPredictorDiTAgent:
             self._goal_mean,
             self._goal_var,
             self._norm_eps,
+            sample_mode=self._goal_sample_mode,
         )
 
         # --- Interpolants ---
@@ -241,7 +286,6 @@ class GoalPredictorDiTAgent:
             delta_t: (B,) time step differences (unused, kept for interface compat)
         """
         config = self.config.optimization
-        align_depth = self.config.network.goal_align_depth
 
         # 1. Encode current obs and goal obs with frozen encoder
         with torch.no_grad():
@@ -260,32 +304,58 @@ class GoalPredictorDiTAgent:
         x_t = self.goal_interpolant.calc_It(t_flow, x0, x1)
         x_t_dot = self.goal_interpolant.calc_It_dot(t_flow, x0, x1)
 
-        # Forward through goal DiT with intermediate extraction
-        v_pred, _, zs_tilde = self.goal_dit(x_t, t_flow, t_flow, z_t, align_depth=align_depth)
+        # Forward through goal DiT (projector unused; skip via align_depth=None)
+        v_pred, _, _ = self.goal_dit(x_t, t_flow, t_flow, z_t, align_depth=None)
 
         state_flow_loss = self._goal_loss_scale * torch.mean(
             get_norm(v_pred - x_t_dot, config.norm_type)
         )
 
-        # 4. Action regularization loss through frozen IDM
-        if self._action_reg_scale > 0:
-            g_inter = zs_tilde[0]  # (B, 1, d_model) projected intermediate state
-            obs_emb = torch.cat([z_t, g_inter], dim=1)  # (B, To+1, emb_dim)
+        # 4. Action flow matching loss through frozen IDM via K-step Euler
+        #    refinement from x_t at t_flow up to t=1.
+        #      K=1: x_pred = x_t + (1 - t_flow) * v_pred  (one-step shortcut,
+        #            reusing the v_pred from state_flow_loss above).
+        #      K>1: K Euler steps with K-1 extra goal_dit forward passes.
+        #    Always computed for monitoring; only contributes to total loss
+        #    (and its gradient is built) when action_reg_scale > 0.
+        x_pred_clean = self._refine_to_one(
+            x_t=x_t,
+            t_flow=t_flow,
+            v_pred_first=v_pred,
+            z_t=z_t,
+            K=self._action_reg_num_steps,
+        )
+        g_hat = self._denormalize(x_pred_clean)  # back to raw encoder space
+        obs_emb = torch.cat([z_t, g_hat], dim=1)  # (B, To+1, emb_dim)
 
-            t_act = torch.empty_like(delta_t).uniform_(0, 1)
-            act_0 = torch.randn_like(act)
-            act_1 = act
+        t_act = torch.empty_like(delta_t).uniform_(0, 1)
+        act_0 = torch.randn_like(act)
+        act_1 = act
 
-            act_t = self.interpolant.calc_It(t_act, act_0, act_1)
-            act_t_dot = self.interpolant.calc_It_dot(t_act, act_0, act_1)
+        act_t = self.interpolant.calc_It(t_act, act_0, act_1)
+        act_t_dot = self.interpolant.calc_It_dot(t_act, act_0, act_1)
+
+        def _compute_action_losses() -> tuple[torch.Tensor, torch.Tensor]:
             b_t = self.flow_map.get_velocity(t_act, act_t, obs_emb)
+            per_elem_loss = get_norm(b_t - act_t_dot, config.norm_type)  # (B, horizon)
+            unweighted = per_elem_loss.mean()
+            if config.action_reg_t_weighting == "linear":
+                weights = t_flow.unsqueeze(-1)  # (B, 1) → broadcast to (B, horizon)
+                weighted = (per_elem_loss * weights).mean() / t_flow.mean().clamp(min=1e-6)
+            elif config.action_reg_t_weighting == "none":
+                weighted = unweighted
+            else:
+                raise ValueError(
+                    f"Unknown action_reg_t_weighting: {config.action_reg_t_weighting}"
+                )
+            return unweighted, weighted
 
-            action_reg_loss_unscaled = torch.mean(
-                get_norm(b_t - act_t_dot, config.norm_type)
-            )
-            action_reg_loss = self._action_reg_scale * action_reg_loss_unscaled
+        if self._action_reg_scale > 0:
+            action_reg_loss_unscaled, weighted_unscaled = _compute_action_losses()
+            action_reg_loss = self._action_reg_scale * weighted_unscaled
         else:
-            action_reg_loss_unscaled = torch.zeros((), device=state_flow_loss.device)
+            with torch.no_grad():
+                action_reg_loss_unscaled, _ = _compute_action_losses()
             action_reg_loss = torch.zeros((), device=state_flow_loss.device)
 
         # 5. Total loss and backward
@@ -314,6 +384,50 @@ class GoalPredictorDiTAgent:
             "action_reg_loss_unscaled": action_reg_loss_unscaled.detach(),
             "grad_norm": grad_norm.detach(),
         }
+
+    def _refine_to_one(
+        self,
+        x_t: torch.Tensor,
+        t_flow: torch.Tensor,
+        v_pred_first: torch.Tensor,
+        z_t: torch.Tensor,
+        K: int,
+    ) -> torch.Tensor:
+        """K-step Euler refinement from (x_t, t_flow) up to t=1, in normalized
+        goal space. Returns the integrated x_pred at t=1.
+
+        Per-sample integration grid: for sample i with t_flow_i, the K Euler
+        steps span (k/K)·(1 - t_flow_i) of the remaining interval each, for
+        k = 0..K-1.
+
+        K=1 reduces to the one-step shortcut x_t + (1-t_flow)·v_pred, with no
+        extra goal_dit forward passes.
+
+        The first step always reuses v_pred_first (already computed at
+        (x_t, t_flow) for state_flow_loss). Steps k=1..K-1 call goal_dit fresh.
+        """
+        if K < 1:
+            raise ValueError(f"K must be >= 1, got {K}")
+
+        g_s = x_t
+        remaining = 1.0 - t_flow                # (B,)
+        step_frac = 1.0 / K                     # scalar
+
+        for k in range(K):
+            s_per_sample = t_flow + (k * step_frac) * remaining        # (B,)
+            t_per_sample = t_flow + ((k + 1) * step_frac) * remaining  # (B,)
+
+            if k == 0:
+                v_k = v_pred_first
+            else:
+                v_k, _, _ = self.goal_dit(
+                    g_s, s_per_sample, s_per_sample, z_t, align_depth=None,
+                )
+
+            dt_x = at_least_ndim(t_per_sample - s_per_sample, g_s.dim())
+            g_s = g_s + v_k * dt_x
+
+        return g_s
 
     def _ema_update(self):
         """Update EMA of goal DiT."""
@@ -372,12 +486,17 @@ class GoalPredictorDiTAgent:
 
         # Encode current obs
         z_t = self._inner_encoder(obs, None)  # (B, To, emb_dim)
-        B, To, emb_dim = z_t.shape
+        B, _, emb_dim = z_t.shape
         device = z_t.device
 
-        # Generate goal via DiT ODE
+        # Generate goal via DiT ODE. Source uses the goal-specific sample_mode
+        # (resolved at agent init from goal_sample_mode || sample_mode), which
+        # may differ from the action ODE's mode below.
         goal_num_steps = config.goal_flow_num_steps
-        g_s = torch.randn(B, 1, emb_dim, device=device)
+        if self._goal_sample_mode == "stochastic":
+            g_s = torch.randn(B, 1, emb_dim, device=device)
+        else:
+            g_s = torch.zeros(B, 1, emb_dim, device=device)
         t_schedule = np.linspace(0, 1, goal_num_steps + 1)
 
         for i in range(goal_num_steps):
@@ -453,10 +572,24 @@ class GoalPredictorDiTAgent:
         return training_state
 
     def eval(self):
-        """Set goal DiT to eval mode. IDM is always in eval."""
+        """Set goal DiT and (frozen) encoder to eval mode for inference.
+
+        The encoder is in eval mode here so its CropRandomizer takes the
+        deterministic center crop — matching the deployment / val setting.
+        Encoder weights remain frozen via requires_grad_(False) regardless.
+        """
         self.goal_dit.eval()
         self.goal_dit_ema.eval()
+        self.encoder.eval()
 
     def train(self):
-        """Set goal DiT to train mode. IDM stays frozen/eval."""
+        """Set goal DiT and (frozen) encoder to train mode.
+
+        Putting the encoder in train mode re-enables CropRandomizer's
+        random branch, so each batch sees a fresh 128×128 crop of every
+        obs frame and the goal frame — the same augmentation regime the
+        IDM saw during its own training. Encoder weights remain frozen
+        via requires_grad_(False); only the augmentor mode flag changes.
+        """
         self.goal_dit.train()
+        self.encoder.train()

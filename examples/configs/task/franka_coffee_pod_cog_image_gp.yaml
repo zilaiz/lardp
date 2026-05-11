@@ -1,0 +1,24 @@
+# @package task
+# Franka coffee-pod goal-predictor task: expert-only HDF5.
+#
+# Mirrors the robomimic *_gp.yaml convention (e.g. tool_hang_ph_image_gp.yaml):
+# the IDM is pretrained on a wider mixture (expert + play), but the goal
+# predictor is trained on clean expert demonstrations only so that the
+# z_goal targets are drawn from the high-quality task-completion
+# distribution. The IDM's encoder still works on the expert obs identically
+# (encoder is action-agnostic), and action_reg can be enabled here without
+# act_dim mismatches because Franka actions are pre-expanded to 10-dim at
+# conversion time.
+defaults:
+  - franka_coffee_pod_cog_image
+  - _self_
+
+# Single (expert) dataset, but kept in list form to match the robomimic
+# *_gp.yaml convention: the list form signals "this enters the
+# make_idm_dataset path", as opposed to the singular dataset_path form
+# used by plain BC (*_image.yaml). Functionally identical to a singular
+# string for a one-element list.
+dataset_path: null
+dataset_paths:
+  - data/franka_coffee_pod_cog/image.hdf5
+filter_success: false

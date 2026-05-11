@@ -38,6 +38,10 @@ class OptimizationConfig:
     weight_decay: float = 1e-5
     num_steps: int = 1
     sample_mode: str = "stochastic"  # "zero", "mean"
+    # Goal-predictor ODE source override. None -> inherit `sample_mode`.
+    # Useful when the goal distribution and the action distribution have
+    # different modal structure (e.g. expert-only goals vs expert+play actions).
+    goal_sample_mode: str | None = None
     t_two_step: float = 0.9
     discrete_dt: float = 0.01
     grad_clip_norm: float = 10.0
@@ -72,14 +76,131 @@ class OptimizationConfig:
     goal_flow_num_steps: int = 5  # ODE steps for goal generation at inference
     goal_flow_loss_scale: float = 1.0  # weight for state flow loss
     action_reg_weight: float = 1.0  # weight for action regularization loss
+    action_reg_t_weighting: str = "linear"  # per-sample weighting of action loss by t_flow: "none" | "linear"
+    action_reg_num_steps: int = 1  # K Euler steps from x_t -> g_hat for action_reg_loss; 1 = original one-step shortcut
     goal_stats_path: str | None = None  # path to precomputed goal normalization stats (.pt)
+    # Goal predictor DDT-NS (noise-shift) variant only. SD3-style time shift on
+    # the single goal flow time, plus a configurable base-t distribution and
+    # endpoint clamp. Identity defaults so leaving them untouched recovers the
+    # plain GP behavior.
+    goal_t_shift: float = 1.0  # SD3 shift t' = a*t / (1 + (a-1)*t); 1.0 = no shift
+    goal_t_dist: str = "uniform"  # "uniform" | "logit_normal"
+    goal_t_dist_mu: float = 0.0  # logit_normal mean (sigmoid(N(mu, sigma)))
+    goal_t_dist_sigma: float = 1.0  # logit_normal std
+    goal_t_eps: float = 0.0  # clamp t to [eps, 1-eps] at training + inference
+    # Policy DDT-NS (noise-shift) variant only — used by ``flow_ns`` loss +
+    # ``ode_ns_sampler`` to apply SD3 time shift on the single action flow
+    # time. Identity defaults recover plain flow matching.
+    policy_t_shift: float = 1.0  # SD3 shift t' = a*t / (1 + (a-1)*t); 1.0 = no shift
+    policy_t_dist: str = "uniform"  # "uniform" | "logit_normal"
+    policy_t_dist_mu: float = 0.0
+    policy_t_dist_sigma: float = 1.0
+    policy_t_eps: float = 0.0  # clamp t to [eps, 1-eps] at training + inference
+    # Goal predictor o2g consistency loss (0 disables; mirrors VITA's FLC but with
+    # action FM as the comparator rather than direct latent MSE)
+    consistency_weight: float = 0.0
+    consistency_num_steps: int | None = None  # None -> use goal_flow_num_steps
+    # Goal predictor regressor: deterministic L2 + action-FM training
+    goal_l2_weight: float = 1.0  # weight for L2 loss on expert goal embedding
+    # Whether the L2 loss is computed in normalized or raw encoder space. With
+    # no goal_stats_path, "normalized" auto-falls-back to "raw"; default "raw"
+    # keeps the no-stats path silent (the recommended default).
+    goal_l2_target_space: str = "raw"
+    # Goal predictor retrieval: non-parametric, looks up nearest training goal.
+    retrieval_index_path: str | None = None  # path to (.pt) index built offline
+    retrieval_query_space: str = "obs_summary"  # "flatten_zt" | "obs_summary"
+    retrieval_distance: str = "l2"  # "l2" | "cosine"
+    retrieval_top_k: int = 1
+    retrieval_aggregation: str = "top1"  # "top1" | "weighted"
+    retrieval_temperature: float = 1.0   # softmax temperature for "weighted"
+    # If True, retrieve both obs_summary (= index keys) and goal embedding
+    # (= index values) from the nearest training row, and inject the pair
+    # directly into the IDM action trunk via ``forward_with_summary``,
+    # bypassing the IDM's obs_summarizer. Forces top1 and requires
+    # query_space="obs_summary" + a v2 IDM with ``forward_with_summary``.
+    retrieval_use_retrieved_pair: bool = False
     # IDM + FDM joint training (lbmidm_v2 / IDMFDMAgent)
     fdm_loss_scale: float = 0.0  # weight for forward-dynamics auxiliary loss (0 = disabled)
+    # Ortho regularizer: hinge-form penalty on cos_sim(z_obs[-1], z_goal),
+    # active only when cos_sim > ortho_reg_threshold. The hinge gives a
+    # stable equilibrium (no runaway orthogonality) and avoids the
+    # FDM-vs-ortho phase transition observed with no-threshold cos_sim
+    # minimization. Both inputs are raw encoder outputs (no MLP in between),
+    # so the regularizer shapes the encoder directly. 0 disables.
+    ortho_reg_weight: float = 0.0
+    ortho_reg_threshold: float = 0.5
     # Dropout annealing for condistill extra_cond_encoder
     extra_cond_dropout_warmup_steps: int = 5000  # number of steps to keep dropout at 0
     extra_cond_dropout_rampup_steps: int = 10000  # number of steps to linearly ramp dropout from 0 to max
     # Diagnostic: measure how much extra_cond affects teacher representations
     diagnose_teacher_delta: bool = False
+    # LBMDiTJoint (single-stage joint state+action DiT) -------------------
+    # Per-stream loss weights (final loss = state_w * L_state + action_w * L_act).
+    joint_state_loss_weight: float = 1.0
+    joint_action_loss_weight: float = 1.0
+    # CFG dropout: fraction of training steps where the optimality label is
+    # overridden with the null/play index (slot 1). Default 0.0 because play
+    # data already trains the null slot directly; raise only if you want extra
+    # regularization on the null embedding.
+    joint_cfg_dropout_prob: float = 0.0
+    # Inference-time CFG strength `w` in v_guided = (1+w)*v_cond - w*v_uncond.
+    # 0 = plain conditional sampling (one network call per ODE step).
+    joint_cfg_scale: float = 0.0
+    # ODE source for sampling (state/action streams share the same mode).
+    # "stochastic" = Gaussian noise, "zero" = deterministic.
+    joint_sample_mode: str = "stochastic"
+    # Number of Euler steps for joint ODE sampling at inference.
+    joint_num_steps: int = 5
+    # Whether the encoder loaded from idm_checkpoint_path is frozen (default) or
+    # fine-tuned alongside the joint trunk.
+    joint_freeze_encoder: bool = True
+    # E2E variant only (LBMDiTJointE2EAgent): whether the target LayerNorm
+    # has learnable gamma/beta. Default False removes the gamma->0 collapse
+    # mode; flip to True for the UNITE-faithful variant (encoder gets more
+    # expressive target normalization at the cost of a real collapse path).
+    joint_target_ln_affine: bool = False
+    # E2E variant only (LBMDiTJointE2EAgent / DDT): use the EMA encoder +
+    # EMA target_ln to compute the FM state target during training. This
+    # decouples the regression target from per-step encoder updates, the
+    # standard self-distillation fix (BYOL/DINO/REPA-E) for the moving-
+    # target dynamic where state_loss creeps up as the encoder evolves.
+    # Reuses ``ema_rate`` for the EMA decay. Active only when ``ema_rate
+    # < 1``; otherwise falls through to the live encoder. Default False
+    # preserves baseline behavior (target from live encoder).
+    joint_use_ema_target: bool = False
+    # DDT/decoupled-time variant only (LBMDiTJointDDTAgent):
+    # If True, sample independent t_state and t_action per batch during
+    # training (DF-style decoupled noising). If False, the same scalar t
+    # is used for both streams (diagonal training, matches LBMDiTJointE2E).
+    joint_decouple_t: bool = True
+    # Inference t-schedule for the (state, action) flow pair.
+    #   "diagonal":    t_state = t_action = grid (single Euler walk).
+    #   "state_first": clean state first (t_state ramps 0->1 in first half),
+    #                  then clean action (t_action ramps 0->1 in second half).
+    #   "pyramid":     t_state leads t_action by a fixed offset throughout.
+    joint_t_schedule: str = "diagonal"
+    # Pyramid offset (only used when joint_t_schedule == "pyramid"). Positive
+    # value means t_state advances ahead of t_action by this much (fraction
+    # of the [0, 1] range). Clamped to [0, 1] at each step.
+    joint_pyramid_offset: float = 0.2
+    # Small epsilon to keep schedule endpoints away from {0, 1} (avoids OOD
+    # at the data/noise corners). Applied symmetrically: schedule lives in
+    # [eps, 1-eps]. 0 disables.
+    joint_t_eps: float = 0.0
+    # Per-stream SD3-style time shift. Formula: t' = a*t / (1 + (a-1)*t).
+    # In mip's convention (t=0 noise, t=1 data): a < 1 emphasizes the
+    # noisy regime (UNITE setting), a > 1 emphasizes the data regime.
+    # Default 1.0 (no shift) preserves baseline behavior. Applied to both
+    # training-time t sampling and inference-time t grids on the matching
+    # stream — DO NOT change one without the other.
+    joint_t_shift_state: float = 1.0
+    joint_t_shift_action: float = 1.0
+    # Base distribution used to sample training t before the per-stream
+    # shift is applied. "uniform" uses Uniform[eps, 1-eps]; "logit_normal"
+    # uses sigmoid(N(mu, sigma)) clamped to [eps, 1-eps], matching SD3/UNITE.
+    joint_t_dist: str = "uniform"  # "uniform" | "logit_normal"
+    joint_t_dist_mu: float = 0.0
+    joint_t_dist_sigma: float = 1.0
 
 
 @dataclass
@@ -129,6 +250,7 @@ class NetworkConfig:
     goal_dit_d_model: int | None = None  # None = use emb_dim
     goal_dit_dropout: float = 0.1
     goal_dit_projector_dim: int | None = None  # None = 2 * d_model
+    goal_dit_timestep_emb_dim: int | None = None  # None = use goal_dit_d_model
     goal_align_depth: int | list[int] | None = 3
     # Goal predictor DiT with DDT head (encoder-decoder split)
     goal_ddt_enc_depth: int = 8
@@ -138,10 +260,43 @@ class NetworkConfig:
     goal_ddt_n_heads_enc: int = 8
     goal_ddt_n_heads_dec: int = 8
     goal_ddt_dropout: float = 0.0
+    # DDT-NS variant: decouple time embedding width from d_model_enc (None -> d_model_enc)
+    goal_ddt_timestep_emb_dim: int | None = None
+    # LBMDiTDDT (action-only DDT policy trunk; encoder/decoder width split,
+    # global cond, single t — paired with ``flow_ns`` loss for noise-shift A/Bs).
+    policy_ddt_enc_depth: int = 4
+    policy_ddt_dec_depth: int = 2
+    policy_ddt_d_model_enc: int | None = None  # None -> emb_dim
+    policy_ddt_d_model_dec: int | None = None  # None -> 2 * d_model_enc
+    policy_ddt_n_heads_enc: int = 8
+    policy_ddt_n_heads_dec: int = 8
+    policy_ddt_timestep_emb_dim: int | None = None  # None -> d_model_enc
     # LBMDiTIDMv2 (IDM with obs summarizer + FDM head)
     obs_summarizer_hidden: int | None = None  # None -> 2 * obs_dim
     action_proj_hidden: int | None = None  # None -> 2 * obs_dim
     fdm_hidden: int | None = None  # None -> 2 * obs_dim
+    # LBMDiTJoint (single-stage joint state+action DiT)
+    joint_opt_emb_dim: int | None = None  # None -> obs_dim
+    # LBMDiTJointDDT (joint DiT with encoder/decoder width split)
+    joint_ddt_enc_depth: int = 8
+    joint_ddt_dec_depth: int = 2
+    joint_ddt_d_model_enc: int | None = None  # None -> emb_dim
+    joint_ddt_d_model_dec: int | None = None  # None -> 2 * d_model_enc
+    joint_ddt_n_heads_enc: int = 8
+    joint_ddt_n_heads_dec: int = 8
+    # Goal predictor o2g (obs-summary -> goal embedding, VITA-style residual MLP)
+    o2g_hidden_dim: int | None = None  # None -> 2 * obs_dim
+    o2g_num_layers: int = 4
+    o2g_mlp_ratio: int = 4
+    o2g_dropout: float = 0.0
+    o2g_timestep_emb_dim: int | None = None  # None -> obs_dim
+    o2g_cond_mode: str = "none"  # "none" | "obs_summary"
+    # Goal predictor regressor (deterministic transformer w/ goal-query token)
+    regressor_depth: int = 6
+    regressor_n_heads: int = 6
+    regressor_d_model: int | None = None  # None = use emb_dim
+    regressor_dropout: float = 0.0
+    regressor_mlp_ratio: int = 4
 
 
 @dataclass

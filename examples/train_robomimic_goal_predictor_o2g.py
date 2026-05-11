@@ -1,9 +1,12 @@
-"""Training pipeline for DiT-based goal predictor through frozen IDM on robomimic dataset.
+"""Training pipeline for the O2G goal predictor on robomimic.
 
-Based on train_robomimic_goal_predictor.py. Key difference: instead of a simple MLP,
-we use a DiT-based flow matching model that generates goal embeddings via ODE,
-with an action flow matching loss through the frozen IDM using a one-step
-Euler-denoised goal embedding (x_t + (1 - t_flow) * v_pred).
+O2G ("obs-to-goal") flows directly from the IDM's frozen obs_summarizer token
+to the raw goal embedding, with no Gaussian-noise prior and no latent
+normalization. State flow loss only.
+
+Mirrors examples/train_robomimic_goal_predictor_dit.py for plumbing; the only
+substantive differences are the agent class and the absence of any goal-stats
+loading.
 """
 
 import os
@@ -19,7 +22,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 # Set MuJoCo rendering backend before importing any robomimic/mujoco modules
 os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 
-from mip.agent_goal_predictor_dit import GoalPredictorDiTAgent  # noqa: E402
+from mip.agent_goal_predictor_o2g import GoalPredictorO2GAgent  # noqa: E402
 from mip.config import Config  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
 from mip.datasets.robomimic_dataset import make_idm_dataset  # noqa: E402
@@ -44,7 +47,6 @@ def timed(section: str, record_dict: dict):
 
 
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):
-    """Goal predictor DiT training function."""
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
@@ -100,7 +102,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                 from tensordict import TensorDict
 
                 if config.task.obs_type == "image":
-                    # Current obs: (B, To, ...)
                     obs_batch = batch["obs"]
                     obs_dict = {}
                     for k in obs_batch:
@@ -108,7 +109,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                             config.optimization.device
                         )
 
-                    # Goal obs: (B, 1, ...) — separate, for state flow target
                     goal_batch = batch["goal_obs"]
                     goal_dict = {}
                     for k in goal_batch:
@@ -119,11 +119,11 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     goal_obs = TensorDict(goal_dict, batch_size=batch_size)
                 else:
                     raise NotImplementedError(
-                        "Goal predictor DiT training currently only supports image observations"
+                        "Goal predictor O2G training currently only supports image observations"
                     )
 
                 act = batch["action"].to(config.optimization.device)
-                act = act[:, : config.task.horizon, :]  # (B, horizon, act_dim)
+                act = act[:, : config.task.horizon, :]
 
             with timed("update", perf_times):
                 delta_t_scalar = warmup_scheduler(n_gradient_step)
@@ -139,7 +139,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     info[k] = v.item()
             info_list.append(info)
 
-        # log metrics
         if ((n_gradient_step + 1) % config.log.log_freq) == 0:
             metrics = {
                 "step": n_gradient_step,
@@ -242,7 +241,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
 
 def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
-    """Evaluate the goal predictor DiT + frozen IDM as a coupled policy."""
+    """Evaluate the O2G goal predictor + frozen IDM as a coupled policy."""
     episode_rewards = []
     episode_steps = []
     episode_success = []
@@ -254,8 +253,11 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
         "env_step": [],
     }
 
-    # Unwrap ConcatDataset to access primary dataset's normalizer
-    base_dataset = dataset.datasets[0] if isinstance(dataset, torch.utils.data.ConcatDataset) else dataset
+    base_dataset = (
+        dataset.datasets[0]
+        if isinstance(dataset, torch.utils.data.ConcatDataset)
+        else dataset
+    )
 
     for i in range(config.log.eval_episodes // config.task.num_envs):
         ep_reward = [0.0] * config.task.num_envs
@@ -277,12 +279,12 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
                             obs_k,
                             device=config.optimization.device,
                             dtype=torch.float32,
-                        )  # (num_envs, obs_steps, ...)
+                        )
                         obs_dict[k] = obs_k
                     obs = obs_dict
                 else:
                     raise NotImplementedError(
-                        "Goal predictor DiT eval currently only supports image observations"
+                        "Goal predictor O2G eval currently only supports image observations"
                     )
 
                 act_0 = torch.randn(
@@ -364,7 +366,6 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
 
 @hydra.main(version_base=None, config_path="configs/", config_name="main")
 def main(config):
-    """Main pipeline for goal predictor DiT training."""
     os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
     if torch.cuda.is_available():
@@ -376,7 +377,6 @@ def main(config):
     logger = Logger(config)
     loguru.logger.info("Finished setting up logger")
 
-    # env setup
     envs = make_vec_env(config.task, seed=config.optimization.seed)
     obs, info = envs.reset()
     if config.task.obs_type == "image":
@@ -385,7 +385,6 @@ def main(config):
         config.task.obs_dim = obs.shape[-1]
     loguru.logger.info("Finished setting up env")
 
-    # Load normalizer from pretrained IDM to ensure consistent normalization
     import pickle
     idm_normalizer = None
     if config.optimization.idm_checkpoint_path:
@@ -397,17 +396,20 @@ def main(config):
                 idm_normalizer = pickle.load(f)
             loguru.logger.info(f"Loaded IDM normalizer from {normalizer_path}")
         else:
-            loguru.logger.warning(f"IDM normalizer not found at {normalizer_path}, will compute new one")
+            loguru.logger.warning(
+                f"IDM normalizer not found at {normalizer_path}, will compute new one"
+            )
 
-    # dataset setup — uses IDM dataset with goal obs
     dataset = make_idm_dataset(config.task, normalizer=idm_normalizer)
     loguru.logger.info("Finished setting up IDM dataset")
 
-    agent = GoalPredictorDiTAgent(config)
+    agent = GoalPredictorO2GAgent(config)
     resume_state = None
 
     if config.optimization.model_path and config.optimization.model_path != "None":
-        loguru.logger.info(f"Loading goal predictor DiT from {config.optimization.model_path}")
+        loguru.logger.info(
+            f"Loading goal predictor O2G from {config.optimization.model_path}"
+        )
         resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
 
     if config.mode == "train":

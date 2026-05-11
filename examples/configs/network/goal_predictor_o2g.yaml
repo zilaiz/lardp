@@ -1,0 +1,15 @@
+# @package network
+# Goal predictor O2G — VITA-style residual MLP that flows from the
+# IDM's frozen obs_summarizer token directly to the raw goal embedding.
+# IDM checkpoint must be lbmidm_v2 (for the reused obs_summarizer).
+defaults:
+  - lbmidm_v2
+  - _self_
+
+# Goal predictor O2G architecture
+o2g_hidden_dim: null     # null -> 2 * obs_dim
+o2g_num_layers: 4
+o2g_mlp_ratio: 4
+o2g_dropout: 0.0
+o2g_timestep_emb_dim: null  # null -> obs_dim
+o2g_cond_mode: "none"    # "none" | "obs_summary" | "z_t"

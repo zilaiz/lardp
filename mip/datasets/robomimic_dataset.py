@@ -587,12 +587,17 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
         mode="train",
         normalizer=None,
         filter_success=False,
+        optimality_label: int = 0,
     ):
         # We need to override the parent's __init__ because:
         # 1. sequence_length must be horizon+1 (extra frame for goal)
         # 2. pad_after must be act_steps (= pad_after+1 from caller) to allow goal frame
         # 3. No key_first_k optimization (need obs at both [0:obs_steps] and [horizon])
         BaseDataset.__init__(self)
+        # Optimality slot carried into every batch sample. Read by joint /
+        # CFG-aware agents (e.g. LBMDiTJointAgent): 0 = expert, 1 = null/play.
+        # Default 0 keeps single-source training silent.
+        self.optimality_label = int(optimality_label)
         self.rotation_transformer = RotationTransformer(
             from_rep="axis_angle", to_rep=rotation_rep
         )
@@ -711,6 +716,7 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
             "goal_obs": dict_apply(goal_dict, torch.tensor),
             "inter_obs": dict_apply(inter_dict, torch.tensor),
             "action": torch.tensor(action),
+            "optimality": torch.tensor(self.optimality_label, dtype=torch.long),
         }
         return torch_data
 
@@ -788,15 +794,18 @@ def make_idm_dataset(task_config, mode="train", normalizer=None):
         mode=mode,
     )
 
-    # Create primary (expert) dataset with val split applied
+    # Create primary (expert) dataset with val split applied. The primary
+    # path is tagged optimality=0 (expert); all additional paths are tagged
+    # optimality=1 (null/play) so CFG-aware agents see real labels per sample.
     datasets = []
     primary_ds = RobomimicImageIDMDataset(
         dataset_dir=paths[0],
         val_dataset_percentage=task_config.val_dataset_percentage,
+        optimality_label=0,
         **common_kwargs,
     )
     datasets.append(primary_ds)
-    logger.info(f"Primary IDM dataset: {len(primary_ds)} samples")
+    logger.info(f"Primary IDM dataset (optimality=0/expert): {len(primary_ds)} samples")
 
     # Create additional (rollout) datasets — each with own normalizer first
     for path in paths[1:]:
@@ -804,10 +813,11 @@ def make_idm_dataset(task_config, mode="train", normalizer=None):
             dataset_dir=path,
             val_dataset_percentage=0.0,
             filter_success=filter_success,
+            optimality_label=1,
             **common_kwargs,
         )
         datasets.append(ds)
-        logger.info(f"Additional IDM dataset: {len(ds)} samples")
+        logger.info(f"Additional IDM dataset (optimality=1/play): {len(ds)} samples")
 
     # Apply normalizer: use provided one, or merge across all datasets
     if normalizer is not None:

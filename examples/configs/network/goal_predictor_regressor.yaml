@@ -1,0 +1,17 @@
+# @package network
+# Goal predictor regressor — deterministic transformer with a [GOAL] query
+# token. Predicts a single goal embedding from the To-frame obs sequence.
+# Trained with L2 on the expert goal embedding + action FM loss through a
+# frozen IDM (see GoalPredictorRegressorAgent). Reuses the lbmidm_v2 base so
+# the IDM checkpoint side-channel (encoder, flow_map, To_obs, FDM head) is
+# already wired up.
+defaults:
+  - lbmidm_v2
+  - _self_
+
+# Regressor architecture
+regressor_depth: 8
+regressor_n_heads: 8
+regressor_d_model: null  # null = use emb_dim
+regressor_dropout: 0.0
+regressor_mlp_ratio: 4

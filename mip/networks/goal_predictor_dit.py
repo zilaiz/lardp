@@ -55,6 +55,7 @@ class GoalPredictorDiT(BaseNetwork):
         timestep_emb_params: dict | None = None,
         disable_time_embedding: bool = False,
         projector_dim: int | None = None,
+        timestep_emb_dim: int | None = None,
     ):
         """Args:
         act_dim: goal embedding dimension (= emb_dim of frozen encoder)
@@ -69,35 +70,39 @@ class GoalPredictorDiT(BaseNetwork):
         timestep_emb_params: additional params for timestep embedding
         disable_time_embedding: if True, zero out time embeddings
         projector_dim: hidden dim of projector MLP (None = 2 * d_model)
+        timestep_emb_dim: width of the (single) time embedding (default:
+            d_model). Decoupled from d_model so callers can shrink the time
+            path independently of the action trunk. Only `t` is embedded —
+            the redundant dual `s/t` path was removed since callers always
+            pass s == t in this codebase.
         """
         super().__init__(act_dim, Ta, obs_dim, To, d_model, depth)
 
         self.d_model = d_model
         self.disable_time_embedding = disable_time_embedding
+        self._timestep_emb_dim = (
+            timestep_emb_dim if timestep_emb_dim is not None else d_model
+        )
 
-        # --- Time embeddings for s and t ---
+        # --- Single t embedding (s is ignored: callers always pass s == t) ---
         timestep_emb_params = timestep_emb_params or {}
         if not disable_time_embedding:
-            self.map_s = SUPPORTED_TIMESTEP_EMBEDDING[timestep_emb_type](
-                d_model // 2, **timestep_emb_params,
-            )
-            self.map_t = SUPPORTED_TIMESTEP_EMBEDDING[timestep_emb_type](
-                d_model // 2, **timestep_emb_params,
+            self.time_embedder = SUPPORTED_TIMESTEP_EMBEDDING[timestep_emb_type](
+                self._timestep_emb_dim, **timestep_emb_params,
             )
         else:
-            self.map_s = None
-            self.map_t = None
+            self.time_embedder = None
 
         # --- Time MLP ---
         self.time_mlp = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
+            nn.Linear(self._timestep_emb_dim, 2 * self._timestep_emb_dim),
             nn.GELU(),
-            nn.Linear(2 * d_model, d_model),
+            nn.Linear(2 * self._timestep_emb_dim, self._timestep_emb_dim),
             nn.GELU(),
         )
 
-        # Conditioning dimension: time_features + flattened obs
-        cond_dim = d_model + obs_dim * To
+        # Conditioning dimension: time_features + flattened obs stack
+        cond_dim = self._timestep_emb_dim + obs_dim * To
 
         # --- Input projection ---
         self.input_proj = nn.Linear(act_dim, d_model)
@@ -150,8 +155,8 @@ class GoalPredictorDiT(BaseNetwork):
     ) -> tuple[Tensor, Tensor | None, list[Tensor] | None]:
         """Args:
             x:           (b, Ta, act_dim) noisy goal embedding(s)
-            s:           (b,) source time parameter
-            t:           (b,) target time parameter
+            s:           (b,) — unused (kept for FlowMap signature compat).
+            t:           (b,) flow-matching time
             condition:   (b, To, obs_dim) encoded current observations
             align_depth: layer index(es) (1-based) to extract intermediate states
 
@@ -160,16 +165,15 @@ class GoalPredictorDiT(BaseNetwork):
             scalar:   None
             zs_tilde: list of projected hidden states at align_depth, or None
         """
+        del s  # unused — get_velocity passes t as both s and t
         batch_size = x.shape[0]
         device = x.device
 
-        # --- Time conditioning ---
-        if self.map_s is not None and self.map_t is not None:
-            s_emb = self.map_s(s)
-            t_emb = self.map_t(t)
-            time_raw = torch.cat([s_emb, t_emb], dim=-1)
+        # --- Time conditioning (single t) ---
+        if self.time_embedder is not None:
+            time_raw = self.time_embedder(t)
         else:
-            time_raw = torch.zeros(batch_size, self.d_model, device=device)
+            time_raw = torch.zeros(batch_size, self._timestep_emb_dim, device=device)
 
         time_features = self.time_mlp(time_raw)
 
@@ -385,6 +389,197 @@ class GoalPredictorDiTDDT(BaseNetwork):
         y = self.output_proj(h_dec)
 
         return y, None
+
+
+class GoalPredictorDiTDDTNS(BaseNetwork):
+    """Modernized DDT goal-predictor trunk paired with the noise-shift agent.
+
+    Same encoder/decoder-width-split topology as ``GoalPredictorDiTDDT``, but:
+      - Single t embedding (callers pass ``s == t``; ``s`` arg ignored). The
+        legacy dual ``map_s + map_t`` half-width split is dropped.
+      - ``timestep_emb_dim`` decoupled from ``d_model_enc`` (matches the
+        joint DDT and v2 GP-DiT conventions).
+      - Output ``output_proj`` is zero-initialized (AdaLN-Zero on the head)
+        for stable training.
+      - Forward returns a 3-tuple ``(y, None, None)`` and accepts an
+        ignored ``align_depth=None`` kwarg, so it is drop-in compatible with
+        the ``GoalPredictorDiT`` API used by the v3 GP-DiT agent's
+        ``update`` / ``_refine_to_one``.
+
+    Cond is global per-sample (NOT per-token) — at ``Ta=1`` per-token
+    AdaLN degenerates to one cond row, so the joint DDT's per-token
+    machinery is unnecessary here.
+    """
+
+    def __init__(
+        self,
+        act_dim: int,
+        Ta: int,
+        obs_dim: int,
+        To: int,
+        d_model_enc: int = 384,
+        d_model_dec: int = 384,
+        n_heads_enc: int = 6,
+        n_heads_dec: int = 6,
+        enc_depth: int = 8,
+        dec_depth: int = 2,
+        dropout: float = 0.0,
+        timestep_emb_type: str = "positional",
+        timestep_emb_params: dict | None = None,
+        disable_time_embedding: bool = False,
+        timestep_emb_dim: int | None = None,
+    ):
+        super().__init__(
+            act_dim, Ta, obs_dim, To, d_model_enc, enc_depth + dec_depth,
+        )
+
+        self.d_model_enc = d_model_enc
+        self.d_model_dec = d_model_dec
+        self.disable_time_embedding = disable_time_embedding
+        self._timestep_emb_dim = (
+            timestep_emb_dim if timestep_emb_dim is not None else d_model_enc
+        )
+
+        # --- Single t embedding ---
+        timestep_emb_params = timestep_emb_params or {}
+        if not disable_time_embedding:
+            self.time_embedder = SUPPORTED_TIMESTEP_EMBEDDING[timestep_emb_type](
+                self._timestep_emb_dim, **timestep_emb_params,
+            )
+        else:
+            self.time_embedder = None
+
+        # --- Time MLP: emb_dim -> d_model_enc (so it can feed both enc cond
+        # and the bridge time_proj) ---
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self._timestep_emb_dim, 2 * d_model_enc),
+            nn.GELU(),
+            nn.Linear(2 * d_model_enc, d_model_enc),
+            nn.GELU(),
+        )
+
+        # --- Encoder ---
+        enc_cond_dim = d_model_enc + obs_dim * To
+        self.enc_input_proj = nn.Linear(act_dim, d_model_enc)
+        self.enc_pos_embedding = nn.Parameter(
+            torch.empty(1, Ta, d_model_enc).normal_(std=0.02),
+        )
+        self.enc_blocks = nn.ModuleList([
+            _TransformerBlock(
+                hidden_size=d_model_enc,
+                num_heads=n_heads_enc,
+                cond_dim=enc_cond_dim,
+                dropout=dropout,
+            )
+            for _ in range(enc_depth)
+        ])
+
+        # --- Bridge: encoder output -> decoder cond ---
+        self.s_projector = (
+            nn.Linear(d_model_enc, d_model_dec)
+            if d_model_enc != d_model_dec
+            else nn.Identity()
+        )
+        self.time_proj = (
+            nn.Linear(d_model_enc, d_model_dec)
+            if d_model_enc != d_model_dec
+            else nn.Identity()
+        )
+
+        # --- Decoder ---
+        dec_cond_dim = d_model_dec + d_model_dec  # concat(time_proj, s_proj)
+        self.dec_input_proj = nn.Linear(act_dim, d_model_dec)
+        self.dec_blocks = nn.ModuleList([
+            _TransformerBlock(
+                hidden_size=d_model_dec,
+                num_heads=n_heads_dec,
+                cond_dim=dec_cond_dim,
+                dropout=dropout,
+            )
+            for _ in range(dec_depth)
+        ])
+
+        # --- Output projection (zero-init for AdaLN-Zero on the head) ---
+        self.output_proj = nn.Linear(d_model_dec, act_dim)
+
+        self._initialize_weights()
+
+        print(
+            f"number of GoalPredictorDiTDDTNS parameters: "
+            f"{sum(p.numel() for p in self.parameters()):e}"
+        )
+
+    def _initialize_weights(self):
+        for block in list(self.enc_blocks) + list(self.dec_blocks):
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        # Zero-init the output head so the network is identity at step 0.
+        nn.init.constant_(self.output_proj.weight, 0)
+        nn.init.constant_(self.output_proj.bias, 0)
+
+    def forward(
+        self,
+        x: Tensor,
+        s: Tensor,
+        t: Tensor,
+        condition: Tensor | None = None,
+        align_depth: int | list[int] | None = None,
+    ) -> tuple[Tensor, Tensor | None, list[Tensor] | None]:
+        """Args:
+            x:           (b, Ta, act_dim) noisy goal embedding(s)
+            s:           (b,) — unused (kept for FlowMap signature compat).
+            t:           (b,) flow-matching time (already noise-shifted by
+                         the agent if shift != 1.0).
+            condition:   (b, To, obs_dim) encoded current observations.
+            align_depth: ignored; accepted for drop-in compat with the DiT
+                         v3 agent's update / _refine_to_one calls.
+
+        Returns:
+            y:        (b, Ta, act_dim) predicted velocity
+            scalar:   None
+            zs_tilde: None  (no projector / align_depth path on DDT)
+        """
+        del s, align_depth
+        batch_size = x.shape[0]
+        device = x.device
+
+        # --- Time conditioning (single t) ---
+        if self.time_embedder is not None:
+            time_raw = self.time_embedder(t)
+        else:
+            time_raw = torch.zeros(
+                batch_size, self._timestep_emb_dim, device=device,
+            )
+        time_features = self.time_mlp(time_raw)  # (b, d_model_enc)
+
+        # --- Encoder cond (time + flat obs) ---
+        if condition is not None:
+            cond_flat = torch.flatten(condition, 1)
+        else:
+            cond_flat = torch.zeros(
+                batch_size, self.obs_dim * self.To, device=device,
+            )
+        enc_cond = torch.cat([time_features, cond_flat], dim=-1)
+
+        # --- Encoder ---
+        h_enc = self.enc_input_proj(x)
+        h_enc = h_enc + self.enc_pos_embedding[:, : x.shape[1], :]
+        for block in self.enc_blocks:
+            h_enc = block(h_enc, enc_cond)
+
+        # --- Bridge ---
+        s_out = self.s_projector(h_enc).squeeze(1)   # (b, d_model_dec)
+        t_dec = self.time_proj(time_features)        # (b, d_model_dec)
+        dec_cond = torch.cat([t_dec, s_out], dim=-1) # (b, 2*d_model_dec)
+
+        # --- Decoder ---
+        h_dec = self.dec_input_proj(x)
+        for block in self.dec_blocks:
+            h_dec = block(h_dec, dec_cond)
+
+        # --- Output ---
+        y = self.output_proj(h_dec)
+        return y, None, None
 
 
 def test_goal_predictor_dit():

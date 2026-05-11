@@ -1,0 +1,20 @@
+# @package task
+# Franka coffee-pod IDM task: expert demos + play data via make_idm_dataset.
+# Used by train_franka_idm_fdm.py and train_franka_goal_predictor_dit.py.
+defaults:
+  - franka_coffee_pod_cog_image
+  - _self_
+
+# Multi-HDF5 setup. The IDM dataset path code in make_idm_dataset treats the
+# first entry as the "primary" (controls the val split via val_dataset_percentage)
+# and the rest as auxiliary training data with their own normalizers, then merges
+# normalizers across all of them so a single shared scale is used downstream.
+dataset_path: null
+dataset_paths:
+  - data/franka_coffee_pod_cog/image.hdf5
+  - data/franka_coffee_pod_cog/image_play.hdf5
+  - data/franka_coffee_pod_cog/image_play_2.hdf5
+
+# Play data has no reward signal in this dataset, so success-filtering would
+# drop everything. Keep all play episodes.
+filter_success: false

@@ -1,0 +1,32 @@
+# @package network
+# DDT-style joint flow matching DiT over (next_state, action_chunk).
+# Per-token AdaLN cond throughout (DFoT pattern). Encoder/decoder width
+# split (RAE/DDT pattern): deep narrow encoder + shallow wide head.
+# Conditioned on per-token (t_state, t_action) plus broadcast obs and
+# optimality. Runs on top of an end-to-end-trained image encoder
+# (LBMDiTJointDDTAgent) with a learnable LayerNorm on the FM target.
+defaults:
+  - _base
+  - _self_
+
+network_type: "lbmdit_joint_ddt"
+emb_dim: 256                # default enc_hidden when joint_ddt_d_model_enc is null
+num_layers: 8               # unused by DDT trunk; encoder/decoder depths below
+dropout: 0.0
+timestep_emb_dim: 128       # decoupled from d_model
+encoder_out_dim: 256        # encoder output dim (= obs_dim fed to network)
+
+# DDT specific
+joint_ddt_enc_depth: 8
+joint_ddt_dec_depth: 2
+joint_ddt_d_model_enc: 256
+joint_ddt_d_model_dec: 512  # shallow wide head
+joint_ddt_n_heads_enc: 8
+joint_ddt_n_heads_dec: 8
+
+# General DiT knobs (unused by DDT trunk but kept for compatibility)
+n_heads: 8
+timestep_emb_type: "positional"
+
+# Optimality embedding width (null -> enc_hidden)
+joint_opt_emb_dim: null

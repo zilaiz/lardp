@@ -14,8 +14,14 @@ from mip.torch_utils import at_least_ndim
 
 
 def get_default_step_list(loss_type: str):
-    if loss_type in ["flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_reg", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "ctm", "lmd", "psd", "lsd", "esd", "mf", "goal_predictor", "goal_predictor_dit"]:
+    if loss_type in ["flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_reg", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "flow_ns", "ctm", "lmd", "psd", "lsd", "esd", "mf", "goal_predictor", "goal_predictor_dit"]:
         return 3 ** np.arange(2, -1, -1)
+    elif loss_type == "joint_dit":
+        # Joint state+action DiT (LBMDiTJoint / LBMDiTJointDDT) — denser NFE
+        # ladder since the joint trunk benefits from finer integration on
+        # the state stream. Descending so num_steps_list[0]=50 is the
+        # primary best-model metric.
+        return np.array([50, 25, 10])
     elif loss_type in ["regression", "mip", "tsd"]:
         return [1]
     else:
@@ -23,8 +29,10 @@ def get_default_step_list(loss_type: str):
 
 
 def get_sampler(loss_type: str):
-    if loss_type in {"flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "goal_predictor", "goal_predictor_dit"}:
+    if loss_type in {"flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "goal_predictor", "goal_predictor_dit", "joint_dit"}:
         return ode_sampler
+    elif loss_type == "flow_ns":
+        return ode_ns_sampler
     elif loss_type == "flow_reg":
         return ode_reg_sampler
     elif loss_type == "regression":
@@ -35,6 +43,64 @@ def get_sampler(loss_type: str):
         return flow_map_sampler
     else:
         raise NotImplementedError(f"Loss type {loss_type} not implemented.")
+
+
+def _ns_apply_t_shift(t, alpha: float):
+    """SD3-style time shift t' = a*t / (1 + (a-1)*t). Identity at a=1.
+
+    Works on numpy arrays and python scalars (only element-wise math).
+    """
+    if alpha == 1.0:
+        return t
+    return alpha * t / (1.0 + (alpha - 1.0) * t)
+
+
+def ode_ns_sampler(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    act_0: torch.Tensor,
+    obs: torch.Tensor,
+    padding_len: int = 0,
+):
+    """Euler ODE sampler that walks a noise-shifted t-grid.
+
+    Identical to :func:`ode_sampler` except the inference t-schedule is
+    ``apply_shift(linspace(eps, 1-eps, num_steps+1))`` rather than
+    ``linspace(0, 1, num_steps+1)``. Reduces to ``ode_sampler`` exactly
+    when ``policy_t_shift == 1.0`` and ``policy_t_eps == 0.0``.
+
+    Pairs with :func:`flow_ns_loss` so the inference walk lands on the
+    same shift-warped grid the trunk was trained on.
+    """
+    num_steps = config.num_steps
+    sample_mode = config.sample_mode
+    eps = float(config.policy_t_eps)
+    t_schedule = _ns_apply_t_shift(
+        np.linspace(eps, 1.0 - eps, num_steps + 1),
+        float(config.policy_t_shift),
+    )
+    if sample_mode == "stochastic":
+        act_s = torch.randn_like(act_0, device=act_0.device)
+    else:
+        act_s = torch.zeros_like(act_0, device=act_0.device)
+    obs_emb = encoder(obs, None)
+    if padding_len > 0:
+        padding = torch.zeros(
+            obs_emb.shape[0], padding_len, obs_emb.shape[2], device=obs_emb.device,
+        )
+        obs_emb = torch.cat([obs_emb, padding], dim=1)
+    bs = act_0.shape[0]
+    for i in range(num_steps):
+        s_val = float(t_schedule[i])
+        t_val = float(t_schedule[i + 1])
+        s = torch.full((bs,), s_val, device=act_0.device)
+        t = torch.full((bs,), t_val, device=act_0.device)
+        b_s = flow_map.get_velocity(s, act_s, obs_emb)
+        s_expanded = at_least_ndim(s, act_s.dim())
+        t_expanded = at_least_ndim(t, act_s.dim())
+        act_s = act_s + b_s * (t_expanded - s_expanded)
+    return act_s
 
 
 def ode_sampler(

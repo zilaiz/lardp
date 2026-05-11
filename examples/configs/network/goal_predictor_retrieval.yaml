@@ -1,0 +1,8 @@
+# @package network
+# Goal predictor retrieval — non-parametric, looks up the nearest training
+# goal embedding for a given obs encoding. Inherits the lbmidm_v2 base so the
+# IDM checkpoint side-channel (encoder, flow_map, To_obs, FDM head) is wired
+# up the same way as the regressor / DiT goal predictors.
+defaults:
+  - lbmidm_v2
+  - _self_

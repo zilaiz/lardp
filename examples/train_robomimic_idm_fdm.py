@@ -8,14 +8,16 @@ forward-predictable in addition to the IDM's controllability signal.
 Compared to ``train_robomimic_idm.py`` this pipeline:
 
 - Uses ``IDMFDMAgent`` and the ``lbmidm_v2`` network.
-- Does *not* wrap the encoder in ``GoalDropoutEncoder`` — there is no
-  CFG / uncond_emb path. The trained encoder is meant to be loaded by a
-  downstream goal predictor (which infers ``enc_out_dim`` from config when
-  ``uncond_emb`` is absent) rather than run as a standalone CFG policy.
+- Wraps the encoder in ``GoalDropoutEncoder`` (CFG path). With
+  ``goal_dropout_prob=0`` this is a no-op on the IDM input but still
+  registers a learned ``uncond_emb`` so a downstream goal predictor can run
+  CFG at inference. Goal dropout is applied only to the IDM input; the FDM
+  auxiliary always targets the real (pre-dropout) goal embedding so encoder
+  shaping is not contaminated.
 - Drops the ``local_linearity`` branch (different research direction).
-- Skips eval-during-training. Standalone IDM eval needs goal padding via
-  ``uncond_emb``, which we don't have here. Run a separate eval script if
-  needed; otherwise the FDM loss curve is the natural training-time proxy.
+- Skips eval-during-training. Standalone IDM eval (BC-mode vs goal-mode)
+  is left to a separate eval script; the FDM loss curve is the
+  training-time proxy.
 
 The agent ``update(act, obs, delta_t)`` receives ``obs`` already stacked as
 ``(B, To+1, ...)`` per key (To obs frames + 1 goal frame), exactly as in
@@ -234,6 +236,33 @@ def main(config):
     loguru.logger.info(
         f"Created IDMFDMAgent with fdm_loss_scale={config.optimization.fdm_loss_scale}"
     )
+
+    # Wrap encoder with GoalDropoutEncoder for CFG support.
+    # goal_dropout_prob=0 disables dropout but still registers a learned
+    # uncond_emb that downstream goal-predictor CFG can use at inference.
+    from mip.encoders import GoalDropoutEncoder
+
+    enc_out_dim = config.network.encoder_out_dim or config.network.emb_dim
+    loguru.logger.info(
+        f"Wrapping encoder with GoalDropoutEncoder "
+        f"(prob={config.optimization.goal_dropout_prob})"
+    )
+    agent.encoder = GoalDropoutEncoder(
+        agent.encoder,
+        enc_out_dim,
+        config.task.obs_steps,
+        config.optimization.goal_dropout_prob,
+    ).to(config.optimization.device)
+    agent.encoder_ema = GoalDropoutEncoder(
+        agent.encoder_ema,
+        enc_out_dim,
+        config.task.obs_steps,
+        config.optimization.goal_dropout_prob,
+    ).to(config.optimization.device)
+    # Register uncond_emb with the optimizer so it gets gradient updates.
+    agent.optimizer.add_param_group({"params": [agent.encoder.uncond_emb]})
+    # Re-compile so the agent's update path picks up the wrapped encoder.
+    agent.__compile__()
 
     resume_state = None
     if config.optimization.model_path and config.optimization.model_path != "None":

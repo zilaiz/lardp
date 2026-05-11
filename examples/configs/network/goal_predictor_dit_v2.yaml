@@ -10,4 +10,5 @@ goal_dit_n_heads: 8
 goal_dit_d_model: null    # null = use emb_dim
 goal_dit_dropout: 0.0
 goal_dit_projector_dim: null  # null = 2 * d_model
+goal_dit_timestep_emb_dim: 256  # null = use goal_dit_d_model
 goal_align_depth: 5       # which layer to extract intermediate states from

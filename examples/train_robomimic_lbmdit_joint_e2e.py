@@ -1,9 +1,12 @@
-"""Training pipeline for DiT-based goal predictor through frozen IDM on robomimic dataset.
+"""Training pipeline for the LBMDiTJointE2EAgent on robomimic.
 
-Based on train_robomimic_goal_predictor.py. Key difference: instead of a simple MLP,
-we use a DiT-based flow matching model that generates goal embeddings via ODE,
-with an action flow matching loss through the frozen IDM using a one-step
-Euler-denoised goal embedding (x_t + (1 - t_flow) * v_pred).
+E2E variant of the joint pipeline:
+- Encoder is trainable end-to-end (warm-start from IDM checkpoint optional).
+- A learnable LayerNorm normalizes the FM target embedding (replaces the
+  offline ``goal_stats`` z-score path).
+- Stop-grad on the FM target side blocks the encoder from receiving a
+  shortcut gradient through the target — the encoder is shaped only by the
+  AdaLN ``condition`` path and the action-flow loss.
 """
 
 import os
@@ -19,7 +22,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 # Set MuJoCo rendering backend before importing any robomimic/mujoco modules
 os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 
-from mip.agent_goal_predictor_dit import GoalPredictorDiTAgent  # noqa: E402
+from mip.agent_lbmdit_joint_e2e import LBMDiTJointE2EAgent  # noqa: E402
 from mip.config import Config  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
 from mip.datasets.robomimic_dataset import make_idm_dataset  # noqa: E402
@@ -43,8 +46,27 @@ def timed(section: str, record_dict: dict):
     record_dict[section].append(time.perf_counter() - start)
 
 
+def _read_optimality(
+    batch: dict, batch_size: int, device,
+) -> torch.Tensor:
+    """Per-sample optimality labels in {0=expert, 1=null/play}.
+
+    The IDM dataset tags samples with ``optimality_label`` per source path:
+    primary path (``dataset_paths[0]``) -> 0 (expert), additional paths -> 1
+    (null/play). When the dataset doesn't carry the field (older checkpoints
+    or custom datasets) we fall back to the null slot — the safer default,
+    matching the agent's own None-handling. If you actually have expert-only
+    data without per-sample tags, override this helper to return zeros.
+    """
+    if "optimality" in batch:
+        return batch["optimality"].to(device=device, dtype=torch.long)
+    from mip.networks.lbmdit_joint import LBMDiTJoint
+    return torch.full(
+        (batch_size,), LBMDiTJoint.NULL_IDX, dtype=torch.long, device=device,
+    )
+
+
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):
-    """Goal predictor DiT training function."""
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
@@ -60,7 +82,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         agent.optimizer,
         T_max=config.optimization.gradient_steps,
     )
-
     warmup_scheduler = WarmupAnnealingScheduler(
         max_steps=config.optimization.gradient_steps,
         warmup_ratio=config.optimization.warmup_ratio,
@@ -77,19 +98,12 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         best_metrics = resume_state.get("best_metrics", {})
         eval_history = resume_state.get("eval_history", [])
         loguru.logger.info(f"Resuming training from step {start_step}")
-        loguru.logger.info(f"Restored best metrics: {best_metrics}")
         for _ in range(start_step):
             lr_scheduler.step()
 
     info_list = []
     start_time = time.time()
-
-    perf_times = {
-        "data_load": [],
-        "preprocess": [],
-        "update": [],
-        "total_step": [],
-    }
+    perf_times = {"data_load": [], "preprocess": [], "update": [], "total_step": []}
 
     for n_gradient_step in range(start_step, config.optimization.gradient_steps):
         with timed("total_step", perf_times):
@@ -100,38 +114,42 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                 from tensordict import TensorDict
 
                 if config.task.obs_type == "image":
-                    # Current obs: (B, To, ...)
                     obs_batch = batch["obs"]
-                    obs_dict = {}
-                    for k in obs_batch:
-                        obs_dict[k] = obs_batch[k][:, : config.task.obs_steps].to(
+                    obs_dict = {
+                        k: obs_batch[k][:, : config.task.obs_steps].to(
                             config.optimization.device
                         )
-
-                    # Goal obs: (B, 1, ...) — separate, for state flow target
+                        for k in obs_batch
+                    }
                     goal_batch = batch["goal_obs"]
-                    goal_dict = {}
-                    for k in goal_batch:
-                        goal_dict[k] = goal_batch[k].to(config.optimization.device)
+                    goal_dict = {
+                        k: goal_batch[k].to(config.optimization.device)
+                        for k in goal_batch
+                    }
 
                     batch_size = next(iter(obs_dict.values())).shape[0]
                     obs = TensorDict(obs_dict, batch_size=batch_size)
                     goal_obs = TensorDict(goal_dict, batch_size=batch_size)
                 else:
                     raise NotImplementedError(
-                        "Goal predictor DiT training currently only supports image observations"
+                        "LBMDiTJoint training currently only supports image obs"
                     )
 
                 act = batch["action"].to(config.optimization.device)
-                act = act[:, : config.task.horizon, :]  # (B, horizon, act_dim)
+                act = act[:, : config.task.horizon, :]
+
+                optimality = _read_optimality(
+                    batch, batch_size, config.optimization.device,
+                )
 
             with timed("update", perf_times):
                 delta_t_scalar = warmup_scheduler(n_gradient_step)
-                batch_size = act.shape[0]
                 delta_t = torch.full(
-                    (batch_size,), delta_t_scalar, device=config.optimization.device
+                    (batch_size,),
+                    delta_t_scalar,
+                    device=config.optimization.device,
                 )
-                info = agent.update(act, obs, goal_obs, delta_t)
+                info = agent.update(act, obs, goal_obs, delta_t, optimality)
                 lr_scheduler.step()
 
             for k, v in info.items():
@@ -139,7 +157,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     info[k] = v.item()
             info_list.append(info)
 
-        # log metrics
         if ((n_gradient_step + 1) % config.log.log_freq) == 0:
             metrics = {
                 "step": n_gradient_step,
@@ -242,20 +259,18 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
 
 def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
-    """Evaluate the goal predictor DiT + frozen IDM as a coupled policy."""
+    """Evaluate the joint trunk as a closed-loop policy."""
     episode_rewards = []
     episode_steps = []
     episode_success = []
 
-    inference_times = {
-        "normalize": [],
-        "sample": [],
-        "unnormalize": [],
-        "env_step": [],
-    }
+    inference_times = {"normalize": [], "sample": [], "unnormalize": [], "env_step": []}
 
-    # Unwrap ConcatDataset to access primary dataset's normalizer
-    base_dataset = dataset.datasets[0] if isinstance(dataset, torch.utils.data.ConcatDataset) else dataset
+    base_dataset = (
+        dataset.datasets[0]
+        if isinstance(dataset, torch.utils.data.ConcatDataset)
+        else dataset
+    )
 
     for i in range(config.log.eval_episodes // config.task.num_envs):
         ep_reward = [0.0] * config.task.num_envs
@@ -277,12 +292,12 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
                             obs_k,
                             device=config.optimization.device,
                             dtype=torch.float32,
-                        )  # (num_envs, obs_steps, ...)
+                        )
                         obs_dict[k] = obs_k
                     obs = obs_dict
                 else:
                     raise NotImplementedError(
-                        "Goal predictor DiT eval currently only supports image observations"
+                        "LBMDiTJoint eval currently only supports image obs"
                     )
 
                 act_0 = torch.randn(
@@ -328,7 +343,8 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
 
     loguru.logger.info(
         f"Nstep: {num_steps} Mean step: {np.nanmean(episode_steps)} "
-        f"Mean reward: {np.nanmean(episode_rewards)} Mean success: {np.nanmean(episode_success)}"
+        f"Mean reward: {np.nanmean(episode_rewards)} "
+        f"Mean success: {np.nanmean(episode_success)}"
     )
 
     if inference_times["sample"]:
@@ -344,7 +360,6 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
         f"mean_reward_{num_steps}": np.nanmean(episode_rewards),
         f"mean_success_{num_steps}": np.nanmean(episode_success),
     }
-
     if inference_times["sample"]:
         metrics[f"perf/inference_normalize_ms_{num_steps}"] = (
             np.mean(inference_times["normalize"]) * 1000
@@ -358,13 +373,11 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
         metrics[f"perf/inference_env_step_ms_{num_steps}"] = (
             np.mean(inference_times["env_step"]) * 1000
         )
-
     return metrics
 
 
 @hydra.main(version_base=None, config_path="configs/", config_name="main")
 def main(config):
-    """Main pipeline for goal predictor DiT training."""
     os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
     if torch.cuda.is_available():
@@ -376,7 +389,6 @@ def main(config):
     logger = Logger(config)
     loguru.logger.info("Finished setting up logger")
 
-    # env setup
     envs = make_vec_env(config.task, seed=config.optimization.seed)
     obs, info = envs.reset()
     if config.task.obs_type == "image":
@@ -385,30 +397,36 @@ def main(config):
         config.task.obs_dim = obs.shape[-1]
     loguru.logger.info("Finished setting up env")
 
-    # Load normalizer from pretrained IDM to ensure consistent normalization
+    # Reuse IDM normalizer so action / obs scaling matches the pretrained encoder.
     import pickle
+
     idm_normalizer = None
     if config.optimization.idm_checkpoint_path:
         normalizer_path = os.path.join(
-            os.path.dirname(config.optimization.idm_checkpoint_path), "normalizer.pkl"
+            os.path.dirname(config.optimization.idm_checkpoint_path),
+            "normalizer.pkl",
         )
         if os.path.exists(normalizer_path):
             with open(normalizer_path, "rb") as f:
                 idm_normalizer = pickle.load(f)
             loguru.logger.info(f"Loaded IDM normalizer from {normalizer_path}")
         else:
-            loguru.logger.warning(f"IDM normalizer not found at {normalizer_path}, will compute new one")
+            loguru.logger.warning(
+                f"IDM normalizer not found at {normalizer_path}; computing fresh"
+            )
 
-    # dataset setup — uses IDM dataset with goal obs
     dataset = make_idm_dataset(config.task, normalizer=idm_normalizer)
     loguru.logger.info("Finished setting up IDM dataset")
 
-    agent = GoalPredictorDiTAgent(config)
+    agent = LBMDiTJointE2EAgent(config)
     resume_state = None
-
     if config.optimization.model_path and config.optimization.model_path != "None":
-        loguru.logger.info(f"Loading goal predictor DiT from {config.optimization.model_path}")
-        resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
+        loguru.logger.info(
+            f"Loading LBMDiTJointE2E from {config.optimization.model_path}"
+        )
+        resume_state = agent.load(
+            config.optimization.model_path, load_optimizer=True
+        )
 
     if config.mode == "train":
         train(config, envs, dataset, agent, logger, resume_state=resume_state)
@@ -417,11 +435,8 @@ def main(config):
         num_steps_list = get_default_step_list(config.optimization.loss_type)
         for num_steps in num_steps_list:
             metrics = {"step": num_steps}
-            metrics.update(
-                eval(config, envs, dataset, agent, logger, num_steps)
-            )
+            metrics.update(eval(config, envs, dataset, agent, logger, num_steps))
             logger.log(metrics, category="eval")
-
         for key, val in metrics.items():
             if "mean_success" in key:
                 loguru.logger.info(f"{key} - {val}")

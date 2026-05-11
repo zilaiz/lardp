@@ -1,9 +1,10 @@
-"""Training pipeline for DiT-based goal predictor through frozen IDM on robomimic dataset.
+"""Training pipeline for the deterministic goal-predictor regressor.
 
-Based on train_robomimic_goal_predictor.py. Key difference: instead of a simple MLP,
-we use a DiT-based flow matching model that generates goal embeddings via ODE,
-with an action flow matching loss through the frozen IDM using a one-step
-Euler-denoised goal embedding (x_t + (1 - t_flow) * v_pred).
+Mirrors ``train_robomimic_goal_predictor_dit.py`` exactly — same dataset,
+same eval loop, same inputs to ``agent.update`` — but instantiates a
+``GoalPredictorRegressorAgent`` (deterministic head) instead of the DiT
+flow-matching agent. The frozen IDM, normalizer and goal stats are loaded
+the same way.
 """
 
 import os
@@ -19,7 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 # Set MuJoCo rendering backend before importing any robomimic/mujoco modules
 os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 
-from mip.agent_goal_predictor_dit import GoalPredictorDiTAgent  # noqa: E402
+from mip.agent_goal_predictor_regressor import GoalPredictorRegressorAgent  # noqa: E402
 from mip.config import Config  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
 from mip.datasets.robomimic_dataset import make_idm_dataset  # noqa: E402
@@ -44,7 +45,7 @@ def timed(section: str, record_dict: dict):
 
 
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):
-    """Goal predictor DiT training function."""
+    """Goal predictor regressor training loop."""
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
@@ -61,6 +62,8 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
         T_max=config.optimization.gradient_steps,
     )
 
+    # Kept for interface parity with the DiT pipeline; the regressor itself
+    # has no time variable, so delta_t is not used inside the agent.
     warmup_scheduler = WarmupAnnealingScheduler(
         max_steps=config.optimization.gradient_steps,
         warmup_ratio=config.optimization.warmup_ratio,
@@ -100,7 +103,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                 from tensordict import TensorDict
 
                 if config.task.obs_type == "image":
-                    # Current obs: (B, To, ...)
                     obs_batch = batch["obs"]
                     obs_dict = {}
                     for k in obs_batch:
@@ -108,7 +110,6 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                             config.optimization.device
                         )
 
-                    # Goal obs: (B, 1, ...) — separate, for state flow target
                     goal_batch = batch["goal_obs"]
                     goal_dict = {}
                     for k in goal_batch:
@@ -119,17 +120,20 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     goal_obs = TensorDict(goal_dict, batch_size=batch_size)
                 else:
                     raise NotImplementedError(
-                        "Goal predictor DiT training currently only supports image observations"
+                        "Goal predictor regressor training currently only supports "
+                        "image observations"
                     )
 
                 act = batch["action"].to(config.optimization.device)
-                act = act[:, : config.task.horizon, :]  # (B, horizon, act_dim)
+                act = act[:, : config.task.horizon, :]
 
             with timed("update", perf_times):
                 delta_t_scalar = warmup_scheduler(n_gradient_step)
                 batch_size = act.shape[0]
                 delta_t = torch.full(
-                    (batch_size,), delta_t_scalar, device=config.optimization.device
+                    (batch_size,),
+                    delta_t_scalar,
+                    device=config.optimization.device,
                 )
                 info = agent.update(act, obs, goal_obs, delta_t)
                 lr_scheduler.step()
@@ -155,20 +159,21 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     metrics[key] = np.nan
 
             if perf_times["total_step"]:
+                window = config.log.log_freq
                 metrics["perf/data_load_ms"] = (
-                    np.mean(perf_times["data_load"][-config.log.log_freq :]) * 1000
+                    np.mean(perf_times["data_load"][-window:]) * 1000
                 )
                 metrics["perf/preprocess_ms"] = (
-                    np.mean(perf_times["preprocess"][-config.log.log_freq :]) * 1000
+                    np.mean(perf_times["preprocess"][-window:]) * 1000
                 )
                 metrics["perf/update_ms"] = (
-                    np.mean(perf_times["update"][-config.log.log_freq :]) * 1000
+                    np.mean(perf_times["update"][-window:]) * 1000
                 )
                 metrics["perf/total_step_ms"] = (
-                    np.mean(perf_times["total_step"][-config.log.log_freq :]) * 1000
+                    np.mean(perf_times["total_step"][-window:]) * 1000
                 )
                 metrics["perf/steps_per_sec"] = 1.0 / np.mean(
-                    perf_times["total_step"][-config.log.log_freq :]
+                    perf_times["total_step"][-window:]
                 )
 
             logger.log(metrics, category="train")
@@ -208,9 +213,10 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
                     logger.save_agent(agent=agent, identifier="best")
 
                     checkpoint_base_name = (
-                        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-                        f"{config.optimization.loss_type}_{config.network.network_type}_"
-                        f"{config.network.emb_dim}_seed{config.optimization.seed}"
+                        f"{config.task.env_name}_{config.task.env_type}_"
+                        f"{config.task.obs_type}_{config.optimization.loss_type}_"
+                        f"{config.network.network_type}_{config.network.emb_dim}_"
+                        f"seed{config.optimization.seed}"
                     )
                     training_state = {
                         "n_gradient_step": n_gradient_step,
@@ -242,7 +248,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
 
 def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
-    """Evaluate the goal predictor DiT + frozen IDM as a coupled policy."""
+    """Evaluate the regressor + frozen IDM as a coupled policy."""
     episode_rewards = []
     episode_steps = []
     episode_success = []
@@ -254,8 +260,11 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
         "env_step": [],
     }
 
-    # Unwrap ConcatDataset to access primary dataset's normalizer
-    base_dataset = dataset.datasets[0] if isinstance(dataset, torch.utils.data.ConcatDataset) else dataset
+    base_dataset = (
+        dataset.datasets[0]
+        if isinstance(dataset, torch.utils.data.ConcatDataset)
+        else dataset
+    )
 
     for i in range(config.log.eval_episodes // config.task.num_envs):
         ep_reward = [0.0] * config.task.num_envs
@@ -277,12 +286,12 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
                             obs_k,
                             device=config.optimization.device,
                             dtype=torch.float32,
-                        )  # (num_envs, obs_steps, ...)
+                        )
                         obs_dict[k] = obs_k
                     obs = obs_dict
                 else:
                     raise NotImplementedError(
-                        "Goal predictor DiT eval currently only supports image observations"
+                        "Goal predictor regressor eval currently only supports image obs"
                     )
 
                 act_0 = torch.randn(
@@ -328,12 +337,14 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
 
     loguru.logger.info(
         f"Nstep: {num_steps} Mean step: {np.nanmean(episode_steps)} "
-        f"Mean reward: {np.nanmean(episode_rewards)} Mean success: {np.nanmean(episode_success)}"
+        f"Mean reward: {np.nanmean(episode_rewards)} "
+        f"Mean success: {np.nanmean(episode_success)}"
     )
 
     if inference_times["sample"]:
         loguru.logger.info(
-            f"Inference perf - Normalize: {np.mean(inference_times['normalize']) * 1000:.2f}ms, "
+            f"Inference perf - "
+            f"Normalize: {np.mean(inference_times['normalize']) * 1000:.2f}ms, "
             f"Sample: {np.mean(inference_times['sample']) * 1000:.2f}ms, "
             f"Unnormalize: {np.mean(inference_times['unnormalize']) * 1000:.2f}ms, "
             f"Env step: {np.mean(inference_times['env_step']) * 1000:.2f}ms"
@@ -364,7 +375,7 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
 
 @hydra.main(version_base=None, config_path="configs/", config_name="main")
 def main(config):
-    """Main pipeline for goal predictor DiT training."""
+    """Main pipeline for goal-predictor regressor training."""
     os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 
     if torch.cuda.is_available():
@@ -376,7 +387,6 @@ def main(config):
     logger = Logger(config)
     loguru.logger.info("Finished setting up logger")
 
-    # env setup
     envs = make_vec_env(config.task, seed=config.optimization.seed)
     obs, info = envs.reset()
     if config.task.obs_type == "image":
@@ -385,29 +395,35 @@ def main(config):
         config.task.obs_dim = obs.shape[-1]
     loguru.logger.info("Finished setting up env")
 
-    # Load normalizer from pretrained IDM to ensure consistent normalization
+    # Load normalizer from pretrained IDM to ensure consistent normalization.
     import pickle
+
     idm_normalizer = None
     if config.optimization.idm_checkpoint_path:
         normalizer_path = os.path.join(
-            os.path.dirname(config.optimization.idm_checkpoint_path), "normalizer.pkl"
+            os.path.dirname(config.optimization.idm_checkpoint_path),
+            "normalizer.pkl",
         )
         if os.path.exists(normalizer_path):
             with open(normalizer_path, "rb") as f:
                 idm_normalizer = pickle.load(f)
             loguru.logger.info(f"Loaded IDM normalizer from {normalizer_path}")
         else:
-            loguru.logger.warning(f"IDM normalizer not found at {normalizer_path}, will compute new one")
+            loguru.logger.warning(
+                f"IDM normalizer not found at {normalizer_path}, "
+                "will compute new one"
+            )
 
-    # dataset setup — uses IDM dataset with goal obs
     dataset = make_idm_dataset(config.task, normalizer=idm_normalizer)
     loguru.logger.info("Finished setting up IDM dataset")
 
-    agent = GoalPredictorDiTAgent(config)
+    agent = GoalPredictorRegressorAgent(config)
     resume_state = None
 
     if config.optimization.model_path and config.optimization.model_path != "None":
-        loguru.logger.info(f"Loading goal predictor DiT from {config.optimization.model_path}")
+        loguru.logger.info(
+            f"Loading goal-predictor regressor from {config.optimization.model_path}"
+        )
         resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
 
     if config.mode == "train":
@@ -417,9 +433,7 @@ def main(config):
         num_steps_list = get_default_step_list(config.optimization.loss_type)
         for num_steps in num_steps_list:
             metrics = {"step": num_steps}
-            metrics.update(
-                eval(config, envs, dataset, agent, logger, num_steps)
-            )
+            metrics.update(eval(config, envs, dataset, agent, logger, num_steps))
             logger.log(metrics, category="eval")
 
         for key, val in metrics.items():

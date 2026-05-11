@@ -315,6 +315,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--n_time_samples", type=int, default=8, help="Random time samples for IDM action analysis")
+    parser.add_argument("--skip_action_quality", action="store_true", help="Skip Analysis 2 (IDM cond/uncond action quality)")
     parser.add_argument("--val_dataset_percentage", type=float, default=0.0, help="Fraction of demos held out as val (uses first (1-pct)*N demos)")
     parser.add_argument("--max_samples", type=int, default=None, help="Subsample dataset to at most N samples after loading")
     args = parser.parse_args()
@@ -354,17 +355,21 @@ def main():
         loguru.logger.info(f"  {k}: {v:.6f}")
 
     # --- Analysis 2: IDM conditional vs unconditional ---
-    loguru.logger.info("=" * 60)
-    loguru.logger.info("Analysis 2: IDM action quality (conditional vs unconditional)")
-    loguru.logger.info("=" * 60)
-    action_quality = analyze_idm_action_quality(
-        inner_encoder, flow_map, uncond_emb, dataset, device,
-        obs_steps=task_cfg.obs_steps, batch_size=args.batch_size,
-        n_time_samples=args.n_time_samples,
-    )
-    results["action_quality"] = action_quality
-    for k, v in action_quality.items():
-        loguru.logger.info(f"  {k}: {v:.6f}")
+    if args.skip_action_quality:
+        loguru.logger.info("Skipping Analysis 2 (--skip_action_quality)")
+        action_quality = {}
+    else:
+        loguru.logger.info("=" * 60)
+        loguru.logger.info("Analysis 2: IDM action quality (conditional vs unconditional)")
+        loguru.logger.info("=" * 60)
+        action_quality = analyze_idm_action_quality(
+            inner_encoder, flow_map, uncond_emb, dataset, device,
+            obs_steps=task_cfg.obs_steps, batch_size=args.batch_size,
+            n_time_samples=args.n_time_samples,
+        )
+        results["action_quality"] = action_quality
+        for k, v in action_quality.items():
+            loguru.logger.info(f"  {k}: {v:.6f}")
 
     # --- Summary ---
     loguru.logger.info("=" * 60)

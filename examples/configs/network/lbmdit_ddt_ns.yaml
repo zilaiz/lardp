@@ -1,0 +1,30 @@
+# @package network
+# Action-only DDT policy trunk paired with the noise-shift loss/sampler
+# (``flow_ns`` + ``ode_ns_sampler``). Encoder/decoder width split, global
+# AdaLN cond, single flow time. Drop-in replacement for ``lbmdit`` at the
+# trunk layer; the noise-shift is gated by the loss type, so leaving
+# ``policy_t_shift=1.0`` + ``policy_t_dist=uniform`` recovers a plain
+# DDT policy.
+defaults:
+  - _base
+  - _self_
+
+network_type: "lbmdit_ddt"
+emb_dim: 256                # default d_model_enc when policy_ddt_d_model_enc is null
+num_layers: 6               # unused by DDT trunk; depths set below
+dropout: 0.0
+timestep_emb_dim: 128       # general default; trunk uses policy_ddt_timestep_emb_dim if non-null
+encoder_out_dim: 256        # encoder output dim (= obs_dim fed to network)
+
+# DDT-specific knobs
+policy_ddt_enc_depth: 4
+policy_ddt_dec_depth: 2
+policy_ddt_d_model_enc: 256
+policy_ddt_d_model_dec: 512  # shallow wide head
+policy_ddt_n_heads_enc: 8
+policy_ddt_n_heads_dec: 8
+policy_ddt_timestep_emb_dim: 128
+
+# General DiT knobs (kept for compatibility; not consumed by DDT trunk)
+n_heads: 8
+timestep_emb_type: "positional"

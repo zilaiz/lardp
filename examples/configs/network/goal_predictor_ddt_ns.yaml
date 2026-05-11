@@ -1,0 +1,17 @@
+# @package network
+# Goal predictor DDT-NS: encoder/decoder-width-split DDT trunk, paired with
+# the noise-shift agent (SD3 time shift + configurable base-t distribution).
+# Inherits from lbmidm_v2 so the IDM checkpoint shape matches the v2 IDM.
+defaults:
+  - lbmidm_v2
+  - _self_
+
+# Goal predictor DDT-NS architecture
+goal_ddt_enc_depth: 4
+goal_ddt_dec_depth: 2
+goal_ddt_d_model_enc: null    # null = use emb_dim
+goal_ddt_d_model_dec: 1024
+goal_ddt_n_heads_enc: 8
+goal_ddt_n_heads_dec: 8
+goal_ddt_dropout: 0.0
+goal_ddt_timestep_emb_dim: 256  # null = use d_model_enc
