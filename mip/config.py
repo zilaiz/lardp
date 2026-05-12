@@ -154,6 +154,14 @@ class OptimizationConfig:
     # Whether the encoder loaded from idm_checkpoint_path is frozen (default) or
     # fine-tuned alongside the joint trunk.
     joint_freeze_encoder: bool = True
+    # DP-pretrained encoder source (LBMDiTJointDDTFrozenDPAgent variant).
+    # Path to a pretrained LBMDiT/DP checkpoint whose encoder weights will be
+    # loaded into the joint trunk's obs encoder instead of an IDM-pretrained
+    # one. Mutually exclusive with idm_checkpoint_path for that agent.
+    dp_checkpoint_path: str | None = None
+    # If True, load weights from ``encoder_ema`` rather than ``encoder`` —
+    # the smoother choice for downstream feature use. Defaults to True.
+    dp_use_encoder_ema: bool = True
     # E2E variant only (LBMDiTJointE2EAgent): whether the target LayerNorm
     # has learnable gamma/beta. Default False removes the gamma->0 collapse
     # mode; flip to True for the UNITE-faithful variant (encoder gets more
