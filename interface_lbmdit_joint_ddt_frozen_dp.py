@@ -1,24 +1,22 @@
-"""Policy inference server for the lardp Franka LBMDiTJointDDTFrozen policy.
+"""Policy inference server for the lardp Franka LBMDiTJointDDTFrozenDP policy.
 
-Mirrors ``interface_goal_predictor.py`` (which serves a goal-predictor DiT)
-but loads ``LBMDiTJointDDTFrozenAgent``. Same Flask endpoints (``/predict``,
-``/reset``, ``/health``) and same wire format, so the existing
-``PolicyClient`` on the controller side works unchanged.
+Sibling of ``interface_lbmdit_joint_ddt_frozen.py``. Same Flask endpoints
+(``/predict``, ``/reset``, ``/health``), same wire format, same joint Euler
+ODE sampler — the only difference is the **encoder source**:
 
-What's different vs interface_goal_predictor.py:
-  - Loads ``LBMDiTJointDDTFrozenAgent`` (frozen IDM encoder + trainable
-    joint DDT trunk over (next_state_embedding, action_chunk)).
-  - Single ``sample`` call drives a joint Euler ODE that walks
-    ``(t_state, t_action)`` along the configured schedule and returns the
-    action chunk. The state stream is sampled internally and discarded by
-    ``agent.sample``.
-  - Exposes the joint-trunk inference knobs as CLI args so a deployed
-    checkpoint can be re-served with a different sampling recipe (steps,
-    mode, schedule, t-shift, CFG) without retraining.
-  - Normalizer is the same ``normalizer.pkl`` saved by IDM training —
-    reused so action/obs scaling matches the pretrained encoder.
+  - This file loads ``LBMDiTJointDDTFrozenDPAgent``, whose encoder comes
+    from a pretrained LBMDiT (behavior-cloning DP) checkpoint via
+    ``optimization.dp_checkpoint_path``. The DP checkpoint stores
+    ``encoder`` and ``encoder_ema`` as separate top-level keys; the agent
+    picks one based on ``optimization.dp_use_encoder_ema`` (default True).
+  - The data normalizer is NOT typically saved next to the LBMDiT
+    checkpoint. ``--normalizer_path`` is still required at deploy time;
+    point it at any compatible ``normalizer.pkl`` (sibling of a sister IDM
+    run on the same dataset, or one exported from the dataset). Picking a
+    normalizer trained on the *same* HDF5 keeps obs/action scaling
+    consistent with what the encoder saw at LBMDiT training time.
 
-Inference knobs (all optional; if omitted, the saved hydra config is used):
+Inference knobs (all optional; defaults come from the saved hydra config):
   --joint_num_steps        ODE steps for the joint sampler.
   --joint_sample_mode      "stochastic" | "zero" — initial action stream.
   --joint_t_schedule       "diagonal" | "state_first" | "pyramid" |
@@ -32,16 +30,19 @@ Inference knobs (all optional; if omitted, the saved hydra config is used):
   --joint_t_shift_action   SD3-style time shift for the action stream.
   --joint_cfg_scale        CFG strength w; v_guided = (1+w)v_cond - w v_uncond.
                            0 = plain conditional sampling.
-  --idm_checkpoint_path    Override optimization.idm_checkpoint_path.
+  --dp_checkpoint_path     Override optimization.dp_checkpoint_path
+                           (location of the LBMDiT/DP encoder).
+  --dp_use_encoder_ema     Override optimization.dp_use_encoder_ema
+                           (true -> load encoder_ema, false -> encoder).
   --goal_stats_path        Override optimization.goal_stats_path.
   --act_steps              Override task.act_steps for the executable slice.
 
 Usage
 -----
-    python interface_lbmdit_joint_ddt_frozen.py \\
+    python interface_lbmdit_joint_ddt_frozen_dp.py \\
         --ckpt_path        logs/<exp>/<ts>/models/model_latest.pt \\
         --config_path      outputs/<date>/<time>/.hydra/config.yaml \\
-        --normalizer_path  <idm>/normalizer.pkl \\
+        --normalizer_path  <some>/normalizer.pkl \\
         --joint_num_steps  5 \\
         --joint_t_schedule diagonal \\
         --port 5000
@@ -66,14 +67,14 @@ LARDP_PATH = "/path/to/lardp"
 if LARDP_PATH not in sys.path:
     sys.path.append(LARDP_PATH)
 
-from mip.agent_lbmdit_joint_ddt_frozen import LBMDiTJointDDTFrozenAgent
+from mip.agent_lbmdit_joint_ddt_frozen_dp import LBMDiTJointDDTFrozenDPAgent
 from mip.dataset_utils import dict_apply
 from mip.franka_inference import decode_action
 
 app = Flask(__name__)
 
 # Globals populated by `initialize_policy`
-agent: LBMDiTJointDDTFrozenAgent | None = None
+agent: LBMDiTJointDDTFrozenDPAgent | None = None
 config = None
 device: torch.device | None = None
 normalizer: dict | None = None
@@ -85,14 +86,16 @@ _save_obs_count: int = 0
 
 
 # ---------------------------------------------------------------------------
-# Normalizer loading (pickle from IDM training)
+# Normalizer loading (pickle)
 # ---------------------------------------------------------------------------
 def _load_normalizer_from_pickle(path: str) -> dict:
-    """Load the IDM normalizer (sibling of the IDM ckpt).
+    """Load the data normalizer.
 
     Format: ``{"obs": {key: Normalizer}, "action": Normalizer}`` where the
     per-key normalizers are ``MinMaxNormalizer`` (low-dim) or
-    ``ImageNormalizer`` (rgb).
+    ``ImageNormalizer`` (rgb). Source can be any sibling run on the same
+    dataset (IDM run or a dedicated export); pick one matching the HDF5 the
+    DP encoder was trained on.
     """
     with open(path, "rb") as f:
         norm = pickle.load(f)
@@ -109,7 +112,8 @@ def initialize_policy(
     ckpt_path: str,
     config_path: str,
     normalizer_path: str,
-    idm_checkpoint_path: str | None = None,
+    dp_checkpoint_path: str | None = None,
+    dp_use_encoder_ema: bool | None = None,
     goal_stats_path: str | None = None,
     joint_num_steps: int | None = None,
     joint_sample_mode: str | None = None,
@@ -121,22 +125,27 @@ def initialize_policy(
     joint_cfg_scale: float | None = None,
     act_steps: int | None = None,
 ):
-    """Build the joint-DDT-frozen agent, load the trunk ckpt + normalizer.
+    """Build the joint-DDT-DP-frozen agent, load the trunk ckpt + normalizer.
 
     Hydra overrides are applied BEFORE constructing the agent so the agent's
     internal scalar caches (``_num_steps``, ``_sample_mode``, ``_t_schedule``,
     ``_shift_state``/``_shift_action``, ``_cfg_scale``, ...) pick up the
-    new values. Order matters: the agent reads these once in ``__init__``.
+    new values. Same goes for ``dp_checkpoint_path`` / ``dp_use_encoder_ema``
+    — the agent reads them once in ``__init__`` to load the frozen encoder.
     """
     global agent, config, device, normalizer
 
     print(f"Loading hydra config: {config_path}")
     cfg = OmegaConf.load(config_path)
 
-    # Optional reference-path overrides for the frozen IDM + offline goal stats.
-    if idm_checkpoint_path is not None:
-        OmegaConf.update(cfg, "optimization.idm_checkpoint_path",
-                         idm_checkpoint_path, merge=False)
+    # Optional reference-path overrides for the frozen DP encoder + offline
+    # goal stats.
+    if dp_checkpoint_path is not None:
+        OmegaConf.update(cfg, "optimization.dp_checkpoint_path",
+                         dp_checkpoint_path, merge=False)
+    if dp_use_encoder_ema is not None:
+        OmegaConf.update(cfg, "optimization.dp_use_encoder_ema",
+                         bool(dp_use_encoder_ema), merge=False)
     if goal_stats_path is not None:
         OmegaConf.update(cfg, "optimization.goal_stats_path",
                          goal_stats_path, merge=False)
@@ -189,23 +198,24 @@ def initialize_policy(
         f"shift_state: {cfg.optimization.joint_t_shift_state} | "
         f"shift_action: {cfg.optimization.joint_t_shift_action} | "
         f"cfg_scale: {cfg.optimization.joint_cfg_scale} | "
+        f"dp_use_encoder_ema: {cfg.optimization.dp_use_encoder_ema} | "
         f"horizon: {cfg.task.horizon} | obs_steps: {cfg.task.obs_steps} | "
         f"act_steps: {cfg.task.act_steps}"
     )
 
     print(
-        f"Building LBMDiTJointDDTFrozenAgent({cfg.network.network_type}, "
+        f"Building LBMDiTJointDDTFrozenDPAgent({cfg.network.network_type}, "
         f"enc_hidden={cfg.network.joint_ddt_d_model_enc}, "
         f"dec_hidden={cfg.network.joint_ddt_d_model_dec}) — "
-        f"loads frozen IDM internally..."
+        f"loads frozen LBMDiT (DP) encoder internally..."
     )
-    agent = LBMDiTJointDDTFrozenAgent(cfg)
+    agent = LBMDiTJointDDTFrozenDPAgent(cfg)
 
     print(f"Loading joint trunk checkpoint: {ckpt_path}")
     agent.load(ckpt_path, load_optimizer=False)
     agent.eval()
 
-    print(f"Loading IDM normalizer (pickle): {normalizer_path}")
+    print(f"Loading data normalizer (pickle): {normalizer_path}")
     normalizer = _load_normalizer_from_pickle(normalizer_path)
 
     print("Policy initialized successfully")
@@ -372,9 +382,8 @@ def predict():
                     lambda x: torch.from_numpy(x).unsqueeze(0).unsqueeze(1).to(device),
                 )
 
-            # Initial action noise. The agent draws state noise internally
-            # (no `state_0` is needed); `_sample_mode` controls whether it's
-            # stochastic or zero.
+            # Initial action noise. State noise is drawn internally; the
+            # `_sample_mode` cache decides stochastic vs zero for both streams.
             act_0 = torch.randn(
                 (1, config.task.horizon, config.task.act_dim),
                 device=device,
@@ -384,8 +393,6 @@ def predict():
             t_to_gpu = time.time() - t0
 
             t0 = time.time()
-            # Pass num_steps explicitly so it composes with whatever was set
-            # at agent build time (the agent default is `_num_steps` from cfg).
             act_normed = agent.sample(
                 act_0=act_0,
                 obs=obs_torch,
@@ -441,7 +448,7 @@ def predict():
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    """No-op: joint-DDT-frozen policy is stateless across calls."""
+    """No-op: joint-DDT-DP-frozen policy is stateless across calls."""
     if agent is None:
         return jsonify({"error": "Policy not initialized"}), 500
     return jsonify({"status": "success"})
@@ -461,17 +468,23 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", type=str, required=True,
-                        help="Path to LBMDiTJointDDTFrozenAgent checkpoint (.pt)")
+                        help="Path to LBMDiTJointDDTFrozenDPAgent checkpoint (.pt)")
     parser.add_argument("--config_path", type=str, required=True,
                         help="Path to .hydra/config.yaml from the training run")
     parser.add_argument("--normalizer_path", type=str, required=True,
-                        help="Path to normalizer.pkl saved by IDM training "
-                             "(usually a sibling of the IDM checkpoint)")
+                        help="Path to a normalizer.pkl compatible with the "
+                             "dataset the LBMDiT encoder was trained on")
 
-    # Reference paths (frozen IDM + offline goal stats). Default to the values
-    # baked into the training-time hydra config.
-    parser.add_argument("--idm_checkpoint_path", type=str, default=None,
-                        help="Override optimization.idm_checkpoint_path")
+    # Reference paths (frozen LBMDiT/DP encoder + offline goal stats).
+    # Default to the values baked into the training-time hydra config.
+    parser.add_argument("--dp_checkpoint_path", type=str, default=None,
+                        help="Override optimization.dp_checkpoint_path "
+                             "(location of the pretrained LBMDiT encoder)")
+    parser.add_argument("--dp_use_encoder_ema",
+                        action=argparse.BooleanOptionalAction, default=None,
+                        help="Override optimization.dp_use_encoder_ema "
+                             "(true -> load 'encoder_ema' from the DP "
+                             "checkpoint; false -> load 'encoder')")
     parser.add_argument("--goal_stats_path", type=str, default=None,
                         help="Override optimization.goal_stats_path")
 
@@ -523,7 +536,8 @@ if __name__ == "__main__":
         ckpt_path=args.ckpt_path,
         config_path=args.config_path,
         normalizer_path=args.normalizer_path,
-        idm_checkpoint_path=args.idm_checkpoint_path,
+        dp_checkpoint_path=args.dp_checkpoint_path,
+        dp_use_encoder_ema=args.dp_use_encoder_ema,
         goal_stats_path=args.goal_stats_path,
         joint_num_steps=args.joint_num_steps,
         joint_sample_mode=args.joint_sample_mode,

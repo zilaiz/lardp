@@ -79,6 +79,7 @@ class OptimizationConfig:
     action_reg_t_weighting: str = "linear"  # per-sample weighting of action loss by t_flow: "none" | "linear"
     action_reg_num_steps: int = 1  # K Euler steps from x_t -> g_hat for action_reg_loss; 1 = original one-step shortcut
     goal_stats_path: str | None = None  # path to precomputed goal normalization stats (.pt)
+    delta_stats_path: str | None = None  # path to precomputed delta (= z_goal - z_last_obs) stats (.pt) for the delta predictor
     # Goal predictor DDT-NS (noise-shift) variant only. SD3-style time shift on
     # the single goal flow time, plus a configurable base-t distribution and
     # endpoint clamp. Identity defaults so leaving them untouched recovers the
@@ -154,6 +155,13 @@ class OptimizationConfig:
     # Whether the encoder loaded from idm_checkpoint_path is frozen (default) or
     # fine-tuned alongside the joint trunk.
     joint_freeze_encoder: bool = True
+    # LBMDiTJointDDTFrozenAgent variant: if True, the input/conditioning encoder
+    # is initialized from the IDM checkpoint and fine-tuned alongside the joint
+    # trunk, while a second *frozen* copy of the encoder (snapshot of the same
+    # IDM weights) is used to compute the next-state embedding target. This
+    # gives the input pathway gradient flow without making the FM target a
+    # moving target. Overrides ``joint_freeze_encoder`` when True.
+    joint_finetune_input_encoder: bool = False
     # DP-pretrained encoder source (LBMDiTJointDDTFrozenDPAgent variant).
     # Path to a pretrained LBMDiT/DP checkpoint whose encoder weights will be
     # loaded into the joint trunk's obs encoder instead of an IDM-pretrained
@@ -176,6 +184,24 @@ class OptimizationConfig:
     # < 1``; otherwise falls through to the live encoder. Default False
     # preserves baseline behavior (target from live encoder).
     joint_use_ema_target: bool = False
+    # E2E/DDT variant only: if False, block state_loss gradients from
+    # reaching the encoder and target_ln by running a second trunk forward
+    # pass with z_t.detach() to produce v_state. action_loss still flows
+    # into the encoder via the live z_t forward used for v_action. Costs
+    # ~2x trunk compute. Motivation: state_loss creates a self-distillation
+    # loop on the shared representation (encoder is both the source of
+    # the regression target and the conditioning input), which can fight
+    # action_loss and destabilize encoder training. Default True preserves
+    # baseline behavior (single forward, state_loss shapes encoder).
+    joint_state_loss_to_encoder: bool = True
+    # Mixed-data sampling (joint pipeline, expert + IDM rollouts):
+    # Target fraction of each training batch drawn from the expert (primary)
+    # dataset; rollouts get (1 - fraction). Implemented via WeightedRandomSampler
+    # over the ConcatDataset, so the natural size imbalance between expert and
+    # rollouts doesn't dilute expert-conditional updates. None disables the
+    # reweighting (falls back to uniform shuffle = natural proportions). No-op
+    # when the dataset is a single source (no rollouts).
+    expert_sample_fraction: float | None = 0.5
     # DDT/decoupled-time variant only (LBMDiTJointDDTAgent):
     # If True, sample independent t_state and t_action per batch during
     # training (DF-style decoupled noising). If False, the same scalar t
@@ -186,6 +212,9 @@ class OptimizationConfig:
     #   "state_first": clean state first (t_state ramps 0->1 in first half),
     #                  then clean action (t_action ramps 0->1 in second half).
     #   "pyramid":     t_state leads t_action by a fixed offset throughout.
+    #   "action_only": t_state pinned at eps; only action walks. Ablation
+    #                  for the value of joint state denoising; requires
+    #                  joint_sample_mode == "stochastic" to stay in-dist.
     joint_t_schedule: str = "diagonal"
     # Pyramid offset (only used when joint_t_schedule == "pyramid"). Positive
     # value means t_state advances ahead of t_action by this much (fraction

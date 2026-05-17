@@ -17,11 +17,9 @@ def get_default_step_list(loss_type: str):
     if loss_type in ["flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_reg", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "flow_ns", "ctm", "lmd", "psd", "lsd", "esd", "mf", "goal_predictor", "goal_predictor_dit"]:
         return 3 ** np.arange(2, -1, -1)
     elif loss_type == "joint_dit":
-        # Joint state+action DiT (LBMDiTJoint / LBMDiTJointDDT) — denser NFE
-        # ladder since the joint trunk benefits from finer integration on
-        # the state stream. Descending so num_steps_list[0]=50 is the
-        # primary best-model metric.
-        return np.array([50, 25, 10])
+        # Joint state+action DiT (LBMDiTJoint / LBMDiTJointDDT).
+        # num_steps_list[0]=25 is the primary best-model metric.
+        return np.array([25, 10])
     elif loss_type in ["regression", "mip", "tsd"]:
         return [1]
     else:

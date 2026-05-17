@@ -1,22 +1,22 @@
-"""Franka LBMDiTJointDDTFrozen training pipeline (real-robot, no sim env).
+"""Franka LBMDiTJointDDT training pipeline (real-robot, no sim env).
 
 DDT-trunk joint flow matching over (next_state_embedding, action_chunk) with
-a frozen IDM-pretrained encoder. Mirrors examples/train_franka_goal_predictor_dit.py
-in dataset/eval plumbing but swaps in ``LBMDiTJointDDTFrozenAgent``:
+an **end-to-end** trainable image encoder (optionally warm-started from an
+IDM checkpoint). Mirrors examples/train_franka_lbmdit_joint_ddt_frozen.py in
+dataset/eval plumbing but swaps the frozen-encoder + offline goal-stats path
+for ``LBMDiTJointDDTAgent``:
 
-- Loads the IDM dataset (with goal_obs) from one or more HDF5 files via
-  ``make_idm_dataset``. The first path is tagged expert (optimality=0), the
-  rest play (optimality=1) — the agent's CFG-aware update consumes this.
-- Loads a frozen IDM checkpoint (``optimization.idm_checkpoint_path``). The
-  IDM normalizer (saved alongside the checkpoint as ``normalizer.pkl``) is
-  reused so the policy sees the same scale the IDM was trained on.
-- Offline goal-stats z-scoring of the FM state target via
-  ``optimization.goal_stats_path``.
+- Encoder is trainable; a learnable ``target_ln`` normalizes the FM state
+  target (replacing the offline ``goal_stats_path``).
+- Optional EMA target encoder + EMA target_ln (``joint_use_ema_target``)
+  stabilizes the regression target as the live encoder evolves.
+- Stop-grad on the FM target side blocks the encoder from receiving a
+  shortcut gradient through the target.
 - Decoupled t_state / t_action and the (t_state, t_action) inference
-  schedule from the agent are exposed straight through optimization config.
-- No simulator, no rollout eval. Inline eval is replaced with periodic val
-  loss (state FM loss + action FM loss) on the held-out primary HDF5's val
-  split, computed against the EMA trunk.
+  schedule are exposed straight through optimization config.
+- No simulator, no rollout eval. Inline eval is periodic val loss
+  (state FM loss + action FM loss) on the held-out primary HDF5's val
+  split, computed against the EMA stack.
 """
 
 import os
@@ -31,7 +31,7 @@ import torch
 from tensordict import TensorDict
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from mip.agent_lbmdit_joint_ddt_frozen import LBMDiTJointDDTFrozenAgent
+from mip.agent_lbmdit_joint_ddt import LBMDiTJointDDTAgent
 from mip.config import Config
 from mip.dataset_utils import loop_dataloader, make_expert_weighted_sampler
 from mip.datasets.robomimic_dataset import RobomimicImageIDMDataset, make_idm_dataset
@@ -76,8 +76,7 @@ def _read_optimality(batch: dict, batch_size: int, device) -> torch.Tensor:
     """Per-sample optimality labels in {0=expert, 1=null/play}.
 
     ``make_idm_dataset`` tags samples per source path: primary -> 0, additional
-    paths -> 1. Older datasets without the field fall back to null/play (the
-    safer default; matches the agent's own None-handling).
+    paths -> 1. Older datasets without the field fall back to null/play.
     """
     if "optimality" in batch:
         return batch["optimality"].to(device=device, dtype=torch.long)
@@ -88,21 +87,23 @@ def _read_optimality(batch: dict, batch_size: int, device) -> torch.Tensor:
 
 @torch.no_grad()
 def compute_val_loss(
-    agent: LBMDiTJointDDTFrozenAgent,
+    agent: LBMDiTJointDDTAgent,
     val_loader: torch.utils.data.DataLoader,
     config: Config,
     max_batches: int = 50,
 ) -> dict[str, float]:
-    """State + action FM loss on the val set, against the EMA trunk.
+    """State + action FM loss on the val set, against the EMA stack.
 
-    Mirrors the agent's ``update`` path (encoder forward, target z-scoring,
-    decoupled t sampling, interpolant, per-stream loss) but runs no_grad on
-    ``net_ema``. Optimality labels come from the dataset.
+    Mirrors the agent's ``update`` path (encoder forward, target_ln, decoupled
+    t sampling, interpolant, per-stream loss) but runs no_grad against the
+    EMA trunk + EMA encoder + EMA target_ln (falls back to live modules when
+    EMA is not actively tracked, i.e. ``ema_rate >= 1``).
     """
     agent.eval()
     cfg = config.optimization
     device = cfg.device
     net = agent.net_ema
+    encoder, target_ln = agent._eval_encoder_modules(use_ema=True)
 
     state_losses: list[float] = []
     action_losses: list[float] = []
@@ -115,9 +116,8 @@ def compute_val_loss(
         B = act.shape[0]
         optimality = _read_optimality(batch, B, device)
 
-        z_t = agent.encoder(obs, None)
-        z_goal_raw = agent.encoder(goal_obs, None)
-        target = agent._normalize_goal(z_goal_raw)
+        z_t = target_ln(encoder(obs, None))
+        target = target_ln(encoder(goal_obs, None))
 
         eps = agent._t_eps
         lo, hi = eps, 1.0 - eps
@@ -164,7 +164,7 @@ def train(
     config: Config,
     dataset,
     val_dataset,
-    agent: LBMDiTJointDDTFrozenAgent,
+    agent: LBMDiTJointDDTAgent,
     logger: Logger,
     resume_state: dict | None = None,
 ):
@@ -298,23 +298,28 @@ def main(config: Config):
         config.task.obs_dim = config.network.emb_dim
     else:
         raise NotImplementedError(
-            "Franka LBMDiTJointDDTFrozen training only supports image obs"
+            "Franka LBMDiTJointDDT training only supports image obs"
         )
 
+    # Optional IDM warm-start. When provided, also reuse the IDM normalizer
+    # so observations/actions match the encoder's training scale. When None,
+    # the encoder trains from scratch and a fresh normalizer is computed.
     idm_path = config.optimization.idm_checkpoint_path
-    if idm_path is None:
-        raise ValueError(
-            "optimization.idm_checkpoint_path must be set for joint DDT frozen training"
-        )
     idm_normalizer = None
-    normalizer_path = os.path.join(os.path.dirname(idm_path), "normalizer.pkl")
-    if os.path.exists(normalizer_path):
-        with open(normalizer_path, "rb") as f:
-            idm_normalizer = pickle.load(f)
-        loguru.logger.info(f"Loaded IDM normalizer from {normalizer_path}")
+    if idm_path is not None and idm_path != "None" and idm_path != "null":
+        normalizer_path = os.path.join(os.path.dirname(idm_path), "normalizer.pkl")
+        if os.path.exists(normalizer_path):
+            with open(normalizer_path, "rb") as f:
+                idm_normalizer = pickle.load(f)
+            loguru.logger.info(f"Loaded IDM normalizer from {normalizer_path}")
+        else:
+            loguru.logger.warning(
+                f"IDM normalizer not found at {normalizer_path}; computing a fresh one"
+            )
     else:
-        loguru.logger.warning(
-            f"IDM normalizer not found at {normalizer_path}; computing a fresh one"
+        loguru.logger.info(
+            "No idm_checkpoint_path — encoder trains from scratch with a "
+            "freshly computed normalizer"
         )
 
     dataset = make_idm_dataset(config.task, mode="train", normalizer=idm_normalizer)
@@ -347,11 +352,11 @@ def main(config: Config):
         )
         loguru.logger.info(f"Val IDM dataset: {len(val_dataset)} samples")
 
-    agent = LBMDiTJointDDTFrozenAgent(config)
+    agent = LBMDiTJointDDTAgent(config)
     resume_state = None
     if config.optimization.model_path and config.optimization.model_path != "None":
         loguru.logger.info(
-            f"Loading LBMDiTJointDDTFrozen from {config.optimization.model_path}"
+            f"Loading LBMDiTJointDDT from {config.optimization.model_path}"
         )
         resume_state = agent.load(
             config.optimization.model_path, load_optimizer=True,
@@ -361,7 +366,7 @@ def main(config: Config):
         train(config, dataset, val_dataset, agent, logger, resume_state=resume_state)
     else:
         raise ValueError(
-            f"Franka joint DDT frozen pipeline only supports mode='train' "
+            f"Franka joint DDT pipeline only supports mode='train' "
             f"(got {config.mode!r})"
         )
 

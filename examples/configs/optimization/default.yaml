@@ -59,6 +59,7 @@ action_reg_weight: 1.0
 action_reg_t_weighting: linear  # per-sample t-weighting of action loss: "none" | "linear"
 action_reg_num_steps: 1         # K Euler steps from x_t -> g_hat for action_reg_loss; 1 = original one-step shortcut
 goal_stats_path: null
+delta_stats_path: null         # path to precomputed delta (= z_goal - z_last_obs) stats for the delta predictor
 
 # Goal predictor DDT-NS (noise-shift) variant only. Identity defaults so
 # leaving them untouched recovers the plain GP behavior.
@@ -123,6 +124,11 @@ joint_sample_mode: "stochastic"  # "stochastic" | "zero"
 joint_num_steps: 5
 # Whether to freeze the IDM-pretrained encoder during joint training.
 joint_freeze_encoder: true
+# LBMDiTJointDDTFrozenAgent only: if true, the input/conditioning encoder is
+# initialized from idm_checkpoint_path and fine-tuned alongside the trunk,
+# while a separate frozen snapshot of the same IDM weights computes the FM
+# state target. Overrides joint_freeze_encoder when true.
+joint_finetune_input_encoder: false
 # DP-pretrained encoder source (LBMDiTJointDDTFrozenDPAgent variant). Path
 # to a pretrained LBMDiT (DP) checkpoint whose encoder weights will be
 # loaded into the joint trunk. Mutually exclusive with idm_checkpoint_path
@@ -140,6 +146,18 @@ joint_target_ln_affine: false
 # Reuses ema_rate above. Active only when ema_rate < 1. Default false
 # preserves baseline behavior (target from live encoder).
 joint_use_ema_target: false
+# If false, block state_loss gradients from reaching the encoder + target_ln
+# by running a second trunk forward with z_t.detach() for v_state. action_loss
+# still flows into the encoder via the live z_t forward used for v_action.
+# Costs ~2x trunk compute. Default true preserves baseline behavior.
+joint_state_loss_to_encoder: true
+# Mixed-data sampling (expert + IDM rollouts): target fraction of each
+# training batch drawn from the expert (primary) dataset. Implemented via
+# WeightedRandomSampler over the ConcatDataset so the natural size imbalance
+# between expert and rollouts doesn't dilute expert-conditional updates.
+# null disables the reweighting (uniform shuffle = natural proportions).
+# No-op when the dataset is a single source (no rollouts).
+expert_sample_fraction: 0.5
 # DDT/decoupled-time variant only (LBMDiTJointDDTAgent) ------------------
 # If true, sample independent t_state and t_action per batch (DF-style
 # decoupled noising). If false, share a single t between streams (recovers
@@ -149,6 +167,10 @@ joint_decouple_t: true
 #   "diagonal":    t_state == t_action at every step (single Euler walk).
 #   "state_first": clean state in first half, then clean action.
 #   "pyramid":     t_state leads t_action by a fixed offset throughout.
+#   "action_only": t_state pinned at eps; only action walks. Ablation for
+#                  the value of joint state denoising; pair with
+#                  joint_sample_mode == "stochastic" so x_state inits to
+#                  randn (in-distribution for the trunk at t_state ≈ eps).
 joint_t_schedule: "diagonal"
 # Pyramid offset (used only when joint_t_schedule == "pyramid").
 joint_pyramid_offset: 0.2

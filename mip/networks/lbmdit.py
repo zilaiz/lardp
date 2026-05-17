@@ -567,6 +567,39 @@ class LBMDiTIDMv2(BaseNetwork):
         return self.fdm_head(torch.cat([obs_summary, action_emb], dim=-1))
 
 
+class LBMDiTIDMv2Delta(LBMDiTIDMv2):
+    """Delta-cond variant of LBMDiTIDMv2.
+
+    Architecture is identical to ``LBMDiTIDMv2`` (same parameter names and
+    shapes), so checkpoints are interchangeable at the ``load_state_dict``
+    level. The only behavioral difference is the third slot of the AdaLN
+    conditioning vector:
+
+        v2       cond_vec = concat(time_emb, obs_summary, goal_emb)
+        v2-delta cond_vec = concat(time_emb, obs_summary, goal_emb - last_obs_emb)
+
+    The FDM head's output is interpreted as the predicted *delta*
+    ``z_goal − z_last_obs`` rather than the absolute goal embedding. The
+    network itself doesn't enforce this — it's a contract with the agent,
+    which must compute the FDM target accordingly.
+
+    ``forward_with_summary`` callers (e.g., retrieval pipelines) must pass
+    the *delta* embedding as the ``goal_emb`` argument; the kwarg name is
+    kept for interface compatibility.
+    """
+
+    def _summarize(self, condition: Tensor) -> tuple[Tensor, Tensor]:
+        """Return (obs_summary, goal_delta).
+
+        ``goal_delta = z_goal − z_last_obs`` is the displacement from the
+        most recent observation embedding to the goal embedding.
+        """
+        obs_summary, goal_emb = super()._summarize(condition)
+        last_obs_emb = condition[:, self.To_obs - 1]  # (B, obs_dim)
+        goal_delta = goal_emb - last_obs_emb
+        return obs_summary, goal_delta
+
+
 def test_lbmdit():
     """Test LBMDiT network."""
     print("=" * 50)

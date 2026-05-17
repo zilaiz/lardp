@@ -1,24 +1,28 @@
-"""Policy inference server for the lardp Franka LBMDiTJointDDTFrozen policy.
+"""Policy inference server for the lardp Franka LBMDiTJointDDT (E2E) policy.
 
-Mirrors ``interface_goal_predictor.py`` (which serves a goal-predictor DiT)
-but loads ``LBMDiTJointDDTFrozenAgent``. Same Flask endpoints (``/predict``,
-``/reset``, ``/health``) and same wire format, so the existing
-``PolicyClient`` on the controller side works unchanged.
+Sibling of ``interface_lbmdit_joint_ddt_frozen.py``. Same Flask endpoints
+(``/predict``, ``/reset``, ``/health``), same wire format, same joint Euler
+ODE sampler — the only difference is the **encoder is trained end-to-end**
+with the joint trunk (optionally warm-started from an IDM checkpoint) and
+the FM state target is normalized by a learnable ``target_ln`` saved in the
+checkpoint. There is no offline ``goal_stats_path`` to wire up.
 
-What's different vs interface_goal_predictor.py:
-  - Loads ``LBMDiTJointDDTFrozenAgent`` (frozen IDM encoder + trainable
-    joint DDT trunk over (next_state_embedding, action_chunk)).
-  - Single ``sample`` call drives a joint Euler ODE that walks
-    ``(t_state, t_action)`` along the configured schedule and returns the
-    action chunk. The state stream is sampled internally and discarded by
-    ``agent.sample``.
-  - Exposes the joint-trunk inference knobs as CLI args so a deployed
-    checkpoint can be re-served with a different sampling recipe (steps,
-    mode, schedule, t-shift, CFG) without retraining.
-  - Normalizer is the same ``normalizer.pkl`` saved by IDM training —
-    reused so action/obs scaling matches the pretrained encoder.
+  - Loads ``LBMDiTJointDDTAgent``: trainable encoder + trainable joint DDT
+    trunk over ``(next_state_embedding, action_chunk)``. The encoder ckpt,
+    encoder EMA, joint trunk, trunk EMA, ``target_ln``, and ``target_ln_ema``
+    are all restored from the saved ``model_*.pt``.
+  - ``optimization.idm_checkpoint_path`` is OPTIONAL — only relevant if the
+    training run warm-started the encoder from an IDM ckpt. At deploy time
+    we don't reload that init; the checkpoint already has the final encoder
+    weights. Override only if your training-time config path is no longer
+    valid on this machine and the agent ``__init__`` would otherwise fail.
+  - The data normalizer is NOT auto-saved by the joint training pipeline.
+    ``--normalizer_path`` is required at deploy time; point it at any
+    compatible ``normalizer.pkl``: the sibling of the IDM ckpt the run was
+    warm-started from (most common), or one exported from the same HDF5 the
+    run trained on. Wrong normalizer = wrong obs/action scale at inference.
 
-Inference knobs (all optional; if omitted, the saved hydra config is used):
+Inference knobs (all optional; defaults come from the saved hydra config):
   --joint_num_steps        ODE steps for the joint sampler.
   --joint_sample_mode      "stochastic" | "zero" — initial action stream.
   --joint_t_schedule       "diagonal" | "state_first" | "pyramid" |
@@ -32,13 +36,15 @@ Inference knobs (all optional; if omitted, the saved hydra config is used):
   --joint_t_shift_action   SD3-style time shift for the action stream.
   --joint_cfg_scale        CFG strength w; v_guided = (1+w)v_cond - w v_uncond.
                            0 = plain conditional sampling.
-  --idm_checkpoint_path    Override optimization.idm_checkpoint_path.
-  --goal_stats_path        Override optimization.goal_stats_path.
+  --idm_checkpoint_path    Override optimization.idm_checkpoint_path (only
+                           matters if the agent __init__ touches the path
+                           on this machine; weights themselves come from
+                           --ckpt_path).
   --act_steps              Override task.act_steps for the executable slice.
 
 Usage
 -----
-    python interface_lbmdit_joint_ddt_frozen.py \\
+    python interface_lbmdit_joint_ddt.py \\
         --ckpt_path        logs/<exp>/<ts>/models/model_latest.pt \\
         --config_path      outputs/<date>/<time>/.hydra/config.yaml \\
         --normalizer_path  <idm>/normalizer.pkl \\
@@ -66,14 +72,14 @@ LARDP_PATH = "/path/to/lardp"
 if LARDP_PATH not in sys.path:
     sys.path.append(LARDP_PATH)
 
-from mip.agent_lbmdit_joint_ddt_frozen import LBMDiTJointDDTFrozenAgent
+from mip.agent_lbmdit_joint_ddt import LBMDiTJointDDTAgent
 from mip.dataset_utils import dict_apply
 from mip.franka_inference import decode_action
 
 app = Flask(__name__)
 
 # Globals populated by `initialize_policy`
-agent: LBMDiTJointDDTFrozenAgent | None = None
+agent: LBMDiTJointDDTAgent | None = None
 config = None
 device: torch.device | None = None
 normalizer: dict | None = None
@@ -88,7 +94,7 @@ _save_obs_count: int = 0
 # Normalizer loading (pickle from IDM training)
 # ---------------------------------------------------------------------------
 def _load_normalizer_from_pickle(path: str) -> dict:
-    """Load the IDM normalizer (sibling of the IDM ckpt).
+    """Load a normalizer pickle.
 
     Format: ``{"obs": {key: Normalizer}, "action": Normalizer}`` where the
     per-key normalizers are ``MinMaxNormalizer`` (low-dim) or
@@ -110,7 +116,6 @@ def initialize_policy(
     config_path: str,
     normalizer_path: str,
     idm_checkpoint_path: str | None = None,
-    goal_stats_path: str | None = None,
     joint_num_steps: int | None = None,
     joint_sample_mode: str | None = None,
     joint_t_schedule: str | None = None,
@@ -121,7 +126,7 @@ def initialize_policy(
     joint_cfg_scale: float | None = None,
     act_steps: int | None = None,
 ):
-    """Build the joint-DDT-frozen agent, load the trunk ckpt + normalizer.
+    """Build the joint-DDT-E2E agent, load the checkpoint + normalizer.
 
     Hydra overrides are applied BEFORE constructing the agent so the agent's
     internal scalar caches (``_num_steps``, ``_sample_mode``, ``_t_schedule``,
@@ -133,13 +138,14 @@ def initialize_policy(
     print(f"Loading hydra config: {config_path}")
     cfg = OmegaConf.load(config_path)
 
-    # Optional reference-path overrides for the frozen IDM + offline goal stats.
+    # Optional override for the IDM warm-start path. The agent only touches
+    # this path in __init__ (and only when it points to a real file); at
+    # deploy time the final weights come from --ckpt_path, so passing this
+    # is usually unnecessary. Override only if the training-time path is no
+    # longer valid on this machine.
     if idm_checkpoint_path is not None:
         OmegaConf.update(cfg, "optimization.idm_checkpoint_path",
                          idm_checkpoint_path, merge=False)
-    if goal_stats_path is not None:
-        OmegaConf.update(cfg, "optimization.goal_stats_path",
-                         goal_stats_path, merge=False)
 
     # Joint-trunk inference knobs.
     if joint_num_steps is not None:
@@ -194,18 +200,18 @@ def initialize_policy(
     )
 
     print(
-        f"Building LBMDiTJointDDTFrozenAgent({cfg.network.network_type}, "
+        f"Building LBMDiTJointDDTAgent({cfg.network.network_type}, "
         f"enc_hidden={cfg.network.joint_ddt_d_model_enc}, "
         f"dec_hidden={cfg.network.joint_ddt_d_model_dec}) — "
-        f"loads frozen IDM internally..."
+        f"encoder trains end-to-end; target_ln replaces offline goal stats..."
     )
-    agent = LBMDiTJointDDTFrozenAgent(cfg)
+    agent = LBMDiTJointDDTAgent(cfg)
 
-    print(f"Loading joint trunk checkpoint: {ckpt_path}")
+    print(f"Loading joint trunk + encoder + target_ln checkpoint: {ckpt_path}")
     agent.load(ckpt_path, load_optimizer=False)
     agent.eval()
 
-    print(f"Loading IDM normalizer (pickle): {normalizer_path}")
+    print(f"Loading normalizer (pickle): {normalizer_path}")
     normalizer = _load_normalizer_from_pickle(normalizer_path)
 
     print("Policy initialized successfully")
@@ -441,7 +447,7 @@ def predict():
 
 @app.route("/reset", methods=["POST"])
 def reset():
-    """No-op: joint-DDT-frozen policy is stateless across calls."""
+    """No-op: joint-DDT policy is stateless across calls."""
     if agent is None:
         return jsonify({"error": "Policy not initialized"}), 500
     return jsonify({"status": "success"})
@@ -461,19 +467,19 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_path", type=str, required=True,
-                        help="Path to LBMDiTJointDDTFrozenAgent checkpoint (.pt)")
+                        help="Path to LBMDiTJointDDTAgent checkpoint (.pt)")
     parser.add_argument("--config_path", type=str, required=True,
                         help="Path to .hydra/config.yaml from the training run")
     parser.add_argument("--normalizer_path", type=str, required=True,
-                        help="Path to normalizer.pkl saved by IDM training "
-                             "(usually a sibling of the IDM checkpoint)")
+                        help="Path to normalizer.pkl (sibling of the IDM ckpt "
+                             "the run was warm-started from, or one exported "
+                             "from the same HDF5)")
 
-    # Reference paths (frozen IDM + offline goal stats). Default to the values
-    # baked into the training-time hydra config.
+    # Optional override for the IDM warm-start path. Only matters if the
+    # training-time path is no longer valid on this machine; the final
+    # weights come from --ckpt_path.
     parser.add_argument("--idm_checkpoint_path", type=str, default=None,
                         help="Override optimization.idm_checkpoint_path")
-    parser.add_argument("--goal_stats_path", type=str, default=None,
-                        help="Override optimization.goal_stats_path")
 
     # Joint-trunk sampler knobs.
     parser.add_argument("--joint_num_steps", type=int, default=None,
@@ -524,7 +530,6 @@ if __name__ == "__main__":
         config_path=args.config_path,
         normalizer_path=args.normalizer_path,
         idm_checkpoint_path=args.idm_checkpoint_path,
-        goal_stats_path=args.goal_stats_path,
         joint_num_steps=args.joint_num_steps,
         joint_sample_mode=args.joint_sample_mode,
         joint_t_schedule=args.joint_t_schedule,

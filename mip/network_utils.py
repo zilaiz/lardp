@@ -24,8 +24,9 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.chitfm import ChiTransformer
     from mip.networks.chiunet import ChiUNet
     from mip.networks.jannerunet import JannerUNet
-    from mip.networks.lbmdit import LBMDiT, LBMDiTIDM, LBMDiTIDMv2
+    from mip.networks.lbmdit import LBMDiT, LBMDiTIDM, LBMDiTIDMv2, LBMDiTIDMv2Delta
     from mip.networks.lbmdit_ddt import LBMDiTDDT
+    from mip.networks.lbmdit_ddt_pt import LBMDiTDDTPT
     from mip.networks.lbmdit_joint import LBMDiTJoint
     from mip.networks.lbmdit_joint_ddt import LBMDiTJointDDT
     from mip.networks.mlp import MLP, VanillaMLP
@@ -57,8 +58,10 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "sudeepdit_repa_agg": SudeepDiTREPAAgg,
         "lbmdit": LBMDiT,
         "lbmdit_ddt": LBMDiTDDT,
+        "lbmdit_ddt_pt": LBMDiTDDTPT,
         "lbmidm": LBMDiTIDM,
         "lbmidm_v2": LBMDiTIDMv2,
+        "lbmidm_v2_delta": LBMDiTIDMv2Delta,
         "lbmdit_joint": LBMDiTJoint,
         "lbmdit_joint_ddt": LBMDiTJointDDT,
     }[network_config.network_type]
@@ -180,6 +183,30 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             timestep_emb_dim=network_config.policy_ddt_timestep_emb_dim,
         )
 
+    elif network_config.network_type == "lbmdit_ddt_pt":
+        # Action-only DDT trunk with PER-TOKEN encoder->decoder cond. Same
+        # config knobs as ``lbmdit_ddt`` (drop-in alternative): the encoder
+        # output is NOT mean-pooled before the bridge — each decoder token
+        # gets the corresponding encoder feature as its AdaLN cond.
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        d_model_enc = network_config.policy_ddt_d_model_enc or network_config.emb_dim
+        d_model_dec = network_config.policy_ddt_d_model_dec or 2 * d_model_enc
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            obs_dim=enc_out_dim,
+            To=task_config.obs_steps,
+            d_model_enc=d_model_enc,
+            d_model_dec=d_model_dec,
+            n_heads_enc=network_config.policy_ddt_n_heads_enc,
+            n_heads_dec=network_config.policy_ddt_n_heads_dec,
+            enc_depth=network_config.policy_ddt_enc_depth,
+            dec_depth=network_config.policy_ddt_dec_depth,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+            timestep_emb_dim=network_config.policy_ddt_timestep_emb_dim,
+        )
+
     elif network_config.network_type == "lbmidm":
         lbmidm_params = dict(common_params)
         enc_out_dim = _get_encoder_out_dim(network_config)
@@ -194,7 +221,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             timestep_emb_type=network_config.timestep_emb_type,
         )
 
-    elif network_config.network_type == "lbmidm_v2":
+    elif network_config.network_type in ("lbmidm_v2", "lbmidm_v2_delta"):
         enc_out_dim = _get_encoder_out_dim(network_config)
         return network_class(
             act_dim=task_config.act_dim,

@@ -27,7 +27,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from mip.agent_lbmdit_joint_ddt_frozen_dp import LBMDiTJointDDTFrozenDPAgent
 from mip.config import Config
-from mip.dataset_utils import loop_dataloader
+from mip.dataset_utils import loop_dataloader, make_expert_weighted_sampler
 from mip.datasets.robomimic_dataset import RobomimicImageIDMDataset, make_idm_dataset
 from mip.logger import Logger
 from mip.losses import get_norm
@@ -146,11 +146,15 @@ def train(
     logger: Logger,
     resume_state: dict | None = None,
 ):
+    sampler = make_expert_weighted_sampler(
+        dataset, config.optimization.expert_sample_fraction,
+    )
     train_loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
         num_workers=4,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         pin_memory=True,
         persistent_workers=True,
         drop_last=True,

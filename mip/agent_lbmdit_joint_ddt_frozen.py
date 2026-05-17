@@ -87,11 +87,36 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
             self.encoder.load_state_dict(encoder_sd)
             loguru.logger.info("Loaded encoder weights from IDM checkpoint")
 
-        if config.optimization.joint_freeze_encoder:
-            self.encoder.requires_grad_(False)
-            loguru.logger.info("Encoder frozen for DDT joint training")
+        # Three modes:
+        #   1. joint_finetune_input_encoder=True
+        #        Input encoder is trainable; a separate *frozen* snapshot of
+        #        the IDM weights computes the FM state target. This is the
+        #        "split target" mode — overrides joint_freeze_encoder.
+        #   2. joint_freeze_encoder=True   (default)
+        #        Single encoder, frozen. target_encoder aliases self.encoder.
+        #   3. joint_freeze_encoder=False
+        #        Single encoder, fine-tuned end-to-end (state target detached
+        #        in update()). target_encoder aliases self.encoder.
+        self._finetune_input_encoder = bool(
+            config.optimization.joint_finetune_input_encoder
+        )
+        if self._finetune_input_encoder:
+            self.target_encoder = deepcopy(self.encoder).requires_grad_(False)
+            self.target_encoder.eval()
+            self.encoder.requires_grad_(True)
+            loguru.logger.info(
+                "Input encoder will be FINE-TUNED from IDM init; target "
+                "encoder kept FROZEN at IDM weights for state-flow target."
+            )
         else:
-            loguru.logger.info("Encoder will be fine-tuned during DDT joint training")
+            self.target_encoder = self.encoder  # alias — no extra memory
+            if config.optimization.joint_freeze_encoder:
+                self.encoder.requires_grad_(False)
+                loguru.logger.info("Encoder frozen for DDT joint training")
+            else:
+                loguru.logger.info(
+                    "Encoder will be fine-tuned during DDT joint training"
+                )
 
         # --- Goal normalization stats (mirrors LBMDiTJointAgent) ---
         self._norm_eps = 1e-5
@@ -139,7 +164,10 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
 
         # --- Optimizer (joint trunk + optionally encoder) ---
         params = list(self.net.parameters())
-        if not config.optimization.joint_freeze_encoder:
+        if (
+            self._finetune_input_encoder
+            or not config.optimization.joint_freeze_encoder
+        ):
             params += list(self.encoder.parameters())
         self.optimizer = torch.optim.AdamW(
             params,
@@ -208,6 +236,17 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
             grid = np.linspace(lo, hi, steps + 1)
             t_state, t_action = grid, grid
 
+        elif self._t_schedule == "action_only":
+            # State stream pinned at lo throughout: ds = 0 every step, so
+            # x_state never integrates and stays at its initial draw. Only
+            # x_action walks lo -> hi. Use joint_sample_mode="stochastic" so
+            # x_state inits to randn — what the trunk saw at training when
+            # t_state ≈ eps (zero init is OOD at the noise endpoint).
+            t_state = np.full(steps + 1, lo)
+            t_action = np.linspace(lo, hi, steps + 1)
+            assert t_state.shape == (steps + 1,)
+            assert t_action.shape == (steps + 1,)
+
         elif self._t_schedule == "state_first":
             half = steps // 2 if steps >= 2 else 1
             t_state = np.concatenate([
@@ -265,21 +304,30 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
         device = act.device
         B = act.shape[0]
 
-        # 1. Encode obs + goal. Frozen path uses no_grad; fine-tune path
-        #    keeps gradients on the condition side (matches parent semantics).
-        if config.joint_freeze_encoder:
+        # 1. Encode obs + goal.
+        #    - Split-target mode: input encoder runs with grad; goal goes
+        #      through the frozen target_encoder under no_grad.
+        #    - Single-encoder frozen: both under no_grad.
+        #    - Single-encoder E2E: both with grad (target detached below).
+        if self._finetune_input_encoder:
+            z_t = self.encoder(obs, None)                       # (B, To, emb_dim)
             with torch.no_grad():
-                z_t = self.encoder(obs, None)              # (B, To, emb_dim)
-                z_goal_raw = self.encoder(goal_obs, None)  # (B, 1, emb_dim)
+                z_goal_raw = self.target_encoder(goal_obs, None)  # (B, 1, emb_dim)
+        elif config.joint_freeze_encoder:
+            with torch.no_grad():
+                z_t = self.encoder(obs, None)
+                z_goal_raw = self.encoder(goal_obs, None)
         else:
             z_t = self.encoder(obs, None)
             z_goal_raw = self.encoder(goal_obs, None)
 
-        # 2. State-flow target normalization. When the encoder is fine-tuned,
-        #    detach so the FM target is a pure regression target (encoder
-        #    receives signal only via the condition path z_t).
+        # 2. State-flow target normalization. When a single encoder is being
+        #    fine-tuned end-to-end, detach so the FM target is a pure
+        #    regression target (encoder receives signal only via the
+        #    condition path z_t). Split-target mode is already no_grad on
+        #    target_encoder, so detach is a no-op there.
         target = self._normalize_goal(z_goal_raw)
-        if not config.joint_freeze_encoder:
+        if not self._finetune_input_encoder and not config.joint_freeze_encoder:
             target = target.detach()
 
         # 3. Optimality + CFG dropout.
@@ -348,7 +396,7 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
         loss.backward()
 
         params = list(self.net.parameters())
-        if not config.joint_freeze_encoder:
+        if self._finetune_input_encoder or not config.joint_freeze_encoder:
             params += list(self.encoder.parameters())
         if config.grad_clip_norm:
             grad_norm = nn.utils.clip_grad_norm_(params, config.grad_clip_norm)
@@ -504,3 +552,53 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
 
         z_goal_pred = self._denormalize_goal(x_state)
         return x_action, z_goal_pred
+
+    # ------------------------------- modes / IO ------------------------------
+    # Overrides for the split-target mode so target_encoder stays in eval mode
+    # (deterministic goal embedding — no CropRandomizer noise in the target)
+    # and its weights round-trip through save/load. In single-encoder modes
+    # target_encoder is an alias to self.encoder, so these overrides reduce to
+    # the parent behavior.
+
+    def eval(self):
+        super().eval()
+        if self.target_encoder is not self.encoder:
+            self.target_encoder.eval()
+
+    def train(self):
+        super().train()
+        if self.target_encoder is not self.encoder:
+            # Frozen target stays in eval — deterministic embeddings.
+            self.target_encoder.eval()
+
+    def save(self, path, training_state=None):
+        checkpoint = {
+            "net": self.net.state_dict(),
+            "net_ema": self.net_ema.state_dict(),
+            "encoder": self.encoder.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "idm_checkpoint_path": self.config.optimization.idm_checkpoint_path,
+        }
+        if self.target_encoder is not self.encoder:
+            checkpoint["target_encoder"] = self.target_encoder.state_dict()
+        if training_state is not None:
+            checkpoint["training_state"] = training_state
+        torch.save(checkpoint, path)
+
+    def load(self, path, load_optimizer: bool = False):
+        training_state = super().load(path, load_optimizer=load_optimizer)
+        if self.target_encoder is not self.encoder:
+            state_dict = torch.load(
+                path,
+                map_location=self.config.optimization.device,
+                weights_only=False,
+            )
+            if "target_encoder" in state_dict:
+                self.target_encoder.load_state_dict(state_dict["target_encoder"])
+                loguru.logger.info("Loaded target_encoder from checkpoint")
+            else:
+                loguru.logger.info(
+                    "No target_encoder in checkpoint; keeping the IDM snapshot "
+                    "built at __init__"
+                )
+        return training_state

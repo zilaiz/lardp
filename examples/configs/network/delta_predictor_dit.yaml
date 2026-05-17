@@ -1,0 +1,16 @@
+# @package network
+# Delta predictor DiT trained on top of a delta-cond IDM (LBMDiTIDMv2Delta).
+# Architecture identical to goal_predictor_dit_v2; only target semantics differ
+# (the agent regresses z_goal − z_last_obs instead of z_goal).
+defaults:
+  - lbmidm_v2_delta
+  - _self_
+
+# DiT trunk hparams (match goal_predictor_dit_v2.yaml)
+goal_dit_depth: 8
+goal_dit_n_heads: 8
+goal_dit_d_model: null    # null = use emb_dim
+goal_dit_dropout: 0.0
+goal_dit_projector_dim: null  # null = 2 * d_model
+goal_dit_timestep_emb_dim: 256  # null = use goal_dit_d_model
+goal_align_depth: 5       # which layer to extract intermediate states from

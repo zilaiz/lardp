@@ -1092,6 +1092,68 @@ def dict_apply(
     return result
 
 
+def make_expert_weighted_sampler(
+    dataset: torch.utils.data.Dataset,
+    expert_sample_fraction: float | None,
+) -> torch.utils.data.WeightedRandomSampler | None:
+    """Build a WeightedRandomSampler that draws `expert_sample_fraction` of
+    samples from the expert (primary) component of a ConcatDataset.
+
+    Convention matches `make_idm_dataset`: the first component is the expert
+    (optimality=0), all remaining components are rollouts (optimality=1).
+
+    Returns None — meaning "use uniform shuffle, no reweighting" — when:
+      - `expert_sample_fraction` is None,
+      - the dataset is not a ConcatDataset (single source, nothing to mix),
+      - the ConcatDataset has only one component (e.g. expert-only),
+      - the expert or rollout component is empty.
+
+    The natural mixing proportion is also returned through a log line so it's
+    obvious in the run log how much resampling is being applied.
+    """
+    if expert_sample_fraction is None:
+        return None
+    if not isinstance(dataset, torch.utils.data.ConcatDataset):
+        return None
+    if len(dataset.datasets) <= 1:
+        return None
+
+    expert_ds = dataset.datasets[0]
+    n_expert = len(expert_ds)
+    n_rollout = sum(len(ds) for ds in dataset.datasets[1:])
+    total = n_expert + n_rollout
+    if n_expert == 0 or n_rollout == 0:
+        return None
+
+    f = float(expert_sample_fraction)
+    if not (0.0 < f < 1.0):
+        raise ValueError(
+            f"expert_sample_fraction must be in (0, 1) when set; got {f}. "
+            f"Use None to disable reweighting."
+        )
+
+    # Per-sample weight so each expert sample collectively contributes `f`
+    # mass and each rollout sample contributes (1 - f) mass.
+    w_expert = f / n_expert
+    w_rollout = (1.0 - f) / n_rollout
+    weights = torch.empty(total, dtype=torch.double)
+    weights[:n_expert] = w_expert
+    weights[n_expert:] = w_rollout
+
+    natural = n_expert / total
+    logger.info(
+        f"Expert upweighting: target={f:.2f}, natural={natural:.4f} "
+        f"({n_expert} expert / {n_rollout} rollout samples). "
+        f"Per-sample weights: expert={w_expert:.3e}, rollout={w_rollout:.3e}"
+    )
+
+    return torch.utils.data.WeightedRandomSampler(
+        weights=weights,
+        num_samples=total,
+        replacement=True,
+    )
+
+
 def loop_dataloader(dl):
     while True:
         yield from dl

@@ -24,7 +24,7 @@ os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 
 from mip.agent_lbmdit_joint_e2e import LBMDiTJointE2EAgent  # noqa: E402
 from mip.config import Config  # noqa: E402
-from mip.dataset_utils import loop_dataloader  # noqa: E402
+from mip.dataset_utils import loop_dataloader, make_expert_weighted_sampler  # noqa: E402
 from mip.datasets.robomimic_dataset import make_idm_dataset  # noqa: E402
 from mip.envs.robomimic.robomimic_env import make_vec_env  # noqa: E402
 from mip.logger import (  # noqa: E402
@@ -67,11 +67,15 @@ def _read_optimality(
 
 
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):
+    sampler = make_expert_weighted_sampler(
+        dataset, config.optimization.expert_sample_fraction,
+    )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
         num_workers=4,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         pin_memory=True,
         persistent_workers=True,
         drop_last=True,

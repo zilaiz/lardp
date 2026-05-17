@@ -1,0 +1,18 @@
+# @package network
+# Delta predictor DDT-NS: same DDT-NS trunk topology as goal_predictor_ddt_ns,
+# but inherits from lbmidm_v2_delta so the frozen IDM the predictor wraps is
+# the delta-cond trunk (LBMDiTIDMv2Delta). Architecture is otherwise
+# identical — the agent decides target semantics (delta vs absolute goal).
+defaults:
+  - lbmidm_v2_delta
+  - _self_
+
+# Delta predictor DDT-NS architecture (matches goal_predictor_ddt_ns)
+goal_ddt_enc_depth: 4
+goal_ddt_dec_depth: 2
+goal_ddt_d_model_enc: null    # null = use emb_dim
+goal_ddt_d_model_dec: 1024
+goal_ddt_n_heads_enc: 8
+goal_ddt_n_heads_dec: 8
+goal_ddt_dropout: 0.0
+goal_ddt_timestep_emb_dim: 256  # null = use d_model_enc

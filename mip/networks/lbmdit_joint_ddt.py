@@ -21,14 +21,18 @@ where ``t[b, 0] = t_state[b]`` and ``t[b, 1:] = t_action[b]`` (or
 sample and replicated across the ``Ta+1`` tokens.
 
 Forward sketch:
-    cond_enc = build_cond_enc(t_state, t_action, obs, opt)        # (B, Ta+1, enc_h)
-    h_enc    = pos_emb + cat(state_proj_enc(x_s), action_proj_enc(x_a))
+    t_per_tok = per_token_time_features(t_state, t_action)        # (B, Ta+1, enc_h)
+    cond_enc  = t_per_tok + obs_per_tok + opt_per_tok             # (B, Ta+1, enc_h)
+    h_enc     = pos_emb + cat(state_proj_enc(x_s), action_proj_enc(x_a))
     for blk in encoder_blocks: h_enc = blk(h_enc, cond_enc)
-    s_dec    = s_projector(h_enc)                                 # (B, Ta+1, dec_h)
-    h_dec    = cat(state_proj_dec(x_s), action_proj_dec(x_a))     # no pos emb on dec side
+    # Bridge with additive time re-injection (RAE pattern but without silu;
+    # we keep the additive time skip from RAE/DDT but drop their outer silu
+    # to match our overall no-outer-silu cond convention):
+    s_dec     = s_projector(t_per_tok + h_enc)                    # (B, Ta+1, dec_h)
+    h_dec     = cat(state_proj_dec(x_s), action_proj_dec(x_a))    # no pos emb on dec side
     for blk in decoder_blocks: h_dec = blk(h_dec, s_dec)
-    v_state  = state_final(h_dec[:, :1], s_dec[:, :1])
-    v_action = action_final(h_dec[:, 1:], s_dec[:, 1:])
+    v_state   = state_final(h_dec[:, :1], s_dec[:, :1])
+    v_action  = action_final(h_dec[:, 1:], s_dec[:, 1:])
 
 Notes vs. ``LBMDiTJoint``:
   - Re-uses the ``s, t`` two-time API; ``s`` is now the state-token flow
@@ -294,8 +298,7 @@ class LBMDiTJointDDT(BaseNetwork):
 
     def _build_cond_enc(
         self,
-        t_state: Tensor,
-        t_action: Tensor,
+        time_per_tok: Tensor,
         condition: Tensor | None,
         optimality_idx: Tensor | None,
         B: int,
@@ -305,9 +308,10 @@ class LBMDiTJointDDT(BaseNetwork):
 
         Components are summed (DFoT pattern of additive composition):
             cond = time_per_token + obs_broadcast + opt_broadcast.
-        """
-        time_per_tok = self._per_token_time_features(t_state, t_action, B)
 
+        ``time_per_tok`` is passed in (computed once in ``forward``) so the
+        same tensor can be reused for the bridge re-injection step.
+        """
         if condition is not None:
             obs_feat = self.obs_mlp(condition.flatten(1))             # (B, enc_hidden)
         else:
@@ -350,10 +354,15 @@ class LBMDiTJointDDT(BaseNetwork):
         B = x_action.shape[0]
         device = x_action.device
 
-        # --- 1. Per-token cond at encoder width ---
-        cond_enc = self._build_cond_enc(s, t, condition, optimality_idx, B, device)
+        # --- 1. Per-token time features (reused for cond + bridge re-inject) ---
+        time_per_tok = self._per_token_time_features(s, t, B)  # (B, Ta+1, enc_hidden)
 
-        # --- 2. Encoder: tokenize x at enc_hidden, run encoder blocks ---
+        # --- 2. Per-token cond at encoder width ---
+        cond_enc = self._build_cond_enc(
+            time_per_tok, condition, optimality_idx, B, device,
+        )
+
+        # --- 3. Encoder: tokenize x at enc_hidden, run encoder blocks ---
         h_enc = torch.cat([
             self.state_input_proj_enc(x_state),     # (B, 1, enc_hidden)
             self.action_input_proj_enc(x_action),   # (B, Ta, enc_hidden)
@@ -363,10 +372,15 @@ class LBMDiTJointDDT(BaseNetwork):
         for blk in self.encoder_blocks:
             h_enc = blk(h_enc, cond_enc)
 
-        # --- 3. Bridge: encoder output becomes per-token decoder cond ---
-        s_dec = self.s_projector(h_enc)             # (B, Ta+1, dec_hidden)
+        # --- 4. Bridge: additive time re-injection, then project ---
+        # ``time + h_enc`` gives the decoder a direct additive time signal
+        # at the boundary, parallel to the multiplicative time path through
+        # encoder AdaLN. RAE wraps this in silu (``DDT.py:351-354``); we
+        # don't, to match our no-outer-silu cond convention. The decoder
+        # block's internal SiLU+Linear modulation handles the nonlinearity.
+        s_dec = self.s_projector(time_per_tok + h_enc)  # (B, Ta+1, dec_hidden)
 
-        # --- 4. Decoder: re-tokenize x at dec_hidden, run decoder blocks ---
+        # --- 5. Decoder: re-tokenize x at dec_hidden, run decoder blocks ---
         # No pos emb on decoder side — RAE pattern; positional information
         # reaches the decoder via the per-token cond from the encoder.
         h_dec = torch.cat([
@@ -377,7 +391,7 @@ class LBMDiTJointDDT(BaseNetwork):
         for blk in self.decoder_blocks:
             h_dec = blk(h_dec, s_dec)
 
-        # --- 5. Output heads with per-token AdaLN final layer ---
+        # --- 6. Output heads with per-token AdaLN final layer ---
         v_state = self.state_final(h_dec[:, :1, :], s_dec[:, :1, :])     # (B, 1, obs_dim)
         v_action = self.action_final(h_dec[:, 1:, :], s_dec[:, 1:, :])   # (B, Ta, act_dim)
         return v_state, v_action, None

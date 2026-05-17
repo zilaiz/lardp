@@ -164,6 +164,9 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._pyramid_offset = config.optimization.joint_pyramid_offset
         self._t_eps = config.optimization.joint_t_eps
         self._use_ema_target = bool(config.optimization.joint_use_ema_target)
+        self._state_loss_to_encoder = bool(
+            config.optimization.joint_state_loss_to_encoder
+        )
         # Per-stream SD3-style time shift. 1.0 = identity (no shift).
         self._shift_state = float(config.optimization.joint_t_shift_state)
         self._shift_action = float(config.optimization.joint_t_shift_action)
@@ -275,14 +278,37 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         a_t_dot = self.interpolant.calc_It_dot(t_action, a_noise, act)
 
         # 5. Joint forward — DDT trunk takes the two times directly.
-        v_state, v_action, _ = self.net(
-            x_state=s_t,
-            x_action=a_t,
-            s=t_state,
-            t=t_action,
-            condition=z_t,
-            optimality_idx=optimality,
-        )
+        #    If state_loss is configured to NOT flow into the encoder, run
+        #    two forward passes: one with z_t.detach() to produce v_state
+        #    (encoder receives no state_loss grad), one with live z_t to
+        #    produce v_action (encoder still receives action_loss grad).
+        #    Otherwise a single forward feeds both heads (baseline path).
+        if self._state_loss_to_encoder:
+            v_state, v_action, _ = self.net(
+                x_state=s_t,
+                x_action=a_t,
+                s=t_state,
+                t=t_action,
+                condition=z_t,
+                optimality_idx=optimality,
+            )
+        else:
+            v_state, _, _ = self.net(
+                x_state=s_t,
+                x_action=a_t,
+                s=t_state,
+                t=t_action,
+                condition=z_t.detach(),
+                optimality_idx=optimality,
+            )
+            _, v_action, _ = self.net(
+                x_state=s_t,
+                x_action=a_t,
+                s=t_state,
+                t=t_action,
+                condition=z_t,
+                optimality_idx=optimality,
+            )
 
         # 6. Per-stream losses (per-element MSE so weights are interpretable).
         state_loss_unscaled = torch.mean(
@@ -355,6 +381,17 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         if self._t_schedule == "diagonal":
             grid = np.linspace(lo, hi, steps + 1)
             t_state, t_action = grid, grid
+
+        elif self._t_schedule == "action_only":
+            # State stream pinned at lo throughout: ds = 0 every step, so
+            # x_state never integrates and stays at its initial draw. Only
+            # x_action walks lo -> hi. Use joint_sample_mode="stochastic" so
+            # x_state inits to randn — what the trunk saw at training when
+            # t_state ≈ eps (zero init is OOD at the noise endpoint).
+            t_state = np.full(steps + 1, lo)
+            t_action = np.linspace(lo, hi, steps + 1)
+            assert t_state.shape == (steps + 1,)
+            assert t_action.shape == (steps + 1,)
 
         elif self._t_schedule == "state_first":
             half = steps // 2 if steps >= 2 else 1
