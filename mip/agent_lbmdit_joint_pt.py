@@ -40,5 +40,7 @@ class LBMDiTJointPTAgent(LBMDiTJointDDTAgent):
             timestep_emb_type=config.network.timestep_emb_type,
             timestep_emb_dim=config.network.timestep_emb_dim,
             opt_emb_dim=config.network.joint_opt_emb_dim,
-            cond_compose=config.network.joint_cond_compose,
+            # Same backward-compat fallback as ``LBMDiTJointDDTAgent._build_net``:
+            # older configs without ``joint_cond_compose`` default to "add".
+            cond_compose=getattr(config.network, "joint_cond_compose", "add"),
         ).to(device)

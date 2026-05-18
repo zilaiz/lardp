@@ -191,7 +191,10 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             timestep_emb_type=config.network.timestep_emb_type,
             timestep_emb_dim=config.network.timestep_emb_dim,
             opt_emb_dim=config.network.joint_opt_emb_dim,
-            cond_compose=config.network.joint_cond_compose,
+            # ``joint_cond_compose`` was added after the original DDT runs;
+            # fall back to "add" (the only mode those runs supported) when
+            # the saved hydra config predates the field.
+            cond_compose=getattr(config.network, "joint_cond_compose", "add"),
         ).to(device)
 
     @staticmethod
