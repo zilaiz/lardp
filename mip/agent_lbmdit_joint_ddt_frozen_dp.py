@@ -104,6 +104,13 @@ class LBMDiTJointDDTFrozenDPAgent(LBMDiTJointDDTFrozenAgent):
                 "Encoder will be fine-tuned during DDT joint training"
             )
 
+        # The DP variant doesn't support the parent's split-target finetune
+        # mode (no separate IDM-snapshot target encoder), so always alias the
+        # target encoder to self.encoder. Required because the inherited
+        # update / save / load / eval / train methods read these attributes.
+        self.target_encoder = self.encoder
+        self._finetune_input_encoder = False
+
         # --- Goal normalization stats (same as IDM-frozen path) ---
         self._norm_eps = 1e-5
         stats_path = config.optimization.goal_stats_path
