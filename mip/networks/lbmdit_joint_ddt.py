@@ -111,13 +111,20 @@ class _DDTFinalLayer(nn.Module):
 
     Used at the head of each output stream (state, action) so the
     last modulation is also per-token.
+
+    ``cond_dim`` decouples the cond rank from the hidden width, so callers
+    that build a concat'd per-token cond (cond width != hidden width) can
+    still drive the AdaLN modulation. Defaults to ``hidden_size`` for
+    backward compatibility with the additive-cond case.
     """
 
-    def __init__(self, hidden_size: int, out_dim: int):
+    def __init__(self, hidden_size: int, out_dim: int, cond_dim: int | None = None):
         super().__init__()
+        if cond_dim is None:
+            cond_dim = hidden_size
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+            nn.SiLU(), nn.Linear(cond_dim, 2 * hidden_size, bias=True),
         )
         self.linear = nn.Linear(hidden_size, out_dim, bias=True)
 
@@ -165,6 +172,7 @@ class LBMDiTJointDDT(BaseNetwork):
         timestep_emb_params: dict | None = None,
         timestep_emb_dim: int = 128,
         opt_emb_dim: int | None = None,
+        cond_compose: str = "add",
     ):
         # BaseNetwork stores act_dim/Ta/obs_dim/To/emb_dim/n_layers as attrs;
         # we use enc_hidden as ``emb_dim`` and the total depth as ``n_layers``.
@@ -173,12 +181,23 @@ class LBMDiTJointDDT(BaseNetwork):
             emb_dim=enc_hidden, n_layers=enc_depth + dec_depth,
         )
 
+        if cond_compose not in ("add", "concat"):
+            raise ValueError(
+                f"cond_compose must be 'add' or 'concat'; got {cond_compose!r}"
+            )
+
         self.enc_hidden = enc_hidden
         self.dec_hidden = dec_hidden
         self.enc_depth = enc_depth
         self.dec_depth = dec_depth
         self._timestep_emb_dim = timestep_emb_dim
         self._opt_emb_dim = opt_emb_dim if opt_emb_dim is not None else enc_hidden
+        self.cond_compose = cond_compose
+        # Encoder-side cond width depends on composition. Decoder cond stays at
+        # ``dec_hidden`` regardless because the bridge ``s_dec`` is unchanged.
+        self._enc_cond_dim = (
+            3 * enc_hidden if cond_compose == "concat" else enc_hidden
+        )
 
         # --- Time embedder + projection to enc_hidden cond width ---
         timestep_emb_params = timestep_emb_params or {}
@@ -207,12 +226,12 @@ class LBMDiTJointDDT(BaseNetwork):
             torch.empty(1, Ta + 1, enc_hidden).normal_(std=0.02),
         )
 
-        # --- Encoder blocks ---
+        # --- Encoder blocks (cond_dim depends on add/concat) ---
         self.encoder_blocks = nn.ModuleList([
             _DDTBlock(
                 hidden_size=enc_hidden,
                 num_heads=enc_n_heads,
-                cond_dim=enc_hidden,
+                cond_dim=self._enc_cond_dim,
                 dropout=dropout,
             )
             for _ in range(enc_depth)
@@ -325,6 +344,9 @@ class LBMDiTJointDDT(BaseNetwork):
         opt_feat = self.opt_mlp(self.optimality_embedding(optimality_idx))
         opt_per_tok = opt_feat.unsqueeze(1).expand(B, self.Ta + 1, -1)
 
+        if self.cond_compose == "concat":
+            # (B, Ta+1, 3 * enc_hidden) — each component keeps its own subspace.
+            return torch.cat([time_per_tok, obs_per_tok, opt_per_tok], dim=-1)
         return time_per_tok + obs_per_tok + opt_per_tok
 
     # ------------------------------- forward -------------------------------

@@ -17,8 +17,8 @@ timestep_emb_dim: 128       # decoupled from d_model
 encoder_out_dim: 256        # encoder output dim (= obs_dim fed to network)
 
 # DDT specific
-joint_ddt_enc_depth: 8
-joint_ddt_dec_depth: 2
+joint_ddt_enc_depth: 6
+joint_ddt_dec_depth: 4
 joint_ddt_d_model_enc: 256
 joint_ddt_d_model_dec: 512  # shallow wide head
 joint_ddt_n_heads_enc: 8
@@ -30,3 +30,8 @@ timestep_emb_type: "positional"
 
 # Optimality embedding width (null -> enc_hidden)
 joint_opt_emb_dim: null
+
+# Encoder-side per-token cond composition: "add" (sum at enc_hidden) or
+# "concat" (3*enc_hidden). Only affects the encoder cond; the decoder
+# cond (s_dec) is unchanged.
+joint_cond_compose: "add"

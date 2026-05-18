@@ -114,25 +114,11 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._norm_eps = 1e-5
 
         # --- Joint trunk (DDT variant) + EMA ---
-        enc_hidden = config.network.joint_ddt_d_model_enc or config.network.emb_dim
-        dec_hidden = config.network.joint_ddt_d_model_dec or 2 * enc_hidden
-        self.net = LBMDiTJointDDT(
-            act_dim=config.task.act_dim,
-            Ta=config.task.horizon,
-            obs_dim=obs_dim,
-            To=config.task.obs_steps,
-            enc_hidden=enc_hidden,
-            enc_depth=config.network.joint_ddt_enc_depth,
-            enc_n_heads=config.network.joint_ddt_n_heads_enc,
-            dec_hidden=dec_hidden,
-            dec_depth=config.network.joint_ddt_dec_depth,
-            dec_n_heads=config.network.joint_ddt_n_heads_dec,
-            dropout=config.network.dropout,
-            timestep_emb_type=config.network.timestep_emb_type,
-            timestep_emb_dim=config.network.timestep_emb_dim,
-            opt_emb_dim=config.network.joint_opt_emb_dim,
-        ).to(device)
-        report_parameters(self.net, model_name="LBMDiTJointDDT")
+        # Trunk construction is delegated to ``_build_net`` so subclasses can
+        # swap the architecture (e.g. ``LBMDiTJointPTAgent`` uses a single-
+        # stack trunk) without duplicating the rest of ``__init__``.
+        self.net = self._build_net(config, obs_dim, device)
+        report_parameters(self.net, model_name=type(self.net).__name__)
 
         self.net_ema = deepcopy(self.net).requires_grad_(False)
         self.net_ema.eval()
@@ -179,6 +165,34 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 f"got {self._t_dist!r}"
             )
 
+
+    def _build_net(self, config: Config, obs_dim: int, device) -> nn.Module:
+        """Build the joint trunk. Override in subclasses to swap architecture.
+
+        The returned module must expose the joint forward signature
+        ``forward(x_state, x_action, s, t, condition, optimality_idx)
+        -> (v_state, v_action, None)`` so the inherited ``update`` /
+        ``sample`` / ``sample_joint`` paths work unchanged.
+        """
+        enc_hidden = config.network.joint_ddt_d_model_enc or config.network.emb_dim
+        dec_hidden = config.network.joint_ddt_d_model_dec or 2 * enc_hidden
+        return LBMDiTJointDDT(
+            act_dim=config.task.act_dim,
+            Ta=config.task.horizon,
+            obs_dim=obs_dim,
+            To=config.task.obs_steps,
+            enc_hidden=enc_hidden,
+            enc_depth=config.network.joint_ddt_enc_depth,
+            enc_n_heads=config.network.joint_ddt_n_heads_enc,
+            dec_hidden=dec_hidden,
+            dec_depth=config.network.joint_ddt_dec_depth,
+            dec_n_heads=config.network.joint_ddt_n_heads_dec,
+            dropout=config.network.dropout,
+            timestep_emb_type=config.network.timestep_emb_type,
+            timestep_emb_dim=config.network.timestep_emb_dim,
+            opt_emb_dim=config.network.joint_opt_emb_dim,
+            cond_compose=config.network.joint_cond_compose,
+        ).to(device)
 
     @staticmethod
     def _apply_t_shift(t, alpha: float):

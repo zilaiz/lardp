@@ -314,6 +314,12 @@ class NetworkConfig:
     fdm_hidden: int | None = None  # None -> 2 * obs_dim
     # LBMDiTJoint (single-stage joint state+action DiT)
     joint_opt_emb_dim: int | None = None  # None -> obs_dim
+    # Per-token cond composition style for the joint DDT/PT trunks.
+    # "add" sums (time + obs + opt) at trunk width (current default).
+    # "concat" stacks them along the feature axis, growing the cond width
+    # by 3x and letting the AdaLN modulation linear learn the mixing
+    # weights instead of receiving a fixed-coefficient sum.
+    joint_cond_compose: str = "add"  # "add" | "concat"
     # LBMDiTJointDDT (joint DiT with encoder/decoder width split)
     joint_ddt_enc_depth: int = 8
     joint_ddt_dec_depth: int = 2

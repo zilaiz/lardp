@@ -29,6 +29,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     from mip.networks.lbmdit_ddt_pt import LBMDiTDDTPT
     from mip.networks.lbmdit_joint import LBMDiTJoint
     from mip.networks.lbmdit_joint_ddt import LBMDiTJointDDT
+    from mip.networks.lbmdit_joint_pt import LBMDiTJointPT
     from mip.networks.mlp import MLP, VanillaMLP
     from mip.networks.rnn import RNN, VanillaRNN
     from mip.networks.sudeepdit import SudeepDiT
@@ -64,6 +65,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "lbmidm_v2_delta": LBMDiTIDMv2Delta,
         "lbmdit_joint": LBMDiTJoint,
         "lbmdit_joint_ddt": LBMDiTJointDDT,
+        "lbmdit_joint_pt": LBMDiTJointPT,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -250,6 +252,22 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             d_model=network_config.emb_dim,
             n_heads=network_config.n_heads,
             depth=network_config.num_layers,
+            dropout=network_config.dropout,
+            timestep_emb_type=network_config.timestep_emb_type,
+            timestep_emb_dim=network_config.timestep_emb_dim,
+            opt_emb_dim=network_config.joint_opt_emb_dim,
+        )
+
+    elif network_config.network_type == "lbmdit_joint_pt":
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            obs_dim=enc_out_dim,
+            To=task_config.obs_steps,
+            d_model=network_config.emb_dim,
+            depth=network_config.num_layers,
+            n_heads=network_config.n_heads,
             dropout=network_config.dropout,
             timestep_emb_type=network_config.timestep_emb_type,
             timestep_emb_dim=network_config.timestep_emb_dim,
