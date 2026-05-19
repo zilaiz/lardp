@@ -96,20 +96,37 @@ class LBMDiTJointDDTFrozenDPAgent(LBMDiTJointDDTFrozenAgent):
             f"({sum(v.numel() for v in encoder_sd.values()):,} params)"
         )
 
-        if config.optimization.joint_freeze_encoder:
-            self.encoder.requires_grad_(False)
-            loguru.logger.info("Encoder frozen for DDT joint training")
-        else:
+        # Three modes — identical to the IDM-frozen parent, only the source
+        # of the initial weights differs (DP/LBMDiT checkpoint, loaded above):
+        #   1. joint_finetune_input_encoder=True
+        #        Input encoder is trainable; a separate frozen snapshot of the
+        #        DP weights computes the FM state target (split-target mode).
+        #        Overrides joint_freeze_encoder.
+        #   2. joint_freeze_encoder=True   (default)
+        #        Single encoder, frozen. target_encoder aliases self.encoder.
+        #   3. joint_freeze_encoder=False
+        #        Single encoder, fine-tuned end-to-end (state target detached
+        #        in inherited update()). target_encoder aliases self.encoder.
+        self._finetune_input_encoder = bool(
+            config.optimization.joint_finetune_input_encoder
+        )
+        if self._finetune_input_encoder:
+            self.target_encoder = deepcopy(self.encoder).requires_grad_(False)
+            self.target_encoder.eval()
+            self.encoder.requires_grad_(True)
             loguru.logger.info(
-                "Encoder will be fine-tuned during DDT joint training"
+                "Input encoder will be FINE-TUNED from DP init; target "
+                "encoder kept FROZEN at DP weights for state-flow target."
             )
-
-        # The DP variant doesn't support the parent's split-target finetune
-        # mode (no separate IDM-snapshot target encoder), so always alias the
-        # target encoder to self.encoder. Required because the inherited
-        # update / save / load / eval / train methods read these attributes.
-        self.target_encoder = self.encoder
-        self._finetune_input_encoder = False
+        else:
+            self.target_encoder = self.encoder  # alias — no extra memory
+            if config.optimization.joint_freeze_encoder:
+                self.encoder.requires_grad_(False)
+                loguru.logger.info("Encoder frozen for DDT joint training")
+            else:
+                loguru.logger.info(
+                    "Encoder will be fine-tuned during DDT joint training"
+                )
 
         # --- Goal normalization stats (same as IDM-frozen path) ---
         self._norm_eps = 1e-5
@@ -157,9 +174,12 @@ class LBMDiTJointDDTFrozenDPAgent(LBMDiTJointDDTFrozenAgent):
         # --- Interpolant ---
         self.interpolant = Interpolant(config.optimization.interp_type)
 
-        # --- Optimizer ---
+        # --- Optimizer (joint trunk + optionally encoder) ---
         params = list(self.net.parameters())
-        if not config.optimization.joint_freeze_encoder:
+        if (
+            self._finetune_input_encoder
+            or not config.optimization.joint_freeze_encoder
+        ):
             params += list(self.encoder.parameters())
         self.optimizer = torch.optim.AdamW(
             params,

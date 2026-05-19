@@ -115,8 +115,11 @@ def compute_val_loss(
         B = act.shape[0]
         optimality = _read_optimality(batch, B, device)
 
+        # Match update()'s split-target routing: when the input encoder is
+        # being fine-tuned, the FM state target is computed from the frozen
+        # target_encoder so val/train losses stay comparable.
         z_t = agent.encoder(obs, None)
-        z_goal_raw = agent.encoder(goal_obs, None)
+        z_goal_raw = agent.target_encoder(goal_obs, None)
         target = agent._normalize_goal(z_goal_raw)
 
         eps = agent._t_eps
