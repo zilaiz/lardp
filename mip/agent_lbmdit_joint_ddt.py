@@ -65,6 +65,20 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self.config = config
         device = config.optimization.device
 
+        # Ablation invariant: replacing x_state with a learnable token is
+        # coherent only when state_loss is disabled (the state head would
+        # otherwise be asked to predict per-sample velocity from a constant
+        # input under a non-zero loss).
+        if (
+            getattr(config.optimization, "joint_replace_x_state", False)
+            and config.optimization.joint_state_loss_weight != 0.0
+        ):
+            raise ValueError(
+                "optimization.joint_replace_x_state=True requires "
+                "optimization.joint_state_loss_weight == 0.0; got "
+                f"{config.optimization.joint_state_loss_weight}"
+            )
+
         # --- Encoder (instantiate first, then optionally warm-start) ---
         self.encoder = get_encoder(config.network, config.task).to(device)
         idm_path = config.optimization.idm_checkpoint_path
@@ -195,6 +209,9 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             # fall back to "add" (the only mode those runs supported) when
             # the saved hydra config predates the field.
             cond_compose=getattr(config.network, "joint_cond_compose", "add"),
+            replace_x_state=getattr(
+                config.optimization, "joint_replace_x_state", False,
+            ),
         ).to(device)
 
     @staticmethod

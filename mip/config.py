@@ -120,6 +120,18 @@ class OptimizationConfig:
     # bypassing the IDM's obs_summarizer. Forces top1 and requires
     # query_space="obs_summary" + a v2 IDM with ``forward_with_summary``.
     retrieval_use_retrieved_pair: bool = False
+    # BYOL-FDM proprioception reconstruction auxiliary (FDMAgent).
+    # When > 0, FDMNet's proprio_decoder predicts the per-frame low-dim obs
+    # (proprioception) from the encoded latent. Acts as a non-collapsible
+    # supervised signal on the encoder, mirroring TDMPC2's use of supervised
+    # heads to prevent representational collapse during pretraining.
+    proprio_recon_loss_scale: float = 0.0  # 0 = disabled
+    # Downstream loading knob (LBMDiTJointDDTFrozenFDMAgent only): if True,
+    # initialize the input encoder from the BYOL EMA target encoder
+    # (state_dict["encoder_ema"]) instead of the online encoder
+    # (state_dict["encoder"]). For BYOL/SPR-style pretraining the EMA target
+    # is sometimes the smoother / preferred downstream artifact.
+    joint_use_encoder_ema_for_init: bool = False
     # IDM + FDM joint training (lbmidm_v2 / IDMFDMAgent)
     fdm_loss_scale: float = 0.0  # weight for forward-dynamics auxiliary loss (0 = disabled)
     # Ortho regularizer: hinge-form penalty on cos_sim(z_obs[-1], z_goal),
@@ -194,6 +206,17 @@ class OptimizationConfig:
     # action_loss and destabilize encoder training. Default True preserves
     # baseline behavior (single forward, state_loss shapes encoder).
     joint_state_loss_to_encoder: bool = True
+    # DDT trunk ablation: when True, replace the trunk's x_state input with
+    # a learnable global state token and pin t_state=1 (clean-endpoint).
+    # Isolates the contribution of per-sample state generation to action
+    # denoising: trunk structure, attention paths, parameter count, and
+    # both heads are preserved, but the state slot carries no per-sample
+    # information. Hard-requires joint_state_loss_weight == 0 (the state
+    # head is asked to predict velocity from a constant input under a
+    # zeroed loss, which is only coherent when no gradient flows through
+    # v_state). The trunk's `learnable_state_token` is trained via the
+    # action_loss gradient (a global learnable bias on the state slot).
+    joint_replace_x_state: bool = False
     # Mixed-data sampling (joint pipeline, expert + IDM rollouts):
     # Target fraction of each training batch drawn from the expert (primary)
     # dataset; rollouts get (1 - fraction). Implemented via WeightedRandomSampler

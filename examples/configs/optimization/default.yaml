@@ -97,6 +97,17 @@ retrieval_temperature: 1.0       # softmax temperature for the weighted aggregat
 # Requires query_space="obs_summary" + a v2 IDM (forward_with_summary).
 retrieval_use_retrieved_pair: false
 
+# BYOL-FDM proprioception reconstruction auxiliary (FDMAgent).
+# When > 0, FDMNet's proprio_decoder predicts the per-frame low-dim obs
+# from the encoded latent. Acts as a non-collapsible supervised signal on
+# the encoder (mirrors TDMPC2's use of supervised heads to prevent collapse).
+proprio_recon_loss_scale: 0.0  # 0 = disabled
+
+# Downstream loading knob (LBMDiTJointDDTFrozenFDMAgent only): when true,
+# initialize the input encoder from state_dict["encoder_ema"] (BYOL EMA
+# target) instead of state_dict["encoder"] (online).
+joint_use_encoder_ema_for_init: false
+
 # IDM + FDM joint training (lbmidm_v2 / IDMFDMAgent)
 fdm_loss_scale: 0.0  # weight for forward-dynamics auxiliary (0 = disabled)
 # Ortho regularizer: hinge penalty on cos_sim(z_obs[-1], z_goal), active when
@@ -151,6 +162,13 @@ joint_use_ema_target: false
 # still flows into the encoder via the live z_t forward used for v_action.
 # Costs ~2x trunk compute. Default true preserves baseline behavior.
 joint_state_loss_to_encoder: true
+# DDT trunk ablation: replace x_state with a learnable global token and pin
+# t_state=1 (clean endpoint) inside the trunk's forward. Hard-requires
+# joint_state_loss_weight == 0. Isolates the contribution of per-sample
+# state generation to action denoising while preserving the trunk's
+# attention paths, parameter count, and both heads. Default false preserves
+# baseline behavior.
+joint_replace_x_state: false
 # Mixed-data sampling (expert + IDM rollouts): target fraction of each
 # training batch drawn from the expert (primary) dataset. Implemented via
 # WeightedRandomSampler over the ConcatDataset so the natural size imbalance

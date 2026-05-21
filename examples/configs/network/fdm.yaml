@@ -1,0 +1,19 @@
+# @package network
+defaults:
+  - _base
+  - _self_
+
+network_type: "fdm"
+emb_dim: 256                # encoder output dim (= obs_dim fed to network)
+encoder_out_dim: 256        # explicit pin; matches lbmidm_v2 convention
+
+# FDMNet hidden dims (null -> 2 * obs_dim). Shape conventions for
+# obs_summarizer / action_proj match lbmidm_v2 so the pretrained encoder
+# is drop-in for downstream goal-cond agents.
+obs_summarizer_hidden: null
+action_proj_hidden: null
+fdm_hidden: null            # used as predictor_hidden inside FDMNet
+
+# Unused by FDMNet but required by NetworkConfig defaults / encoder setup.
+num_layers: 0
+dropout: 0.0

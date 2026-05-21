@@ -23,6 +23,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
     # Import inside function to avoid circular imports
     from mip.networks.chitfm import ChiTransformer
     from mip.networks.chiunet import ChiUNet
+    from mip.networks.fdm import FDMNet
     from mip.networks.jannerunet import JannerUNet
     from mip.networks.lbmdit import LBMDiT, LBMDiTIDM, LBMDiTIDMv2, LBMDiTIDMv2Delta
     from mip.networks.lbmdit_ddt import LBMDiTDDT
@@ -66,6 +67,7 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
         "lbmdit_joint": LBMDiTJoint,
         "lbmdit_joint_ddt": LBMDiTJointDDT,
         "lbmdit_joint_pt": LBMDiTJointPT,
+        "fdm": FDMNet,
     }[network_config.network_type]
 
     # Common parameters for all networks
@@ -242,6 +244,26 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             fdm_hidden=network_config.fdm_hidden,
         )
 
+    elif network_config.network_type == "fdm":
+        # Forward-dynamics network for BYOL-style encoder pretraining.
+        # Online side only — target is the EMA encoder output directly.
+        # Proprio decoder is conditionally built when the task has low_dim
+        # obs keys; the agent gates whether to use it via
+        # optimization.proprio_recon_loss_scale.
+        enc_out_dim = _get_encoder_out_dim(network_config)
+        proprio_dim = _get_proprio_dim(task_config)
+        return network_class(
+            act_dim=task_config.act_dim,
+            Ta=task_config.horizon,
+            obs_dim=enc_out_dim,
+            To=task_config.obs_steps,           # no goal frame in FDM input
+            To_obs=task_config.obs_steps,
+            summarizer_hidden=network_config.obs_summarizer_hidden,
+            action_proj_hidden=network_config.action_proj_hidden,
+            predictor_hidden=network_config.fdm_hidden,
+            proprio_dim=proprio_dim,
+        )
+
     elif network_config.network_type == "lbmdit_joint":
         enc_out_dim = _get_encoder_out_dim(network_config)
         return network_class(
@@ -312,6 +334,22 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
 def _get_encoder_out_dim(network_config: NetworkConfig) -> int:
     """Get the encoder output dimension (encoder_out_dim if set, else emb_dim)."""
     return network_config.encoder_out_dim or network_config.emb_dim
+
+
+def _get_proprio_dim(task_config: TaskConfig) -> int:
+    """Sum the feature dims of all low_dim obs keys in shape_meta.
+
+    Used to size the FDMNet's optional proprio_decoder. Returns 0 for tasks
+    with no low_dim obs (e.g., pure-image tasks).
+    """
+    if not hasattr(task_config, "shape_meta") or task_config.shape_meta is None:
+        return 0
+    obs_meta = task_config.shape_meta.get("obs", {})
+    total = 0
+    for attr in obs_meta.values():
+        if attr.get("type", "low_dim") == "low_dim":
+            total += int(attr["shape"][0])
+    return total
 
 
 def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
