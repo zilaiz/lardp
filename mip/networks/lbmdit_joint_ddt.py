@@ -387,13 +387,14 @@ class LBMDiTJointDDT(BaseNetwork):
         B = x_action.shape[0]
         device = x_action.device
 
-        # --- Ablation: replace state-slot input with a learnable global token
-        # and pin t_state = 1 (clean endpoint). The trunk attends to the state
-        # slot under the same regime it was trained on at the end of
-        # integration, but the slot carries no per-sample information.
+        # --- Ablation: replace state-slot input with a learnable global token.
+        # t_state passes through from the caller (independently sampled when
+        # joint_decouple_t=True, shared with t_action when False), so the
+        # state slot's AdaLN cond is exercised across the full t-range rather
+        # than fixed at a single value. The slot carries no per-sample
+        # information.
         if self.replace_x_state:
             x_state = self.learnable_state_token.expand(B, 1, -1)
-            s = torch.ones_like(s)
 
         # --- 1. Per-token time features (reused for cond + bridge re-inject) ---
         time_per_tok = self._per_token_time_features(s, t, B)  # (B, Ta+1, enc_hidden)
@@ -526,8 +527,9 @@ def test_lbmdit_joint_ddt():
     print("s_projector is Identity when enc_hidden == dec_hidden.")
 
     # Ablation: replace_x_state swaps x_state for a learnable global token
-    # and pins t_state=1. Forward must be invariant to the caller's x_state
-    # / t_state, and the action-head gradient must reach the learnable token.
+    # but lets t_state pass through. Forward must be invariant to the
+    # caller's x_state (overridden), but NOT to t_state (still drives the
+    # state slot's AdaLN cond). Action-head gradient must reach the token.
     model_abl = LBMDiTJointDDT(
         act_dim=act_dim, Ta=Ta, obs_dim=obs_dim, To=To,
         enc_hidden=128, enc_depth=2, dec_hidden=128, dec_depth=2,
@@ -552,19 +554,24 @@ def test_lbmdit_joint_ddt():
             nn.init.normal_(final.adaLN_modulation[-1].bias, std=0.02)
             nn.init.normal_(final.linear.weight, std=0.02)
             nn.init.normal_(final.linear.bias, std=0.02)
-    # Forward should be invariant to the caller's x_state and t_state.
+    # Forward should be invariant to the caller's x_state (the slot input
+    # is overridden by the learnable token) but should still depend on
+    # t_state (it drives the state slot's AdaLN cond).
     x_state_a = torch.randn(B, 1, obs_dim)
     x_state_b = torch.randn(B, 1, obs_dim) * 100.0
-    t_a = torch.full((B,), 0.0)
-    t_b = torch.full((B,), 0.5)
+    t_s = torch.full((B,), 0.3)
+    t_s_other = torch.full((B,), 0.7)
     with torch.no_grad():
-        _, v_action_a, _ = model_abl(x_state_a, x_action, t_a, t_action, cond)
-        _, v_action_b, _ = model_abl(x_state_b, x_action, t_b, t_action, cond)
+        _, v_action_a, _ = model_abl(x_state_a, x_action, t_s, t_action, cond)
+        _, v_action_b, _ = model_abl(x_state_b, x_action, t_s, t_action, cond)
+        _, v_action_c, _ = model_abl(x_state_a, x_action, t_s_other, t_action, cond)
     assert torch.allclose(v_action_a, v_action_b, atol=1e-6), \
-        "replace_x_state should make forward invariant to x_state and t_state"
+        "replace_x_state should make forward invariant to caller's x_state"
+    assert not torch.allclose(v_action_a, v_action_c, atol=1e-4), \
+        "forward should still depend on t_state (cond path)"
     # Action gradient must reach the learnable_state_token.
     model_abl.train()
-    _, v_action_abl, _ = model_abl(x_state_a, x_action, t_a, t_action, cond)
+    _, v_action_abl, _ = model_abl(x_state_a, x_action, t_action, t_action, cond)
     v_action_abl.sum().backward()
     assert model_abl.learnable_state_token.grad is not None
     assert model_abl.learnable_state_token.grad.abs().sum() > 0, \

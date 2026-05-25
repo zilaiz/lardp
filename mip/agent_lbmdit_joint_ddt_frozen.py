@@ -193,10 +193,10 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
         self._t_dist = config.optimization.joint_t_dist
         self._t_dist_mu = float(config.optimization.joint_t_dist_mu)
         self._t_dist_sigma = float(config.optimization.joint_t_dist_sigma)
-        if self._t_dist not in ("uniform", "logit_normal"):
+        if self._t_dist not in ("uniform", "logit_normal", "beta", "reverse_beta"):
             raise ValueError(
-                f"joint_t_dist must be 'uniform' or 'logit_normal'; "
-                f"got {self._t_dist!r}"
+                f"joint_t_dist must be 'uniform', 'logit_normal', 'beta', or "
+                f"'reverse_beta'; got {self._t_dist!r}"
             )
 
     # --------------------------- time helpers ---------------------------
@@ -215,6 +215,16 @@ class LBMDiTJointDDTFrozenAgent(LBMDiTJointAgent):
     ) -> torch.Tensor:
         if self._t_dist == "uniform":
             return torch.empty(shape, device=device).uniform_(lo, hi)
+        if self._t_dist == "beta":
+            # PI-0 schedule under mip's t=0 noise / t=1 data convention.
+            # lo/hi ignored — the 0.999 cap is intrinsic. Mirrors
+            # LBMDiTJointDDTAgent._sample_base_t and flow_beta_loss.
+            u = torch.distributions.Beta(1.5, 1.0).sample(shape).to(device)
+            return 0.999 * (1.0 - u)
+        if self._t_dist == "reverse_beta":
+            # Original (pre-fix) flow_beta schedule: t ~ Beta(1.5, 1.0)
+            # directly, mass at t≈1 (data end). For A/B comparison only.
+            return torch.distributions.Beta(1.5, 1.0).sample(shape).to(device)
         z = torch.randn(shape, device=device) * self._t_dist_sigma + self._t_dist_mu
         t = torch.sigmoid(z)
         return t.clamp(lo, hi)

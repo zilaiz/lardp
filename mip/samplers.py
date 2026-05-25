@@ -14,7 +14,7 @@ from mip.torch_utils import at_least_ndim
 
 
 def get_default_step_list(loss_type: str):
-    if loss_type in ["flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_reg", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "flow_ns", "ctm", "lmd", "psd", "lsd", "esd", "mf", "goal_predictor", "goal_predictor_dit"]:
+    if loss_type in ["flow", "flow_beta", "flow_reverse_beta", "flow_beta_ll", "flow_repa", "flow_reg", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "flow_ns", "ctm", "lmd", "psd", "lsd", "esd", "mf", "goal_predictor", "goal_predictor_dit"]:
         return 3 ** np.arange(2, -1, -1)
     elif loss_type == "joint_dit":
         # Joint state+action DiT (LBMDiTJoint / LBMDiTJointDDT).
@@ -27,7 +27,7 @@ def get_default_step_list(loss_type: str):
 
 
 def get_sampler(loss_type: str):
-    if loss_type in {"flow", "flow_beta", "flow_beta_ll", "flow_repa", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "goal_predictor", "goal_predictor_dit", "joint_dit"}:
+    if loss_type in {"flow", "flow_beta", "flow_reverse_beta", "flow_beta_ll", "flow_repa", "flow_condistill", "flow_fast_condistill", "flow_dual_condistill", "goal_predictor", "goal_predictor_dit", "joint_dit"}:
         return ode_sampler
     elif loss_type == "flow_ns":
         return ode_ns_sampler

@@ -352,6 +352,16 @@ def main():
     p.add_argument("--idm_network",     default="lbmidm_v2")
     p.add_argument("--joint_ddt_ckpt",  default=None)
     p.add_argument("--joint_ddt_network", default="lbmdit_joint_ddt")
+    p.add_argument("--joint_ddt2_ckpt", default=None,
+                   help="Optional second joint_ddt checkpoint. Treated "
+                        "identically to --joint_ddt_ckpt (target_ln applied, "
+                        "solo probe input). Pair with --joint_ddt2_tag to "
+                        "label it in plots.")
+    p.add_argument("--joint_ddt2_network", default="lbmdit_joint_ddt")
+    p.add_argument("--joint_ddt_tag",  default="joint_ddt",
+                   help="Display tag for the first joint_ddt ckpt.")
+    p.add_argument("--joint_ddt2_tag", default="joint_ddt2",
+                   help="Display tag for the second joint_ddt ckpt.")
 
     # Shared task / dataset.
     p.add_argument("--task_config", default="tool_hang_ph_image_gp")
@@ -393,15 +403,16 @@ def main():
 
     # --- Collect requested encoders in display order ---
     requested = [
-        ("dp",        args.dp_ckpt,        args.dp_network),
-        ("idm",       args.idm_ckpt,       args.idm_network),
-        ("joint_ddt", args.joint_ddt_ckpt, args.joint_ddt_network),
+        ("dp",                  args.dp_ckpt,         args.dp_network),
+        ("idm",                 args.idm_ckpt,        args.idm_network),
+        (args.joint_ddt_tag,    args.joint_ddt_ckpt,  args.joint_ddt_network),
+        (args.joint_ddt2_tag,   args.joint_ddt2_ckpt, args.joint_ddt2_network),
     ]
     requested = [(t, c, n) for (t, c, n) in requested if c]
     if len(requested) < 2:
         raise SystemExit(
             "Need at least two of --dp_ckpt / --idm_ckpt / --joint_ddt_ckpt "
-            "to do a comparison."
+            "/ --joint_ddt2_ckpt to do a comparison."
         )
     tags = [t for (t, _, _) in requested]
     loguru.logger.info(f"Comparing encoders: {tags}")
@@ -428,7 +439,7 @@ def main():
                 ckpt, network_cfg, task_cfg, args.device, args.use_ema, tag,
             )
             tln = None
-            if tag == "joint_ddt" and args.apply_target_ln:
+            if tag.startswith("joint_ddt") and args.apply_target_ln:
                 tln = _maybe_load_target_ln(
                     ck, network_cfg, args.device, args.use_ema, tag,
                 )

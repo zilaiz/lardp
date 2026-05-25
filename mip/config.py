@@ -207,15 +207,18 @@ class OptimizationConfig:
     # baseline behavior (single forward, state_loss shapes encoder).
     joint_state_loss_to_encoder: bool = True
     # DDT trunk ablation: when True, replace the trunk's x_state input with
-    # a learnable global state token and pin t_state=1 (clean-endpoint).
-    # Isolates the contribution of per-sample state generation to action
-    # denoising: trunk structure, attention paths, parameter count, and
-    # both heads are preserved, but the state slot carries no per-sample
-    # information. Hard-requires joint_state_loss_weight == 0 (the state
-    # head is asked to predict velocity from a constant input under a
-    # zeroed loss, which is only coherent when no gradient flows through
-    # v_state). The trunk's `learnable_state_token` is trained via the
-    # action_loss gradient (a global learnable bias on the state slot).
+    # a learnable global state token. t_state still passes through from the
+    # caller, so the state slot's AdaLN cond is exercised across the full
+    # t-range (independently sampled when joint_decouple_t=True, shared
+    # with t_action when False). Isolates the contribution of per-sample
+    # state generation to action denoising: trunk structure, attention
+    # paths, parameter count, and both heads are preserved, but the state
+    # slot carries no per-sample information. Hard-requires
+    # joint_state_loss_weight == 0 (the state head is asked to predict
+    # velocity from a constant input under a zeroed loss, which is only
+    # coherent when no gradient flows through v_state). The trunk's
+    # `learnable_state_token` is trained via the action_loss gradient (a
+    # global learnable bias on the state slot).
     joint_replace_x_state: bool = False
     # Mixed-data sampling (joint pipeline, expert + IDM rollouts):
     # Target fraction of each training batch drawn from the expert (primary)
@@ -258,7 +261,12 @@ class OptimizationConfig:
     # Base distribution used to sample training t before the per-stream
     # shift is applied. "uniform" uses Uniform[eps, 1-eps]; "logit_normal"
     # uses sigmoid(N(mu, sigma)) clamped to [eps, 1-eps], matching SD3/UNITE.
-    joint_t_dist: str = "uniform"  # "uniform" | "logit_normal"
+    # "beta" mirrors flow_beta_loss / PI-0: u ~ Beta(1.5, 1.0), t = 0.999*(1-u);
+    # biases mass toward the noise end (mip's t=0). eps is ignored (0.999 cap
+    # is intrinsic); leave joint_t_shift_* at 1.0 to match PI-0 exactly.
+    # "reverse_beta" reproduces the original (pre-fix) flow_beta: t ~ Beta(1.5,
+    # 1.0) directly, mass at t≈1 (data end). For A/B comparisons only.
+    joint_t_dist: str = "uniform"  # "uniform" | "logit_normal" | "beta" | "reverse_beta"
     joint_t_dist_mu: float = 0.0
     joint_t_dist_sigma: float = 1.0
 

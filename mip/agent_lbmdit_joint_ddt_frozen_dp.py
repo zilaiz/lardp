@@ -204,8 +204,8 @@ class LBMDiTJointDDTFrozenDPAgent(LBMDiTJointDDTFrozenAgent):
         self._t_dist = config.optimization.joint_t_dist
         self._t_dist_mu = float(config.optimization.joint_t_dist_mu)
         self._t_dist_sigma = float(config.optimization.joint_t_dist_sigma)
-        if self._t_dist not in ("uniform", "logit_normal"):
+        if self._t_dist not in ("uniform", "logit_normal", "beta", "reverse_beta"):
             raise ValueError(
-                f"joint_t_dist must be 'uniform' or 'logit_normal'; "
-                f"got {self._t_dist!r}"
+                f"joint_t_dist must be 'uniform', 'logit_normal', 'beta', or "
+                f"'reverse_beta'; got {self._t_dist!r}"
             )

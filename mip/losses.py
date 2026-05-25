@@ -41,6 +41,8 @@ def get_loss_fn(loss_type: str) -> Callable:
         return flow_reg_loss
     elif loss_type == "flow_beta":
         return flow_beta_loss
+    elif loss_type == "flow_reverse_beta":
+        return flow_reverse_beta_loss
     elif loss_type == "flow_ns":
         return flow_ns_loss
     elif loss_type == "flow_beta_ll":
@@ -318,6 +320,36 @@ def flow_beta_loss(
     b_t = flow_map.get_velocity(t, act_t, obs_emb)
 
     # compute loss
+    loss = get_norm(b_t - act_t_dot, config.norm_type)
+    loss = config.loss_scale * torch.mean(loss)
+    return loss, {}
+
+
+def flow_reverse_beta_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """Reproduces the original (pre-fix) flow_beta schedule.
+
+    Samples t ~ Beta(1.5, 1.0) directly, so mass lands near t=1, which under
+    mip's (1-t)*noise + t*data convention is the DATA end. Intended for A/B
+    comparisons against ``flow_beta_loss`` (PI-0 schedule, mass at noise end).
+    """
+    t = torch.distributions.Beta(1.5, 1.0).sample(delta_t.shape).to(delta_t.device)
+    act_0 = torch.empty_like(act).normal_(0, 1)
+    act_1 = act
+
+    obs_emb = encoder(obs, None)
+
+    act_t = interp.calc_It(t, act_0, act_1)
+    act_t_dot = interp.calc_It_dot(t, act_0, act_1)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+
     loss = get_norm(b_t - act_t_dot, config.norm_type)
     loss = config.loss_scale * torch.mean(loss)
     return loss, {}
