@@ -1,0 +1,30 @@
+# @package task
+# Franka coffee-pod with chunk-relative DELTA actions (7-dim).
+#
+# Action layout (was 10-dim absolute with rot6d):
+#   [pos_delta(3), axis_angle_delta(3), gripper(1)] = 7-dim
+#
+# All deltas are anchored to the EEF pose at the LAST OBS FRAME (chunk-start
+# state) and apply across the full action chunk — matches the openpi/pi 0.5
+# convention. Gripper is the explicit exception: it stays absolute.
+# Rotation deltas use 3-dim axis-angle in WORLD frame (matches DROID /
+# robosuite OSC_POSE / Diffusion Policy / OpenVLA / Octo).
+#
+# Dataset transform happens at load time: the HDF5 still stores absolute
+# 10-dim rot6d actions; ``delta_action_anchor: current_obs`` triggers the
+# in-RobomimicImage[IDM]Dataset transform that converts them to 7-dim
+# chunk-relative deltas + refits the action normalizer on deltas.
+defaults:
+  - franka_coffee_pod_cog_image
+  - _self_
+
+# Switch action representation to 7-dim chunk-relative deltas.
+# - act_dim describes what the MODEL sees (post-transform): 7-dim.
+# - shape_meta.action.shape stays 10 because the HDF5 still stores raw
+#   absolute 10-dim actions; the dataset transforms them at __getitem__.
+act_dim: 7
+action_type: "delta"            # informational; matches the actual format
+delta_action_anchor: "current_obs"
+
+# obs schema unchanged from the abs variant; shape_meta.action keeps the
+# raw HDF5 shape (10) so the replay-buffer loader validates correctly.

@@ -1,0 +1,14 @@
+# @package task
+# Joint-pipeline variant of the delta-action franka config.
+#
+# Same action transform as the parent (chunk-relative deltas via
+# delta_action_anchor: current_obs), but uses dataset_paths (list form)
+# instead of dataset_path so make_idm_dataset's path resolution picks it up.
+defaults:
+  - franka_coffee_pod_cog_image_delta
+  - _self_
+
+dataset_path: null
+dataset_paths:
+  - data/franka_coffee_pod_cog/image.hdf5
+filter_success: false

@@ -351,6 +351,10 @@ def main(config: Config):
             val_dataset_percentage=config.task.val_dataset_percentage,
             mode="val",
             normalizer=base_dataset.normalizer,
+            # Must match train dataset's action representation; otherwise the
+            # shared normalizer (fit on 7-dim deltas in delta mode) shape-mismatches
+            # the 10-dim raw actions at __getitem__ normalize step.
+            delta_action_anchor=getattr(config.task, "delta_action_anchor", None),
         )
         loguru.logger.info(f"Val IDM dataset: {len(val_dataset)} samples")
 

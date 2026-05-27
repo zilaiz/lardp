@@ -55,7 +55,7 @@ if LARDP_PATH not in sys.path:
 
 from mip.agent import TrainingAgent
 from mip.dataset_utils import MinMaxNormalizer, dict_apply
-from mip.franka_inference import decode_action
+from mip.franka_inference import decode_action, decode_delta_action
 
 app = Flask(__name__)
 
@@ -228,24 +228,43 @@ def _save_io_for_inspection(
                 f"values={arr.tolist()}"
             )
 
-    log_lines.append("[action] shape=(act_steps, 10) = [pos(3), rot6d(6), grip(1)]")
+    # action layout is shape-dependent: 10 = abs [pos, rot6d, grip],
+    # 7 = chunk-relative delta [pos_d, axis_angle_d, grip].
+    is_delta_action = action.shape[-1] == 7
     train_act_min = normalizer["action"].min
     train_act_max = normalizer["action"].max
-    for t, a in enumerate(action):
+    if is_delta_action:
         log_lines.append(
-            f"  t={t}: pos=[{a[0]:+.4f},{a[1]:+.4f},{a[2]:+.4f}]  "
-            f"rot6d=[{a[3]:+.4f},{a[4]:+.4f},{a[5]:+.4f},"
-            f"{a[6]:+.4f},{a[7]:+.4f},{a[8]:+.4f}]  "
-            f"grip={a[9]:.2f}"
+            "[action] shape=(act_steps, 7) = [pos_delta(3), axis_angle_delta(3), grip(1)]"
         )
+        for t, a in enumerate(action):
+            log_lines.append(
+                f"  t={t}: pos_d=[{a[0]:+.4f},{a[1]:+.4f},{a[2]:+.4f}]  "
+                f"aa_d=[{a[3]:+.4f},{a[4]:+.4f},{a[5]:+.4f}]  "
+                f"grip={a[6]:.2f}"
+            )
+        names = ['pos_dx', 'pos_dy', 'pos_dz',
+                 'aa_x', 'aa_y', 'aa_z',
+                 'grip']
+    else:
+        log_lines.append(
+            "[action] shape=(act_steps, 10) = [pos(3), rot6d(6), grip(1)]"
+        )
+        for t, a in enumerate(action):
+            log_lines.append(
+                f"  t={t}: pos=[{a[0]:+.4f},{a[1]:+.4f},{a[2]:+.4f}]  "
+                f"rot6d=[{a[3]:+.4f},{a[4]:+.4f},{a[5]:+.4f},"
+                f"{a[6]:+.4f},{a[7]:+.4f},{a[8]:+.4f}]  "
+                f"grip={a[9]:.2f}"
+            )
+        names = ['pos_x', 'pos_y', 'pos_z',
+                 'r6d_0', 'r6d_1', 'r6d_2', 'r6d_3', 'r6d_4', 'r6d_5',
+                 'grip']
 
     # Per-channel OOD summary (whole chunk) vs training range
     log_lines.append("[action OOD vs training]")
     a_min = action.min(axis=0)
     a_max = action.max(axis=0)
-    names = ['pos_x', 'pos_y', 'pos_z',
-             'r6d_0', 'r6d_1', 'r6d_2', 'r6d_3', 'r6d_4', 'r6d_5',
-             'grip']
     for i, nm in enumerate(names):
         flag = ""
         if a_min[i] < train_act_min[i] - 1e-3:
@@ -371,15 +390,30 @@ def predict():
             # Slice the executable window: drop pre-obs frames, take act_steps.
             start = config.task.obs_steps - 1
             end = start + config.task.act_steps
-            action = act[start:end].astype(np.float32)            # (act_steps, 10)
+            action = act[start:end].astype(np.float32)            # (act_steps, 7 or 10)
 
-            # Binarize the gripper channel to {0, 1} so the controller's
-            # equality-based smoothing (`grasps[i] != grasps[i-1]`) actually
-            # fires. Training data was binary; the policy outputs a soft
-            # scalar that the dataset's MinMax round-trip leaves continuous.
-            action[:, 9] = (action[:, 9] > 0.5).astype(np.float32)
-
-            decoded = decode_action(action)                       # pos / quat_xyzw / gripper
+            # Detect action format from the task config.
+            # - abs  (10-dim) [pos(3), rot6d(6), gripper(1)]      → decode_action
+            # - delta (7-dim) [pos_d(3), axis_angle_d(3), grip(1)] → decode_delta_action
+            #                  anchored at the LAST obs frame (un-normalized).
+            is_delta = (
+                getattr(config.task, "delta_action_anchor", None) == "current_obs"
+            )
+            if is_delta:
+                # Gripper is dim 6 in the 7-dim delta format; binarize same way.
+                action[:, 6] = (action[:, 6] > 0.5).astype(np.float32)
+                # Anchor: un-normalized EEF pose at the last obs frame
+                # (matches the dataset's load-time delta transform anchor).
+                anchor_pos = obs_np_raw["robot0_eef_pos"][-1].astype(np.float32)
+                anchor_quat_xyzw = obs_np_raw["robot0_eef_quat"][-1].astype(np.float32)
+                decoded = decode_delta_action(action, anchor_pos, anchor_quat_xyzw)
+            else:
+                # Binarize the gripper channel to {0, 1} so the controller's
+                # equality-based smoothing (`grasps[i] != grasps[i-1]`) actually
+                # fires. Training data was binary; the policy outputs a soft
+                # scalar that the dataset's MinMax round-trip leaves continuous.
+                action[:, 9] = (action[:, 9] > 0.5).astype(np.float32)
+                decoded = decode_action(action)                   # pos / quat_xyzw / gripper
             t_to_cpu = time.time() - t0
 
         # Diagnostic dump (no-op if --save_obs_dir not set)

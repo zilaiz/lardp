@@ -74,6 +74,7 @@ class FrankaImageDataset(BaseDataset):
         val_dataset_percentage: float = 0.0,
         mode: str = "train",
         normalizer: dict | None = None,
+        delta_action_anchor: str | None = None,
     ):
         super().__init__()
         self.val_dataset_percentage = val_dataset_percentage
@@ -122,8 +123,63 @@ class FrankaImageDataset(BaseDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
+        self.delta_action_anchor = delta_action_anchor
+        if self.delta_action_anchor is not None:
+            if self.delta_action_anchor != "current_obs":
+                raise ValueError(
+                    f"Only delta_action_anchor='current_obs' is supported; "
+                    f"got {self.delta_action_anchor!r}"
+                )
+            if self.n_obs_steps is None:
+                raise ValueError(
+                    "delta_action_anchor='current_obs' requires n_obs_steps "
+                    "to be set (the anchor is the last obs frame)."
+                )
+            for k in ("robot0_eef_pos", "robot0_eef_quat"):
+                if k not in self.lowdim_keys:
+                    raise ValueError(
+                        f"delta_action_anchor='current_obs' requires "
+                        f"'{k}' in lowdim obs keys; got {self.lowdim_keys}"
+                    )
 
         self.normalizer = normalizer if normalizer is not None else self.get_normalizer()
+
+    def _compute_chunk_relative_deltas_for_normalizer(self) -> np.ndarray:
+        """Stack delta-transformed actions across all in-episode chunks.
+
+        Mirrors the helper in RobomimicImageDataset — used to fit the action
+        normalizer on delta-distributed data when ``delta_action_anchor`` is
+        set. Reads ``replay_buffer`` directly so we don't pay the per-sample
+        image-decode cost during normalizer fitting.
+        """
+        from mip.franka_delta_transform import to_delta
+
+        actions = np.asarray(self.replay_buffer["action"][:])           # (T, 10)
+        eef_pos = np.asarray(self.replay_buffer["robot0_eef_pos"][:])   # (T, 3)
+        eef_quat = np.asarray(self.replay_buffer["robot0_eef_quat"][:]) # (T, 4) xyzw
+        episode_ends = np.asarray(self.replay_buffer.episode_ends[:])
+
+        H = self.horizon
+        To = self.n_obs_steps
+
+        all_deltas: list[np.ndarray] = []
+        prev_end = 0
+        for ep_end in episode_ends:
+            k_max = min(ep_end - H, ep_end - To) + 1
+            for k in range(prev_end, k_max):
+                anchor_pos = eef_pos[k + To - 1]
+                anchor_quat = eef_quat[k + To - 1]
+                abs_actions = actions[k : k + H]
+                all_deltas.append(
+                    to_delta(abs_actions, anchor_pos, anchor_quat)
+                )
+            prev_end = ep_end
+        if not all_deltas:
+            raise RuntimeError(
+                "No valid chunks found for delta normalizer fitting "
+                f"(H={H}, To={To}, episode_ends={episode_ends})"
+            )
+        return np.concatenate(all_deltas, axis=0)
 
     def get_normalizer(self) -> dict:
         normalizer: dict = defaultdict(dict)
@@ -131,7 +187,11 @@ class FrankaImageDataset(BaseDataset):
             normalizer["obs"][key] = MinMaxNormalizer(self.replay_buffer[key][:])
         for key in self.rgb_keys:
             normalizer["obs"][key] = ImageNormalizer()
-        normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
+        if self.delta_action_anchor == "current_obs":
+            delta_actions = self._compute_chunk_relative_deltas_for_normalizer()
+            normalizer["action"] = MinMaxNormalizer(delta_actions)
+        else:
+            normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
         return normalizer
 
     def __str__(self) -> str:
@@ -159,12 +219,24 @@ class FrankaImageDataset(BaseDataset):
             obs_dict[key] = self.normalizer["obs"][key].normalize(img)
             del sample[key]
 
+        # Capture raw (un-normalized) anchor BEFORE the lowdim loop deletes
+        # robot0_eef_pos / quat. The captured arrays are used by the delta
+        # transform below.
+        anchor_pos = None
+        anchor_quat = None
+        if self.delta_action_anchor == "current_obs":
+            anchor_pos = sample["robot0_eef_pos"][self.n_obs_steps - 1].astype(np.float32)
+            anchor_quat = sample["robot0_eef_quat"][self.n_obs_steps - 1].astype(np.float32)
+
         for key in self.lowdim_keys:
             arr = sample[key][T_slice].astype(np.float32)
             obs_dict[key] = self.normalizer["obs"][key].normalize(arr)
             del sample[key]
 
         action = sample["action"].astype(np.float32)
+        if self.delta_action_anchor == "current_obs":
+            from mip.franka_delta_transform import to_delta
+            action = to_delta(action, anchor_pos, anchor_quat)
         action = self.normalizer["action"].normalize(action)
 
         return {
@@ -332,4 +404,5 @@ def make_franka_dataset(task_config, mode: str = "train") -> FrankaImageDataset:
         pad_after=task_config.act_steps - 1,
         val_dataset_percentage=task_config.val_dataset_percentage,
         mode=mode,
+        delta_action_anchor=getattr(task_config, "delta_action_anchor", None),
     )

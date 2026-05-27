@@ -380,6 +380,13 @@ class TaskConfig:
     env_type: str = "ph"
     abs_action: bool = True
     action_type: str = "absolute"  # "absolute" or "delta"
+    # When set, transform absolute actions into chunk-relative deltas at
+    # dataset-load time. Currently the only supported value is "current_obs":
+    # anchor = robot0_eef_pos/quat at the LAST obs frame, applied across the
+    # full action chunk (matches openpi/pi 0.5 + DROID/robosuite convention).
+    # The transformed action is 7-dim [pos_delta(3), axis_angle_delta(3), grip(1)].
+    # See mip/franka_delta_transform.py for the math.
+    delta_action_anchor: str | None = None
     # Dataset configuration - either HuggingFace or local path
     dataset_repo: str | None = (
         None  # HuggingFace repository ID (e.g., "ChaoyiPan/mip-dataset")

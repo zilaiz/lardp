@@ -179,6 +179,7 @@ def _make_multi_image_dataset(task_config, mode="train"):
         pad_after=task_config.act_steps - 1,
         abs_action=task_config.abs_action,
         mode=mode,
+        delta_action_anchor=getattr(task_config, "delta_action_anchor", None),
     )
 
     # Primary (expert) dataset with val split
@@ -436,6 +437,7 @@ class RobomimicImageDataset(BaseDataset):
         mode="train",
         normalizer=None,
         filter_success=False,
+        delta_action_anchor: str | None = None,
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -486,11 +488,69 @@ class RobomimicImageDataset(BaseDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.n_obs_steps = n_obs_steps
+        self.delta_action_anchor = delta_action_anchor
+        if self.delta_action_anchor is not None:
+            if self.delta_action_anchor != "current_obs":
+                raise ValueError(
+                    f"Only delta_action_anchor='current_obs' is supported; "
+                    f"got {self.delta_action_anchor!r}"
+                )
+            if self.n_obs_steps is None:
+                raise ValueError(
+                    "delta_action_anchor='current_obs' requires n_obs_steps "
+                    "to be set (the anchor is the last obs frame)."
+                )
+            for k in ("robot0_eef_pos", "robot0_eef_quat"):
+                if k not in self.lowdim_keys:
+                    raise ValueError(
+                        f"delta_action_anchor='current_obs' requires "
+                        f"'{k}' in lowdim obs keys; got {self.lowdim_keys}"
+                    )
 
         if normalizer is not None:
             self.normalizer = normalizer
         else:
             self.normalizer = self.get_normalizer()
+
+    def _compute_chunk_relative_deltas_for_normalizer(self) -> np.ndarray:
+        """Stack delta-transformed actions across all in-episode chunks.
+
+        Used to fit the action normalizer when ``delta_action_anchor`` is set.
+        Accesses ``replay_buffer`` directly (skips the sampler's image fetches)
+        and ignores ``pad_before``/``pad_after`` — for MinMax fitting we just
+        need representative coverage of the in-distribution delta magnitudes.
+        """
+        from mip.franka_delta_transform import to_delta
+
+        actions = np.asarray(self.replay_buffer["action"][:])           # (T, 10)
+        eef_pos = np.asarray(self.replay_buffer["robot0_eef_pos"][:])   # (T, 3)
+        eef_quat = np.asarray(self.replay_buffer["robot0_eef_quat"][:]) # (T, 4) xyzw
+        episode_ends = np.asarray(self.replay_buffer.episode_ends[:])
+
+        H = self.horizon
+        To = self.n_obs_steps if self.n_obs_steps is not None else 1
+
+        all_deltas: list[np.ndarray] = []
+        prev_end = 0
+        for ep_end in episode_ends:
+            # Valid in-episode chunk starts k: need k+To-1 < ep_end (anchor in
+            # episode) AND k+H <= ep_end (full action chunk in episode).
+            k_max = min(ep_end - H, ep_end - To) + 1
+            for k in range(prev_end, k_max):
+                anchor_pos = eef_pos[k + To - 1]
+                anchor_quat = eef_quat[k + To - 1]
+                abs_actions = actions[k : k + H]
+                all_deltas.append(
+                    to_delta(abs_actions, anchor_pos, anchor_quat)
+                )
+            prev_end = ep_end
+
+        if not all_deltas:
+            raise RuntimeError(
+                "No valid chunks found for delta normalizer fitting "
+                f"(H={H}, To={To}, episode_ends={episode_ends})"
+            )
+        return np.concatenate(all_deltas, axis=0)
 
     def get_normalizer(self):
         normalizer = defaultdict(dict)
@@ -498,7 +558,13 @@ class RobomimicImageDataset(BaseDataset):
             normalizer["obs"][key] = MinMaxNormalizer(self.replay_buffer[key][:])
         for key in self.rgb_keys:
             normalizer["obs"][key] = ImageNormalizer()
-        normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
+        if self.delta_action_anchor == "current_obs":
+            # Fit on delta-transformed actions so action samples live in a
+            # well-scaled [-1, 1] range matching the delta distribution.
+            delta_actions = self._compute_chunk_relative_deltas_for_normalizer()
+            normalizer["action"] = MinMaxNormalizer(delta_actions)
+        else:
+            normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
 
         return normalizer
 
@@ -530,6 +596,14 @@ class RobomimicImageDataset(BaseDataset):
             del sample[key]
             obs_dict[key] = self.normalizer["obs"][key].normalize(obs_dict[key])
 
+        # Capture raw (un-normalized) eef pose at the last obs frame BEFORE
+        # we normalize lowdim obs — needed as the delta-action anchor.
+        anchor_pos = None
+        anchor_quat = None
+        if self.delta_action_anchor == "current_obs":
+            anchor_pos = sample["robot0_eef_pos"][self.n_obs_steps - 1].astype(np.float32)
+            anchor_quat = sample["robot0_eef_quat"][self.n_obs_steps - 1].astype(np.float32)
+
         for key in self.lowdim_keys:
             obs_dict[key] = sample[key][T_slice].astype(np.float32)
             del sample[key]
@@ -537,6 +611,9 @@ class RobomimicImageDataset(BaseDataset):
 
         # action
         action = sample["action"].astype(np.float32)
+        if self.delta_action_anchor == "current_obs":
+            from mip.franka_delta_transform import to_delta
+            action = to_delta(action, anchor_pos, anchor_quat)
         action = self.normalizer["action"].normalize(action)
 
         torch_data = {
@@ -588,6 +665,7 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
         normalizer=None,
         filter_success=False,
         optimality_label: int = 0,
+        delta_action_anchor: str | None = None,
     ):
         # We need to override the parent's __init__ because:
         # 1. sequence_length must be horizon+1 (extra frame for goal)
@@ -645,6 +723,24 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
             "IDM dataset needs horizon > n_obs_steps so an intermediate frame "
             "strictly between To_1 and goal exists."
         )
+        self.delta_action_anchor = delta_action_anchor
+        if self.delta_action_anchor is not None:
+            if self.delta_action_anchor != "current_obs":
+                raise ValueError(
+                    f"Only delta_action_anchor='current_obs' is supported; "
+                    f"got {self.delta_action_anchor!r}"
+                )
+            if self.n_obs_steps is None:
+                raise ValueError(
+                    "delta_action_anchor='current_obs' requires n_obs_steps "
+                    "to be set (the anchor is the last obs frame)."
+                )
+            for k in ("robot0_eef_pos", "robot0_eef_quat"):
+                if k not in self.lowdim_keys:
+                    raise ValueError(
+                        f"delta_action_anchor='current_obs' requires "
+                        f"'{k}' in lowdim obs keys; got {self.lowdim_keys}"
+                    )
 
         if normalizer is not None:
             self.normalizer = normalizer
@@ -709,6 +805,15 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
 
         # Action: first `horizon` frames
         action = sample["action"][: self.horizon].astype(np.float32)
+        if self.delta_action_anchor == "current_obs":
+            # Anchor at the last obs frame's eef pose (chunk-relative deltas).
+            # The raw sample dict still has the un-normalized eef_pos / quat
+            # because we read it via sample[key], not via the normalized
+            # obs_dict above (which has been MinMax'd).
+            anchor_pos = sample["robot0_eef_pos"][self.n_obs_steps - 1].astype(np.float32)
+            anchor_quat = sample["robot0_eef_quat"][self.n_obs_steps - 1].astype(np.float32)
+            from mip.franka_delta_transform import to_delta
+            action = to_delta(action, anchor_pos, anchor_quat)
         action = self.normalizer["action"].normalize(action)
 
         torch_data = {
@@ -792,6 +897,7 @@ def make_idm_dataset(task_config, mode="train", normalizer=None):
         pad_after=task_config.act_steps - 1,
         abs_action=task_config.abs_action,
         mode=mode,
+        delta_action_anchor=getattr(task_config, "delta_action_anchor", None),
     )
 
     # Create primary (expert) dataset with val split applied. The primary

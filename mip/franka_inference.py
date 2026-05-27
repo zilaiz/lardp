@@ -78,6 +78,77 @@ def rot6d_to_quat_xyzw(rot6d: np.ndarray) -> np.ndarray:
     return q_xyzw.reshape(R.shape[:-2] + (4,)).astype(np.float32)
 
 
+def decode_delta_action(
+    delta7: np.ndarray,
+    anchor_pos: np.ndarray,
+    anchor_quat_xyzw: np.ndarray,
+    gripper_threshold: float = 0.5,
+) -> dict[str, np.ndarray]:
+    """Decode an un-normalized 7-dim CHUNK-RELATIVE delta action chunk.
+
+    Use this when the policy was trained with
+    ``task.delta_action_anchor: current_obs`` (see
+    ``mip/franka_delta_transform.py``). Each step in the chunk is anchored
+    to the SAME ``anchor_pos`` / ``anchor_quat_xyzw`` (the EEF pose at the
+    moment the chunk was queried — typically the last obs frame).
+
+    Composes the world-frame delta against the anchor DIRECTLY into the
+    controller's (pos, quat, gripper) format — no intermediate rot6d
+    round-trip. Rotation math is:
+        target_pos = anchor_pos + delta_pos                  (world frame)
+        R_target   = R_delta @ R_anchor                       (world-frame premultiply)
+        target_quat = quat_xyzw(R_target), with qw >= 0 canonicalization
+
+    Args:
+        delta7: ``(H, 7)`` un-normalized delta actions
+            ``[pos_delta(3), axis_angle_delta(3), gripper(1)]``. Apply
+            ``dataset.normalizer["action"].unnormalize(...)`` before passing.
+        anchor_pos: ``(3,)`` world-frame anchor EEF position in meters
+            (= ``obs.robot0_eef_pos[-1]`` at chunk-query time, un-normalized).
+        anchor_quat_xyzw: ``(4,)`` world-frame anchor EEF quaternion in xyzw
+            (= ``obs.robot0_eef_quat[-1]``, un-normalized).
+        gripper_threshold: binarization threshold for gripper output.
+
+    Returns:
+        Same dict shape as ``decode_action`` (pos / quat_xyzw / gripper /
+        gripper_continuous), each leading-dim ``(H, ...)``.
+    """
+    delta7 = np.asarray(delta7, dtype=np.float32)
+    if delta7.shape[-1] != 7:
+        raise ValueError(
+            f"decode_delta_action expected last dim=7, got shape {delta7.shape}"
+        )
+    anchor_pos = np.asarray(anchor_pos, dtype=np.float32)
+    anchor_quat = np.asarray(anchor_quat_xyzw, dtype=np.float32)
+
+    # Position: world-frame add.
+    target_pos = (delta7[..., :3] + anchor_pos[None, :]).astype(np.float32)
+
+    # Rotation: compose R_delta (from axis-angle) with R_anchor (from quat).
+    # R_target = R_delta @ R_anchor  (world-frame rotation premultiply).
+    R_anchor = Rotation.from_quat(anchor_quat).as_matrix()                  # (3, 3)
+    R_delta = Rotation.from_rotvec(delta7[..., 3:6]).as_matrix()            # (..., 3, 3)
+    R_target = R_delta @ R_anchor                                            # broadcast OK
+
+    # To quaternion + canonicalize qw >= 0 (matches decode_action's convention).
+    flat = R_target.reshape(-1, 3, 3)
+    q_xyzw = Rotation.from_matrix(flat).as_quat()                            # (N, 4)
+    neg = q_xyzw[..., 3:4] < 0
+    q_xyzw = np.where(neg, -q_xyzw, q_xyzw)
+    target_quat = q_xyzw.reshape(R_target.shape[:-2] + (4,)).astype(np.float32)
+
+    # Gripper: absolute (no anchor involved), threshold for the binary {0, 1} command.
+    grip_cont = delta7[..., 6].astype(np.float32)
+    grip = (grip_cont > gripper_threshold).astype(np.float32)
+
+    return {
+        "pos": target_pos,
+        "quat_xyzw": target_quat,
+        "gripper": grip,
+        "gripper_continuous": grip_cont,
+    }
+
+
 def decode_action(
     action10: np.ndarray,
     gripper_threshold: float = 0.5,
