@@ -141,16 +141,39 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self.interpolant = Interpolant(config.optimization.interp_type)
 
         # --- Optimizer (trunk + encoder + LN) ---
-        params = (
-            list(self.net.parameters())
-            + list(self.encoder.parameters())
-            + list(self.target_ln.parameters())
-        )
-        self.optimizer = torch.optim.AdamW(
-            params,
-            lr=config.optimization.lr,
-            weight_decay=config.optimization.weight_decay,
-        )
+        # The encoder + target_ln (the representation) can be optimized at a
+        # reduced LR relative to the trunk via ``joint_encoder_lr_scale`` < 1,
+        # slowing the representation so the trunk adapts to it rather than the
+        # latent collapsing to ease the denoising objective (JEDI / JEPA /
+        # TD-MPC2 anti-collapse lever). scale == 1.0 keeps the original single
+        # param group for exact checkpoint/optimizer-state compatibility.
+        enc_lr_scale = float(config.optimization.joint_encoder_lr_scale)
+        base_lr = config.optimization.lr
+        wd = config.optimization.weight_decay
+        if enc_lr_scale == 1.0:
+            params = (
+                list(self.net.parameters())
+                + list(self.encoder.parameters())
+                + list(self.target_ln.parameters())
+            )
+            self.optimizer = torch.optim.AdamW(params, lr=base_lr, weight_decay=wd)
+        else:
+            # Trunk group first so ``get_last_lr()[0]`` logs the trunk LR.
+            param_groups = [
+                {"params": list(self.net.parameters()), "lr": base_lr},
+                {
+                    "params": (
+                        list(self.encoder.parameters())
+                        + list(self.target_ln.parameters())
+                    ),
+                    "lr": base_lr * enc_lr_scale,
+                },
+            ]
+            self.optimizer = torch.optim.AdamW(param_groups, weight_decay=wd)
+            loguru.logger.info(
+                f"Encoder + target_ln LR scaled to {enc_lr_scale}x trunk LR "
+                f"({base_lr * enc_lr_scale:g} vs {base_lr:g})"
+            )
 
         # Cache scalars
         self._w_state = config.optimization.joint_state_loss_weight
@@ -160,6 +183,12 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._sample_mode = config.optimization.joint_sample_mode
         self._num_steps = config.optimization.joint_num_steps
         self._decouple_t = config.optimization.joint_decouple_t
+        self._play_avoid_both_noise = bool(
+            getattr(config.optimization, "joint_play_avoid_both_noise", False)
+        )
+        self._play_both_noise_tau = float(
+            getattr(config.optimization, "joint_play_both_noise_tau", 0.5)
+        )
         self._t_schedule = config.optimization.joint_t_schedule
         self._pyramid_offset = config.optimization.joint_pyramid_offset
         self._t_eps = config.optimization.joint_t_eps
@@ -178,6 +207,30 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 f"joint_t_dist must be 'uniform', 'logit_normal', 'beta', or "
                 f"'reverse_beta'; got {self._t_dist!r}"
             )
+        # State-head parameterization: "velocity" (raw v_state output) or
+        # "x1" (UNITE-style — treat output as x1 estimate, LN it, derive v
+        # analytically). See OptimizationConfig.joint_state_param.
+        self._state_param = getattr(
+            config.optimization, "joint_state_param", "velocity",
+        )
+        if self._state_param not in ("velocity", "x1"):
+            raise ValueError(
+                f"joint_state_param must be 'velocity' or 'x1'; "
+                f"got {self._state_param!r}"
+            )
+        # Action-head parameterization (analog of state, no LN). See
+        # OptimizationConfig.joint_action_param.
+        self._action_param = getattr(
+            config.optimization, "joint_action_param", "velocity",
+        )
+        if self._action_param not in ("velocity", "x1"):
+            raise ValueError(
+                f"joint_action_param must be 'velocity' or 'x1'; "
+                f"got {self._action_param!r}"
+            )
+        self._x1_pred_eps = float(
+            getattr(config.optimization, "joint_x1_pred_eps", 5e-2)
+        )
 
 
     def _build_net(self, config: Config, obs_dim: int, device) -> nn.Module:
@@ -278,13 +331,20 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             z_goal_ln = self.target_ln(self.encoder(goal_obs, None))
             target = z_goal_ln.detach()
 
-        # 2. Optimality labels with CFG dropout.
+        # 2. Optimality labels with CFG dropout. ``optimality is None`` means
+        # the dataset carries no labels (unlabeled fallback) — distinct from a
+        # real all-play batch; the play corner-avoidance keys off real labels.
+        labels_provided = optimality is not None
         if optimality is None:
             optimality = torch.full(
                 (B,), LBMDiTJoint.NULL_IDX, dtype=torch.long, device=device,
             )
         else:
             optimality = optimality.to(device=device, dtype=torch.long)
+        # Data-source play mask, captured pre-dropout (CFG dropout below
+        # relabels some expert samples to NULL; corner-avoidance keys off the
+        # data source, so dropped-expert keeps the full t-distribution).
+        is_play_data = optimality == LBMDiTJoint.NULL_IDX
         if self.net.training and self._cfg_dropout_prob > 0:
             drop_mask = torch.rand(B, device=device) < self._cfg_dropout_prob
             optimality = torch.where(
@@ -304,6 +364,19 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         if self._decouple_t:
             t_state_base = self._sample_base_t((B,), device, lo, hi)
             t_action_base = self._sample_base_t((B,), device, lo, hi)
+            # Apply whenever optimality labels are real (mixed OR pure-play);
+            # skip only the unlabeled fallback (optimality was None), where
+            # every sample defaults to NULL and might actually be expert.
+            if self._play_avoid_both_noise and labels_provided:
+                # Play data: drop the both-near-noise corner (unconditional
+                # joint generation); lift one random stream into [tau, hi] so
+                # the sample lands in an IDM/FDM-like regime instead.
+                tau = self._play_both_noise_tau
+                fix = is_play_data & (t_state_base < tau) & (t_action_base < tau)
+                pick_state = torch.rand(B, device=device) < 0.5
+                new_t = torch.empty(B, device=device).uniform_(tau, hi)
+                t_state_base = torch.where(fix & pick_state, new_t, t_state_base)
+                t_action_base = torch.where(fix & ~pick_state, new_t, t_action_base)
             t_state = self._apply_t_shift(t_state_base, self._shift_state)
             t_action = self._apply_t_shift(t_action_base, self._shift_action)
         else:
@@ -323,12 +396,15 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
 
         # 5. Joint forward — DDT trunk takes the two times directly.
         #    If state_loss is configured to NOT flow into the encoder, run
-        #    two forward passes: one with z_t.detach() to produce v_state
-        #    (encoder receives no state_loss grad), one with live z_t to
-        #    produce v_action (encoder still receives action_loss grad).
-        #    Otherwise a single forward feeds both heads (baseline path).
+        #    two forward passes: one with z_t.detach() to produce the state
+        #    head output (encoder receives no state_loss grad), one with
+        #    live z_t to produce the action head output (encoder still
+        #    receives action_loss grad). Otherwise a single forward feeds
+        #    both heads. ``s_head`` and ``a_head`` are raw head outputs;
+        #    their meaning depends on the per-stream parameterization
+        #    (velocity directly, or x1-estimate to be converted in step 6).
         if self._state_loss_to_encoder:
-            v_state, v_action, _ = self.net(
+            s_head, a_head, _ = self.net(
                 x_state=s_t,
                 x_action=a_t,
                 s=t_state,
@@ -337,7 +413,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 optimality_idx=optimality,
             )
         else:
-            v_state, _, _ = self.net(
+            s_head, _, _ = self.net(
                 x_state=s_t,
                 x_action=a_t,
                 s=t_state,
@@ -345,7 +421,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 condition=z_t.detach(),
                 optimality_idx=optimality,
             )
-            _, v_action, _ = self.net(
+            _, a_head, _ = self.net(
                 x_state=s_t,
                 x_action=a_t,
                 s=t_state,
@@ -354,12 +430,40 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 optimality_idx=optimality,
             )
 
-        # 6. Per-stream losses (per-element MSE so weights are interpretable).
+        # 6. Per-stream parameterization.
+        #    State:
+        #      "velocity": ``s_head`` is v_state directly (baseline); v_gt is
+        #                  ``s_t_dot`` (= target - s_noise), no clamp.
+        #      "x1":       ``s_head`` is an x1-estimate of ``target``; derive
+        #                  v_state = (s_head - s_t) / (1 - t_state) with matched
+        #                  clamp on v_gt. No LN on the prediction.
+        #    Action:
+        #      "velocity": ``a_head`` is v_action directly; v_gt = a_t_dot.
+        #      "x1":       ``a_head`` is an x1-estimate of ``act``; derive
+        #                  v_action = (a_head - a_t) / (1 - t_action), matched
+        #                  clamp on v_gt.
+        if self._state_param == "x1":
+            denom_s = (1.0 - t_state).clamp_min(self._x1_pred_eps).view(-1, 1, 1)
+            v_state = (s_head - s_t) / denom_s
+            v_state_gt = (target - s_t) / denom_s
+        else:
+            v_state = s_head
+            v_state_gt = s_t_dot
+
+        if self._action_param == "x1":
+            denom_a = (1.0 - t_action).clamp_min(self._x1_pred_eps).view(-1, 1, 1)
+            v_action = (a_head - a_t) / denom_a
+            v_action_gt = (act - a_t) / denom_a
+        else:
+            v_action = a_head
+            v_action_gt = a_t_dot
+
+        # 7. Per-stream losses (per-element MSE so weights are interpretable).
         state_loss_unscaled = torch.mean(
-            get_norm(v_state - s_t_dot, config.norm_type)
+            get_norm(v_state - v_state_gt, config.norm_type)
         ) / float(self.net.obs_dim)
         action_loss_unscaled = torch.mean(
-            get_norm(v_action - a_t_dot, config.norm_type)
+            get_norm(v_action - v_action_gt, config.norm_type)
         ) / float(self.net.act_dim)
         loss = (
             self._w_state * state_loss_unscaled
@@ -485,6 +589,41 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         t_action = self._apply_t_shift(t_action, self._shift_action)
         return t_state, t_action
 
+    def _head_to_velocity(
+        self,
+        head_cond: torch.Tensor,
+        head_un: torch.Tensor | None,
+        x_t: torch.Tensor,
+        t_scalar: float,
+        cfg_scale: float,
+        ln_module: nn.Module | None,
+        use_x1_param: bool,
+    ) -> torch.Tensor:
+        """Convert head output(s) into a velocity for one Euler step.
+
+        Under ``use_x1_param=True``: optionally LN each branch via
+        ``ln_module`` ("norm_first" CFG; pass ``ln_module=None`` to skip LN),
+        CFG-mix, then derive ``v = (x_pred - x_t) / max(1 - t, eps)``.
+        Under ``use_x1_param=False``: CFG-mix the raw outputs directly
+        (treat them as velocity).
+
+        ``head_un`` is unused when ``cfg_scale <= 0``.
+        """
+        if not use_x1_param:
+            if cfg_scale > 0:
+                return (1 + cfg_scale) * head_cond - cfg_scale * head_un
+            return head_cond
+        if ln_module is not None:
+            head_cond = ln_module(head_cond)
+            if cfg_scale > 0:
+                head_un = ln_module(head_un)
+        if cfg_scale > 0:
+            x_pred = (1 + cfg_scale) * head_cond - cfg_scale * head_un
+        else:
+            x_pred = head_cond
+        denom = max(1.0 - t_scalar, self._x1_pred_eps)
+        return (x_pred - x_t) / denom
+
     @torch.no_grad()
     def sample(
         self,
@@ -528,17 +667,28 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             t_state_b = torch.full((B,), ts_now, device=device)
             t_action_b = torch.full((B,), ta_now, device=device)
 
-            v_s_cond, v_a_cond, _ = net(
+            s_head_cond, a_head_cond, _ = net(
                 x_state, x_action, t_state_b, t_action_b, z_t, expert_idx,
             )
             if cfg_scale > 0:
-                v_s_un, v_a_un, _ = net(
+                s_head_un, a_head_un, _ = net(
                     x_state, x_action, t_state_b, t_action_b, z_t, null_idx,
                 )
-                v_s = (1 + cfg_scale) * v_s_cond - cfg_scale * v_s_un
-                v_a = (1 + cfg_scale) * v_a_cond - cfg_scale * v_a_un
             else:
-                v_s, v_a = v_s_cond, v_a_cond
+                s_head_un, a_head_un = None, None
+
+            # State stream: parameterization + CFG (no LN on the prediction).
+            v_s = self._head_to_velocity(
+                s_head_cond, s_head_un, x_state, ts_now, cfg_scale,
+                ln_module=None,
+                use_x1_param=(self._state_param == "x1"),
+            )
+            # Action stream: no LN; parameterization + CFG.
+            v_a = self._head_to_velocity(
+                a_head_cond, a_head_un, x_action, ta_now, cfg_scale,
+                ln_module=None,
+                use_x1_param=(self._action_param == "x1"),
+            )
 
             x_state = x_state + v_s * ds
             x_action = x_action + v_a * da
@@ -591,17 +741,28 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             t_state_b = torch.full((B,), ts_now, device=device)
             t_action_b = torch.full((B,), ta_now, device=device)
 
-            v_s_cond, v_a_cond, _ = net(
+            s_head_cond, a_head_cond, _ = net(
                 x_state, x_action, t_state_b, t_action_b, z_t, expert_idx,
             )
             if cfg_scale > 0:
-                v_s_un, v_a_un, _ = net(
+                s_head_un, a_head_un, _ = net(
                     x_state, x_action, t_state_b, t_action_b, z_t, null_idx,
                 )
-                v_s = (1 + cfg_scale) * v_s_cond - cfg_scale * v_s_un
-                v_a = (1 + cfg_scale) * v_a_cond - cfg_scale * v_a_un
             else:
-                v_s, v_a = v_s_cond, v_a_cond
+                s_head_un, a_head_un = None, None
+
+            # State stream: parameterization + CFG (no LN on the prediction).
+            v_s = self._head_to_velocity(
+                s_head_cond, s_head_un, x_state, ts_now, cfg_scale,
+                ln_module=None,
+                use_x1_param=(self._state_param == "x1"),
+            )
+            # Action stream: no LN; parameterization + CFG.
+            v_a = self._head_to_velocity(
+                a_head_cond, a_head_un, x_action, ta_now, cfg_scale,
+                ln_module=None,
+                use_x1_param=(self._action_param == "x1"),
+            )
 
             x_state = x_state + v_s * ds
             x_action = x_action + v_a * da

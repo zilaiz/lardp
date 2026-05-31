@@ -42,6 +42,17 @@ def build_normalizer_arrays(config_path: str) -> dict:
     )
     val_pct = float(getattr(task, "val_dataset_percentage", 0.0))
 
+    # When delta_action_anchor='current_obs' the dataset transforms raw
+    # 10-dim absolute actions to 7-dim chunk-relative deltas at load time
+    # and refits the action normalizer on those deltas. The deploy-time
+    # stats must match — fit MinMax on transformed deltas instead of raw.
+    delta_anchor = getattr(task, "delta_action_anchor", None)
+    if delta_anchor is not None and delta_anchor != "current_obs":
+        raise ValueError(
+            f"Only delta_action_anchor='current_obs' is supported; "
+            f"got {delta_anchor!r}"
+        )
+
     print(f"Reading: {dataset_path}")
     with h5py.File(str(dataset_path), "r") as f:
         demos = f["data"]
@@ -57,7 +68,49 @@ def build_normalizer_arrays(config_path: str) -> dict:
             ]
             return np.concatenate(chunks, axis=0)
 
-        action = _concat("actions")
+        if delta_anchor == "current_obs":
+            # Mirrors FrankaImageDataset._compute_chunk_relative_deltas_for_normalizer:
+            # iterate over valid chunk starts per episode, anchor at the last obs
+            # frame (k + To - 1), call to_delta, then MinMax-fit on the concat.
+            from mip.franka_delta_transform import to_delta
+
+            H = int(task.horizon)
+            To = int(task.obs_steps)
+            actions_raw = _concat("actions")                          # (T, 10)
+            eef_pos_raw = _concat("obs/robot0_eef_pos")               # (T, 3)
+            eef_quat_raw = _concat("obs/robot0_eef_quat")             # (T, 4) xyzw
+
+            # episode_ends as cumulative offsets across the train demos only.
+            ep_lengths = [
+                int(demos[f"demo_{i}"]["actions"].shape[0])
+                for i in demo_indices
+            ]
+            episode_ends = np.cumsum(ep_lengths).tolist()
+
+            all_deltas: list[np.ndarray] = []
+            prev_end = 0
+            for ep_end in episode_ends:
+                k_max = min(ep_end - H, ep_end - To) + 1
+                for k in range(prev_end, k_max):
+                    anchor_pos = eef_pos_raw[k + To - 1]
+                    anchor_quat = eef_quat_raw[k + To - 1]
+                    all_deltas.append(
+                        to_delta(actions_raw[k : k + H], anchor_pos, anchor_quat)
+                    )
+                prev_end = ep_end
+            if not all_deltas:
+                raise RuntimeError(
+                    f"No valid chunks for delta normalizer "
+                    f"(H={H}, To={To}, n_eps={len(episode_ends)})"
+                )
+            action = np.concatenate(all_deltas, axis=0)               # (N, 7)
+            print(f"  action mode=delta (H={H}, To={To}): "
+                  f"transformed {actions_raw.shape[0]} raw steps -> "
+                  f"{action.shape[0]} delta chunks * H rows")
+        else:
+            action = _concat("actions")
+            print(f"  action mode=absolute: shape={action.shape}")
+
         action_norm = MinMaxNormalizer(action)
         print(f"  action: shape={action.shape} "
               f"min={action_norm.min} max={action_norm.max}")

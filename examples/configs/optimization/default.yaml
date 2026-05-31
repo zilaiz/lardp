@@ -162,6 +162,10 @@ joint_use_ema_target: false
 # still flows into the encoder via the live z_t forward used for v_action.
 # Costs ~2x trunk compute. Default true preserves baseline behavior.
 joint_state_loss_to_encoder: true
+# Encoder + target_ln LR multiplier relative to trunk LR. 1.0 = single param
+# group (baseline). < 1 slows the representation vs the trunk (JEDI uses 0.3;
+# anti-collapse lever when state_loss flows into the encoder).
+joint_encoder_lr_scale: 1.0
 # DDT trunk ablation: replace x_state with a learnable global token and pin
 # t_state=1 (clean endpoint) inside the trunk's forward. Hard-requires
 # joint_state_loss_weight == 0. Isolates the contribution of per-sample
@@ -181,6 +185,11 @@ expert_sample_fraction: 0.5
 # decoupled noising). If false, share a single t between streams (recovers
 # E2E behavior on the new trunk for A/B comparison).
 joint_decouple_t: true
+# Play-data ablation: drop the both-near-noise corner of the decoupled
+# (t_state, t_action) square for play-source samples (joint generation stays
+# expert-only); tau = pre-shift base-t threshold. No-op when decouple_t=false.
+joint_play_avoid_both_noise: false
+joint_play_both_noise_tau: 0.5
 # Inference (t_state, t_action) trajectory through [0, 1]^2.
 #   "diagonal":    t_state == t_action at every step (single Euler walk).
 #   "state_first": clean state in first half, then clean action.
@@ -204,3 +213,29 @@ joint_t_shift_action: 1.0
 joint_t_dist: "uniform"
 joint_t_dist_mu: 0.0
 joint_t_dist_sigma: 1.0
+# State-head parameterization for DDT/PT joint agents.
+#   "velocity": net's state-head output IS v_state; loss = MSE(v_state - s_t_dot).
+#               Baseline / backwards-compatible.
+#   "x1":       UNITE-style. Net output is treated as the x1-estimate of the
+#               LN'd goal-obs embedding; target_ln is applied to it so the
+#               prediction lives in the same manifold as the target, then
+#               v_state = (target_ln(s_pred) - s_t) / (1 - t_state) is derived
+#               for both the loss and Euler integration. The same clamped
+#               denominator is applied to v_gt (matches UNITE). Loss form
+#               stays velocity-MSE (equivalent to x1-MSE with 1/(1-t)^2
+#               weighting). For full UNITE faithfulness, also set
+#               joint_target_ln_affine=true and joint_t_dist="logit_normal".
+joint_state_param: "velocity"
+# Action-head parameterization for DDT/PT joint agents.
+#   "velocity": net's action-head output IS v_action; loss = MSE(v_action - a_t_dot).
+#               Baseline / backwards-compatible.
+#   "x1":       Net output is the x1-estimate a_pred of the clean action chunk;
+#               v_action = (a_pred - a_t) / (1 - t_action) derived for both
+#               loss and integration. No LN (actions aren't a learned manifold).
+#               Loss form stays velocity-MSE (equivalent to x1-MSE with
+#               1/(1-t)^2 weighting; matches PI-0 / standard FM policies).
+joint_action_param: "velocity"
+# Floor on (1 - t) when deriving v from x1-prediction under the x1
+# parameterization. Mirrors UNITE's train_eps/sample_eps=5e-2 clamp; used by
+# both state and action streams when their respective param is "x1".
+joint_x1_pred_eps: 0.05

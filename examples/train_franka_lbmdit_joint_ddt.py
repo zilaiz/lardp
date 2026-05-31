@@ -72,17 +72,17 @@ def _to_device_obs(batch, key, config: Config) -> TensorDict:
     return TensorDict(obs_dict, batch_size=bs)
 
 
-def _read_optimality(batch: dict, batch_size: int, device) -> torch.Tensor:
-    """Per-sample optimality labels in {0=expert, 1=null/play}.
+def _read_optimality(batch: dict, batch_size: int, device) -> torch.Tensor | None:
+    """Per-sample optimality labels in {0=expert, 1=null/play}, or None.
 
     ``make_idm_dataset`` tags samples per source path: primary -> 0, additional
-    paths -> 1. Older datasets without the field fall back to null/play.
+    paths -> 1. When the field is absent, return None so the agent fills NULL
+    for conditioning AND knows the data is unlabeled (label-keyed logic like the
+    play t-corner-avoidance distinguishes this from a real all-play batch).
     """
     if "optimality" in batch:
         return batch["optimality"].to(device=device, dtype=torch.long)
-    return torch.full(
-        (batch_size,), LBMDiTJoint.NULL_IDX, dtype=torch.long, device=device,
-    )
+    return None
 
 
 @torch.no_grad()
@@ -139,17 +139,30 @@ def compute_val_loss(
         a_t = agent.interpolant.calc_It(t_action, a_noise, act)
         a_t_dot = agent.interpolant.calc_It_dot(t_action, a_noise, act)
 
-        v_state, v_action, _ = net(
+        s_head, a_head, _ = net(
             x_state=s_t, x_action=a_t,
             s=t_state, t=t_action,
             condition=z_t, optimality_idx=optimality,
         )
+        # Mirror agent.update step 6 parameterization (no LN on the x1 pred).
+        if agent._state_param == "x1":
+            denom_s = (1.0 - t_state).clamp_min(agent._x1_pred_eps).view(-1, 1, 1)
+            v_state = (s_head - s_t) / denom_s
+            v_state_gt = (target - s_t) / denom_s
+        else:
+            v_state, v_state_gt = s_head, s_t_dot
+        if agent._action_param == "x1":
+            denom_a = (1.0 - t_action).clamp_min(agent._x1_pred_eps).view(-1, 1, 1)
+            v_action = (a_head - a_t) / denom_a
+            v_action_gt = (act - a_t) / denom_a
+        else:
+            v_action, v_action_gt = a_head, a_t_dot
         state_losses.append(float(
-            (torch.mean(get_norm(v_state - s_t_dot, cfg.norm_type))
+            (torch.mean(get_norm(v_state - v_state_gt, cfg.norm_type))
              / float(net.obs_dim)).item()
         ))
         action_losses.append(float(
-            (torch.mean(get_norm(v_action - a_t_dot, cfg.norm_type))
+            (torch.mean(get_norm(v_action - v_action_gt, cfg.norm_type))
              / float(net.act_dim)).item()
         ))
 

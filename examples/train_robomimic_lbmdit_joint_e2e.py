@@ -48,22 +48,21 @@ def timed(section: str, record_dict: dict):
 
 def _read_optimality(
     batch: dict, batch_size: int, device,
-) -> torch.Tensor:
-    """Per-sample optimality labels in {0=expert, 1=null/play}.
+) -> torch.Tensor | None:
+    """Per-sample optimality labels in {0=expert, 1=null/play}, or None.
 
     The IDM dataset tags samples with ``optimality_label`` per source path:
     primary path (``dataset_paths[0]``) -> 0 (expert), additional paths -> 1
     (null/play). When the dataset doesn't carry the field (older checkpoints
-    or custom datasets) we fall back to the null slot — the safer default,
-    matching the agent's own None-handling. If you actually have expert-only
-    data without per-sample tags, override this helper to return zeros.
+    or custom datasets) we return None: the agent fills NULL for conditioning
+    (same as before) AND knows the data is unlabeled, so label-keyed logic
+    (e.g. the play t-corner-avoidance) can distinguish this from a real
+    all-play batch. If you have expert-only data without tags, override this
+    helper to return zeros.
     """
     if "optimality" in batch:
         return batch["optimality"].to(device=device, dtype=torch.long)
-    from mip.networks.lbmdit_joint import LBMDiTJoint
-    return torch.full(
-        (batch_size,), LBMDiTJoint.NULL_IDX, dtype=torch.long, device=device,
-    )
+    return None
 
 
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):

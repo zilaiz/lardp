@@ -206,6 +206,14 @@ class OptimizationConfig:
     # action_loss and destabilize encoder training. Default True preserves
     # baseline behavior (single forward, state_loss shapes encoder).
     joint_state_loss_to_encoder: bool = True
+    # E2E/DDT/PT variant only: LR multiplier for the encoder + target_ln
+    # param group, relative to the trunk LR (``lr``). 1.0 = single group
+    # (baseline, exact checkpoint/optimizer compat). Values < 1 slow the
+    # representation relative to the trunk so the trunk adapts to a
+    # slowly-moving latent rather than the latent collapsing to ease the
+    # denoising objective (JEDI uses 0.3; spirit of JEPA/TD-MPC2). Anti-
+    # collapse lever for when state_loss is allowed into the encoder.
+    joint_encoder_lr_scale: float = 1.0
     # DDT trunk ablation: when True, replace the trunk's x_state input with
     # a learnable global state token. t_state still passes through from the
     # caller, so the state slot's AdaLN cond is exercised across the full
@@ -233,6 +241,16 @@ class OptimizationConfig:
     # training (DF-style decoupled noising). If False, the same scalar t
     # is used for both streams (diagonal training, matches LBMDiTJointE2E).
     joint_decouple_t: bool = True
+    # Play-data ablation: when True, exclude the both-near-noise corner of the
+    # decoupled (t_state, t_action) square for play-source samples (optimality
+    # == NULL pre-CFG-dropout). That corner = unconditional joint generation of
+    # a (suboptimal) rollout, which you want only on expert data; play keeps
+    # the IDM/FDM-like regimes. If both base times < tau, one randomly chosen
+    # stream is lifted into [tau, hi]. No-op when joint_decouple_t=False.
+    joint_play_avoid_both_noise: bool = False
+    # Threshold (pre-shift base-t space) defining "near the noise end" for the
+    # above: a play sample is in the avoided corner when both base t < tau.
+    joint_play_both_noise_tau: float = 0.5
     # Inference t-schedule for the (state, action) flow pair.
     #   "diagonal":    t_state = t_action = grid (single Euler walk).
     #   "state_first": clean state first (t_state ramps 0->1 in first half),
@@ -269,6 +287,35 @@ class OptimizationConfig:
     joint_t_dist: str = "uniform"  # "uniform" | "logit_normal" | "beta" | "reverse_beta"
     joint_t_dist_mu: float = 0.0
     joint_t_dist_sigma: float = 1.0
+    # State-head parameterization (DDT/PT joint agents).
+    #   "velocity": network's state-head output is the velocity v_state; loss
+    #       is MSE(v_state - s_t_dot). Baseline / backwards-compatible.
+    #   "x1":      UNITE-style. Network output is treated as the x1-estimate
+    #       s_pred of the LN'd goal-obs embedding; target_ln is applied to
+    #       s_pred so prediction lives in the same manifold as the target,
+    #       then v_state = (target_ln(s_pred) - s_t) / (1 - t_state) is
+    #       derived analytically for both the loss and Euler integration.
+    #       Loss form stays MSE in velocity space (equivalent to x1-MSE with
+    #       a 1/(1-t)^2 weighting). At sampling, CFG mixes the LN'd s_pred
+    #       per-branch ("norm_first" in UNITE terms), then v_state is derived.
+    joint_state_param: str = "velocity"
+    # Action-head parameterization (DDT/PT joint agents).
+    #   "velocity": network's action-head output is v_action; loss is
+    #               MSE(v_action - a_t_dot). Baseline / backwards-compatible.
+    #   "x1":       Network output is treated as the x1-estimate ``a_pred`` of
+    #               the clean action chunk; v_action is derived as
+    #               (a_pred - a_t) / (1 - t_action) for both loss and Euler
+    #               integration. SAME clamped denominator is applied to v_gt.
+    #               NO LN is applied — actions aren't a learned representation
+    #               on a target manifold, so UNITE's LN-on-output trick doesn't
+    #               transfer cleanly. Loss form stays velocity-MSE (equivalent
+    #               to x1-MSE with 1/(1-t)^2 weighting; matches PI-0 /
+    #               standard FM-policy parameterization).
+    joint_action_param: str = "velocity"
+    # Floor on (1 - t) when deriving v from x1-prediction under the x1
+    # parameterization. Mirrors UNITE's train_eps/sample_eps=5e-2 clamp; used
+    # by both state and action streams when their respective param is "x1".
+    joint_x1_pred_eps: float = 5e-2
 
 
 @dataclass
