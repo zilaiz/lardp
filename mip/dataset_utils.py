@@ -1060,6 +1060,68 @@ class MinMaxNormalizer:
         return x
 
 
+class QuantileNormalizer:
+    """Normalize by mapping a [q_low, q_high] quantile range to [-1, 1].
+
+    Robust drop-in alternative to ``MinMaxNormalizer``: the per-dimension
+    scale is anchored on quantiles (default 1st / 99th percentile) instead of
+    the global min/max, so a small fraction of outliers can no longer inflate
+    the range and crush the bulk of the signal into a thin band. This matches
+    the per-dim quantile normalization used by OpenVLA and pi 0.5.
+
+    Exposes ``.min`` / ``.max`` / ``.range`` (the linear anchors, set to the
+    low/high quantiles) so it is interchangeable with ``MinMaxNormalizer``
+    everywhere those attributes are read (e.g. the npz normalizer export and
+    the deploy-time unnormalize). The normalize/unnormalize map is the same
+    linear transform; only the fitted anchors differ.
+
+    Values outside [q_low, q_high] map outside [-1, 1] (no clipping), keeping
+    the transform exactly invertible.
+    """
+
+    def __init__(self, X, q_low: float = 1.0, q_high: float = 99.0):
+        X = X.reshape(-1, X.shape[-1]).astype(np.float32)
+        self.q_low = float(q_low)
+        self.q_high = float(q_high)
+        self.min = np.percentile(X, self.q_low, axis=0).astype(np.float32)
+        self.max = np.percentile(X, self.q_high, axis=0).astype(np.float32)
+        self.range = self.max - self.min
+        if np.any(self.range == 0):
+            logger.warning(
+                "QuantileNormalizer: some features have q_low == q_high "
+                "(near-constant dim). These will be set to range 1."
+            )
+            self.range[self.range == 0] = 1
+
+    @classmethod
+    def from_bounds(cls, lo, hi, q_low: float = 1.0, q_high: float = 99.0):
+        """Build directly from precomputed low/high anchors (skips fitting).
+
+        Used when merging normalizers across datasets, where only the fitted
+        anchors are available (not the raw data).
+        """
+        obj = cls.__new__(cls)
+        obj.q_low = float(q_low)
+        obj.q_high = float(q_high)
+        obj.min = np.asarray(lo, dtype=np.float32)
+        obj.max = np.asarray(hi, dtype=np.float32)
+        obj.range = (obj.max - obj.min).astype(np.float32)
+        obj.range[obj.range == 0] = 1
+        return obj
+
+    def normalize(self, x):
+        x = x.astype(np.float32)
+        nx = (x - self.min) / self.range
+        nx = nx * 2 - 1
+        return nx
+
+    def unnormalize(self, x):
+        x = x.astype(np.float32)
+        nx = (x + 1) / 2
+        x = nx * self.range + self.min
+        return x
+
+
 class EmptyNormalizer:
     """do nothing and change nothing."""
 

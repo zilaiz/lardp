@@ -19,6 +19,7 @@ from tqdm import tqdm
 from mip.dataset_utils import (
     ImageNormalizer,
     MinMaxNormalizer,
+    QuantileNormalizer,
     ReplayBuffer,
     RotationTransformer,
     SequenceSampler,
@@ -180,6 +181,9 @@ def _make_multi_image_dataset(task_config, mode="train"):
         abs_action=task_config.abs_action,
         mode=mode,
         delta_action_anchor=getattr(task_config, "delta_action_anchor", None),
+        delta_action_normalizer=getattr(
+            task_config, "delta_action_normalizer", "quantile"
+        ),
     )
 
     # Primary (expert) dataset with val split
@@ -438,6 +442,7 @@ class RobomimicImageDataset(BaseDataset):
         normalizer=None,
         filter_success=False,
         delta_action_anchor: str | None = None,
+        delta_action_normalizer: str = "quantile",
     ):
         super().__init__()
         self.rotation_transformer = RotationTransformer(
@@ -445,6 +450,10 @@ class RobomimicImageDataset(BaseDataset):
         )
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
+        # Only consulted on the delta-action (current_obs) branch of
+        # get_normalizer(); robomimic abs/relative tasks never set
+        # delta_action_anchor, so this leaves their MinMax path untouched.
+        self.delta_action_normalizer = delta_action_normalizer
 
         self.replay_buffer = _convert_robomimic_to_replay(
             store=zarr.storage.MemoryStore(),
@@ -561,8 +570,13 @@ class RobomimicImageDataset(BaseDataset):
         if self.delta_action_anchor == "current_obs":
             # Fit on delta-transformed actions so action samples live in a
             # well-scaled [-1, 1] range matching the delta distribution.
+            # Quantile (default) is robust to the heavy-tailed, sub-degree
+            # rotation deltas that MinMax would crush into a thin band.
             delta_actions = self._compute_chunk_relative_deltas_for_normalizer()
-            normalizer["action"] = MinMaxNormalizer(delta_actions)
+            if getattr(self, "delta_action_normalizer", "quantile") == "quantile":
+                normalizer["action"] = QuantileNormalizer(delta_actions)
+            else:
+                normalizer["action"] = MinMaxNormalizer(delta_actions)
         else:
             normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
 
@@ -666,6 +680,7 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
         filter_success=False,
         optimality_label: int = 0,
         delta_action_anchor: str | None = None,
+        delta_action_normalizer: str = "quantile",
     ):
         # We need to override the parent's __init__ because:
         # 1. sequence_length must be horizon+1 (extra frame for goal)
@@ -676,6 +691,9 @@ class RobomimicImageIDMDataset(RobomimicImageDataset):
         # CFG-aware agents (e.g. LBMDiTJointAgent): 0 = expert, 1 = null/play.
         # Default 0 keeps single-source training silent.
         self.optimality_label = int(optimality_label)
+        # Action-normalizer choice for the delta (current_obs) branch of
+        # get_normalizer(); ignored when delta_action_anchor is None.
+        self.delta_action_normalizer = delta_action_normalizer
         self.rotation_transformer = RotationTransformer(
             from_rep="axis_angle", to_rep=rotation_rep
         )
@@ -851,12 +869,19 @@ def _merge_normalizers(normalizers):
                 f"Inconsistent normalizer types for obs key '{key}': "
                 f"{[type(n).__name__ for n in sub_norms]}"
             )
-    # Merge action normalizer
+    # Merge action normalizer. For QuantileNormalizer (delta path) the .min/.max
+    # anchors are the per-dim q01/q99; merging by union of [q01, q99] across
+    # datasets is an approximation of the global quantiles (errs toward a wider,
+    # less aggressive range — safe). MinMax merge is byte-for-byte unchanged, so
+    # robomimic action merges are unaffected.
     act_norms = [n["action"] for n in normalizers]
     global_min = np.minimum.reduce([n.min for n in act_norms])
     global_max = np.maximum.reduce([n.max for n in act_norms])
-    dummy = np.stack([global_min, global_max])
-    merged["action"] = MinMaxNormalizer(dummy)
+    if all(isinstance(n, QuantileNormalizer) for n in act_norms):
+        merged["action"] = QuantileNormalizer.from_bounds(global_min, global_max)
+    else:
+        dummy = np.stack([global_min, global_max])
+        merged["action"] = MinMaxNormalizer(dummy)
     return merged
 
 
@@ -898,6 +923,9 @@ def make_idm_dataset(task_config, mode="train", normalizer=None):
         abs_action=task_config.abs_action,
         mode=mode,
         delta_action_anchor=getattr(task_config, "delta_action_anchor", None),
+        delta_action_normalizer=getattr(
+            task_config, "delta_action_normalizer", "quantile"
+        ),
     )
 
     # Create primary (expert) dataset with val split applied. The primary

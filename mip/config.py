@@ -434,6 +434,13 @@ class TaskConfig:
     # The transformed action is 7-dim [pos_delta(3), axis_angle_delta(3), grip(1)].
     # See mip/franka_delta_transform.py for the math.
     delta_action_anchor: str | None = None
+    # Normalizer for the (delta) action channel: "quantile" (default; maps the
+    # 1st/99th percentile per dim to [-1, 1], robust to outliers — recommended
+    # for delta actions whose rotation channel is tiny + heavy-tailed) or
+    # "minmax" (legacy global min/max, the DP default). Only affects the action
+    # normalizer; obs normalizers stay MinMax. Absolute-action runs keep MinMax
+    # regardless (the abs channels are full-range, so the choice barely matters).
+    delta_action_normalizer: str = "quantile"
     # Dataset configuration - either HuggingFace or local path
     dataset_repo: str | None = (
         None  # HuggingFace repository ID (e.g., "ChaoyiPan/mip-dataset")

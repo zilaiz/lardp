@@ -32,6 +32,7 @@ from tqdm import tqdm
 from mip.dataset_utils import (
     ImageNormalizer,
     MinMaxNormalizer,
+    QuantileNormalizer,
     ReplayBuffer,
     SequenceSampler,
     dict_apply,
@@ -75,10 +76,12 @@ class FrankaImageDataset(BaseDataset):
         mode: str = "train",
         normalizer: dict | None = None,
         delta_action_anchor: str | None = None,
+        delta_action_normalizer: str = "quantile",
     ):
         super().__init__()
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
+        self.delta_action_normalizer = delta_action_normalizer
 
         # Parse obs keys from shape_meta
         rgb_keys: list[str] = []
@@ -189,7 +192,10 @@ class FrankaImageDataset(BaseDataset):
             normalizer["obs"][key] = ImageNormalizer()
         if self.delta_action_anchor == "current_obs":
             delta_actions = self._compute_chunk_relative_deltas_for_normalizer()
-            normalizer["action"] = MinMaxNormalizer(delta_actions)
+            if getattr(self, "delta_action_normalizer", "quantile") == "quantile":
+                normalizer["action"] = QuantileNormalizer(delta_actions)
+            else:
+                normalizer["action"] = MinMaxNormalizer(delta_actions)
         else:
             normalizer["action"] = MinMaxNormalizer(self.replay_buffer["action"][:])
         return normalizer
@@ -405,4 +411,7 @@ def make_franka_dataset(task_config, mode: str = "train") -> FrankaImageDataset:
         val_dataset_percentage=task_config.val_dataset_percentage,
         mode=mode,
         delta_action_anchor=getattr(task_config, "delta_action_anchor", None),
+        delta_action_normalizer=getattr(
+            task_config, "delta_action_normalizer", "quantile"
+        ),
     )

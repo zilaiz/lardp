@@ -25,6 +25,11 @@ defaults:
 act_dim: 7
 action_type: "delta"            # informational; matches the actual format
 delta_action_anchor: "current_obs"
+# Robust per-dim quantile (q01/q99 -> [-1,1]) normalizer for the delta action.
+# The sub-degree, heavy-tailed rotation deltas get crushed into a thin,
+# off-center band by global MinMax; quantile matches OpenVLA / pi 0.5. Set to
+# "minmax" to recover the legacy behavior.
+delta_action_normalizer: "quantile"
 
 # obs schema unchanged from the abs variant; shape_meta.action keeps the
 # raw HDF5 shape (10) so the replay-buffer loader validates correctly.

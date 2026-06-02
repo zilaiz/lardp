@@ -25,7 +25,7 @@ import h5py
 import numpy as np
 from omegaconf import OmegaConf
 
-from mip.dataset_utils import MinMaxNormalizer
+from mip.dataset_utils import MinMaxNormalizer, QuantileNormalizer
 
 
 def build_normalizer_arrays(config_path: str) -> dict:
@@ -52,6 +52,11 @@ def build_normalizer_arrays(config_path: str) -> dict:
             f"Only delta_action_anchor='current_obs' is supported; "
             f"got {delta_anchor!r}"
         )
+    # Match the run's training-time action normalizer. Default "minmax": a
+    # saved config WITHOUT this field is a pre-quantile run (trained MinMax),
+    # so exporting MinMax keeps deploy stats consistent with the model. New
+    # delta runs record delta_action_normalizer="quantile" in their config.
+    action_norm_type = getattr(task, "delta_action_normalizer", "minmax")
 
     print(f"Reading: {dataset_path}")
     with h5py.File(str(dataset_path), "r") as f:
@@ -111,7 +116,15 @@ def build_normalizer_arrays(config_path: str) -> dict:
             action = _concat("actions")
             print(f"  action mode=absolute: shape={action.shape}")
 
-        action_norm = MinMaxNormalizer(action)
+        # Absolute actions always use MinMax (full-range channels). Delta
+        # actions honor the run's configured normalizer (quantile by default
+        # for new runs; see action_norm_type above).
+        if delta_anchor == "current_obs" and action_norm_type == "quantile":
+            action_norm = QuantileNormalizer(action)
+            print("  action normalizer=quantile (q01/q99)")
+        else:
+            action_norm = MinMaxNormalizer(action)
+            print("  action normalizer=minmax")
         print(f"  action: shape={action.shape} "
               f"min={action_norm.min} max={action_norm.max}")
 
