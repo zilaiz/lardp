@@ -202,14 +202,47 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._t_dist = config.optimization.joint_t_dist
         self._t_dist_mu = float(config.optimization.joint_t_dist_mu)
         self._t_dist_sigma = float(config.optimization.joint_t_dist_sigma)
-        if self._t_dist not in ("uniform", "logit_normal", "beta", "reverse_beta"):
-            raise ValueError(
-                f"joint_t_dist must be 'uniform', 'logit_normal', 'beta', or "
-                f"'reverse_beta'; got {self._t_dist!r}"
-            )
+        # Per-stream overrides (used only when joint_decouple_t=True). Each
+        # falls back to the shared value when its config field is None, so
+        # existing configs reproduce the shared-distribution behavior exactly.
+        def _coalesce(stream_val, shared_val):
+            return shared_val if stream_val is None else stream_val
+        self._t_dist_state = _coalesce(
+            getattr(config.optimization, "joint_t_dist_state", None), self._t_dist
+        )
+        self._t_dist_mu_state = float(_coalesce(
+            getattr(config.optimization, "joint_t_dist_mu_state", None),
+            self._t_dist_mu,
+        ))
+        self._t_dist_sigma_state = float(_coalesce(
+            getattr(config.optimization, "joint_t_dist_sigma_state", None),
+            self._t_dist_sigma,
+        ))
+        self._t_dist_action = _coalesce(
+            getattr(config.optimization, "joint_t_dist_action", None), self._t_dist
+        )
+        self._t_dist_mu_action = float(_coalesce(
+            getattr(config.optimization, "joint_t_dist_mu_action", None),
+            self._t_dist_mu,
+        ))
+        self._t_dist_sigma_action = float(_coalesce(
+            getattr(config.optimization, "joint_t_dist_sigma_action", None),
+            self._t_dist_sigma,
+        ))
+        _valid_dists = ("uniform", "logit_normal", "beta", "reverse_beta")
+        for name, val in (
+            ("joint_t_dist", self._t_dist),
+            ("joint_t_dist_state", self._t_dist_state),
+            ("joint_t_dist_action", self._t_dist_action),
+        ):
+            if val not in _valid_dists:
+                raise ValueError(
+                    f"{name} must be one of {_valid_dists}; got {val!r}"
+                )
         # State-head parameterization: "velocity" (raw v_state output) or
-        # "x1" (UNITE-style — treat output as x1 estimate, LN it, derive v
-        # analytically). See OptimizationConfig.joint_state_param.
+        # "x1" (UNITE-style — treat the raw output as the x1 estimate of the
+        # LN'd target and derive v analytically; no LN is applied to the
+        # prediction itself). See OptimizationConfig.joint_state_param.
         self._state_param = getattr(
             config.optimization, "joint_state_param", "velocity",
         )
@@ -279,7 +312,14 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         return alpha * t / (1.0 + (alpha - 1.0) * t)
 
     def _sample_base_t(
-        self, shape: tuple, device: torch.device, lo: float, hi: float,
+        self,
+        shape: tuple,
+        device: torch.device,
+        lo: float,
+        hi: float,
+        dist: str | None = None,
+        mu: float | None = None,
+        sigma: float | None = None,
     ) -> torch.Tensor:
         """Sample base flow time before any per-stream shift is applied.
 
@@ -290,16 +330,24 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         ``"reverse_beta"`` reproduces the original (pre-fix) flow_beta:
         t ~ Beta(1.5, 1.0) directly, mass at t≈1 (data end). For A/B only.
         lo/hi are ignored on the beta branches — caps are intrinsic.
+
+        ``dist`` / ``mu`` / ``sigma`` default to the shared ``self._t_dist`` /
+        ``_t_dist_mu`` / ``_t_dist_sigma`` so existing callers are unchanged;
+        pass per-stream values to give the state and action streams different
+        base distributions (mu/sigma only matter on the logit_normal branch).
         """
-        if self._t_dist == "uniform":
+        dist = self._t_dist if dist is None else dist
+        mu = self._t_dist_mu if mu is None else mu
+        sigma = self._t_dist_sigma if sigma is None else sigma
+        if dist == "uniform":
             return torch.empty(shape, device=device).uniform_(lo, hi)
-        if self._t_dist == "beta":
+        if dist == "beta":
             u = torch.distributions.Beta(1.5, 1.0).sample(shape).to(device)
             return 0.999 * (1.0 - u)
-        if self._t_dist == "reverse_beta":
+        if dist == "reverse_beta":
             return torch.distributions.Beta(1.5, 1.0).sample(shape).to(device)
         # logit_normal
-        z = torch.randn(shape, device=device) * self._t_dist_sigma + self._t_dist_mu
+        z = torch.randn(shape, device=device) * sigma + mu
         t = torch.sigmoid(z)
         return t.clamp(lo, hi)
 
@@ -362,8 +410,15 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         eps = self._t_eps
         lo, hi = eps, 1.0 - eps
         if self._decouple_t:
-            t_state_base = self._sample_base_t((B,), device, lo, hi)
-            t_action_base = self._sample_base_t((B,), device, lo, hi)
+            t_state_base = self._sample_base_t(
+                (B,), device, lo, hi,
+                self._t_dist_state, self._t_dist_mu_state, self._t_dist_sigma_state,
+            )
+            t_action_base = self._sample_base_t(
+                (B,), device, lo, hi,
+                self._t_dist_action, self._t_dist_mu_action,
+                self._t_dist_sigma_action,
+            )
             # Apply whenever optimality labels are real (mixed OR pure-play);
             # skip only the unlabeled fallback (optimality was None), where
             # every sample defaults to NULL and might actually be expert.

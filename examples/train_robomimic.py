@@ -221,7 +221,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
             loguru.logger.info("Evaluate model...")
             agent.eval()
             metrics = {"step": n_gradient_step}
-            num_steps_list = get_default_step_list(config.optimization.loss_type)
+            num_steps_list = config.optimization.eval_num_steps or get_default_step_list(config.optimization.loss_type)
             # Compute rollout path once if saving rollouts
             _rollout_path = None
             if getattr(config.log, "save_rollouts", False):
@@ -630,7 +630,7 @@ def main(config):
             _obs_tag = "image" if config.task.obs_type == "image" else "low_dim"
             _rollout_path = str(Path("data/robomimic") / config.task.env_name / f"{_obs_tag}_rollouts.hdf5")
 
-        num_steps_list = get_default_step_list(config.optimization.loss_type)
+        num_steps_list = config.optimization.eval_num_steps or get_default_step_list(config.optimization.loss_type)
         for num_steps in num_steps_list:
             _save = getattr(config.log, "save_rollouts", False) and num_steps == 3
             metrics = {"step": num_steps}

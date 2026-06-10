@@ -37,6 +37,9 @@ class OptimizationConfig:
     lr: float = 1e-4
     weight_decay: float = 1e-5
     num_steps: int = 1
+    # Override the eval-time ODE step counts. None -> use
+    # get_default_step_list(loss_type). Set e.g. [25] to eval at just 25 steps.
+    eval_num_steps: list[int] | None = None
     sample_mode: str = "stochastic"  # "zero", "mean"
     # Goal-predictor ODE source override. None -> inherit `sample_mode`.
     # Useful when the goal distribution and the action distribution have
@@ -287,17 +290,31 @@ class OptimizationConfig:
     joint_t_dist: str = "uniform"  # "uniform" | "logit_normal" | "beta" | "reverse_beta"
     joint_t_dist_mu: float = 0.0
     joint_t_dist_sigma: float = 1.0
+    # Optional per-stream overrides of the base t distribution (only used when
+    # joint_decouple_t=True). Each defaults to None -> fall back to the shared
+    # joint_t_dist / mu / sigma above, so existing configs are unchanged. Lets
+    # the state and action streams train on different t schedules, e.g. state =
+    # logit_normal + shift (UNITE, pairs with joint_state_param="x1") while
+    # action = beta unshifted (PI-0, pairs with joint_action_param="velocity").
+    # mu / sigma only matter for "logit_normal"; the beta branches ignore them.
+    joint_t_dist_state: str | None = None
+    joint_t_dist_mu_state: float | None = None
+    joint_t_dist_sigma_state: float | None = None
+    joint_t_dist_action: str | None = None
+    joint_t_dist_mu_action: float | None = None
+    joint_t_dist_sigma_action: float | None = None
     # State-head parameterization (DDT/PT joint agents).
     #   "velocity": network's state-head output is the velocity v_state; loss
     #       is MSE(v_state - s_t_dot). Baseline / backwards-compatible.
-    #   "x1":      UNITE-style. Network output is treated as the x1-estimate
-    #       s_pred of the LN'd goal-obs embedding; target_ln is applied to
-    #       s_pred so prediction lives in the same manifold as the target,
-    #       then v_state = (target_ln(s_pred) - s_t) / (1 - t_state) is
-    #       derived analytically for both the loss and Euler integration.
-    #       Loss form stays MSE in velocity space (equivalent to x1-MSE with
-    #       a 1/(1-t)^2 weighting). At sampling, CFG mixes the LN'd s_pred
-    #       per-branch ("norm_first" in UNITE terms), then v_state is derived.
+    #   "x1":      UNITE-style. The raw network output is treated as the
+    #       x1-estimate s_pred of the (LN'd) goal-obs embedding — no LN is
+    #       applied to the prediction itself; it is regressed against the
+    #       LN'd target. v_state = (s_pred - s_t) / max(1 - t_state, eps)
+    #       is derived analytically for both the loss and Euler integration,
+    #       with the same clamped denominator applied to v_gt (so the loss
+    #       is an unbiased x1-MSE with a 1/(1-t)^2 weighting capped at
+    #       1/eps^2). At sampling, CFG mixes the raw s_pred per-branch,
+    #       then v_state is derived.
     joint_state_param: str = "velocity"
     # Action-head parameterization (DDT/PT joint agents).
     #   "velocity": network's action-head output is v_action; loss is

@@ -13,6 +13,9 @@ norm_type: "l2" # "l1", "l2", "smooth_l1"
 lr: 1e-4
 weight_decay: 1e-5
 num_steps: 1
+# Override eval-time ODE step counts. null -> use get_default_step_list(loss_type).
+# Set e.g. [25] to evaluate at just 25 steps (primary metric mean_success_25).
+eval_num_steps: null
 sample_mode: "zero"
 goal_sample_mode: null  # null = inherit sample_mode; set "stochastic"/"zero" to override only the goal ODE
 t_two_step: 0.9
@@ -213,18 +216,30 @@ joint_t_shift_action: 1.0
 joint_t_dist: "uniform"
 joint_t_dist_mu: 0.0
 joint_t_dist_sigma: 1.0
+# Optional per-stream overrides of the base t distribution (DDT/PT joint
+# agents; used only when joint_decouple_t=true). null = fall back to the
+# shared joint_t_dist / mu / sigma above, so existing runs are unchanged.
+# Lets state and action train on different t schedules, e.g. state =
+# logit_normal + shift (UNITE) while action = beta unshifted (PI-0).
+# mu / sigma only matter for "logit_normal".
+joint_t_dist_state: null
+joint_t_dist_mu_state: null
+joint_t_dist_sigma_state: null
+joint_t_dist_action: null
+joint_t_dist_mu_action: null
+joint_t_dist_sigma_action: null
 # State-head parameterization for DDT/PT joint agents.
 #   "velocity": net's state-head output IS v_state; loss = MSE(v_state - s_t_dot).
 #               Baseline / backwards-compatible.
-#   "x1":       UNITE-style. Net output is treated as the x1-estimate of the
-#               LN'd goal-obs embedding; target_ln is applied to it so the
-#               prediction lives in the same manifold as the target, then
-#               v_state = (target_ln(s_pred) - s_t) / (1 - t_state) is derived
-#               for both the loss and Euler integration. The same clamped
-#               denominator is applied to v_gt (matches UNITE). Loss form
-#               stays velocity-MSE (equivalent to x1-MSE with 1/(1-t)^2
-#               weighting). For full UNITE faithfulness, also set
-#               joint_target_ln_affine=true and joint_t_dist="logit_normal".
+#   "x1":       UNITE-style. The raw net output is treated as the x1-estimate
+#               of the (LN'd) goal-obs embedding — no LN is applied to the
+#               prediction; it is regressed against the LN'd target. Then
+#               v_state = (s_pred - s_t) / max(1 - t_state, eps) is derived
+#               for both the loss and Euler integration, with the same clamped
+#               denominator applied to v_gt (unbiased x1-MSE with 1/(1-t)^2
+#               weighting capped at 1/eps^2). For full UNITE faithfulness,
+#               also set joint_target_ln_affine=true and
+#               joint_t_dist="logit_normal".
 joint_state_param: "velocity"
 # Action-head parameterization for DDT/PT joint agents.
 #   "velocity": net's action-head output IS v_action; loss = MSE(v_action - a_t_dot).

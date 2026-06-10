@@ -8,7 +8,7 @@ project: "mip"
 group: "default"
 exp_name: "default"
 exp_note: ""
-entity: "brown-palm"
+entity: "palmlab"
 eval_freq: 10000
 log_freq: 1000
 save_freq: 10000
