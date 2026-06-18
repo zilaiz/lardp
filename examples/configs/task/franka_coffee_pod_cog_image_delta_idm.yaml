@@ -1,0 +1,25 @@
+# @package task
+# Mixed (expert + rollout play) variant of the delta-action franka config.
+#
+# Same chunk-relative delta transform as _delta_gp (delta_action_anchor:
+# current_obs, quantile action normalizer), but adds the rollout HDF5s as
+# auxiliary play data so make_idm_dataset tags them optimality=1 (the primary
+# expert HDF5 stays optimality=0). The delta transform + quantile normalizer
+# are applied per-dataset and the quantile bounds are merged across all of
+# them, so expert and play share one action scale.
+#
+# NOTE: the rollout HDF5s store ABSOLUTE 10-dim actions; the delta transform
+# runs at __getitem__ using each chunk's current-obs eef pose as the anchor
+# (robot0_eef_pos / robot0_eef_quat are present in the rollout obs). Keep
+# IDM_CKPT=null when training delta — an abs-fit IDM action normalizer would
+# shape-mismatch the 7-dim delta space.
+defaults:
+  - franka_coffee_pod_cog_image_delta
+  - _self_
+
+dataset_path: null
+dataset_paths:
+  - data/franka_coffee_pod_cog/image.hdf5          # expert  -> optimality=0
+  - data/franka_coffee_pod_cog/image_rollout.hdf5   # play    -> optimality=1
+  - data/franka_coffee_pod_cog/image_rollout_2.hdf5 # play    -> optimality=1
+filter_success: false

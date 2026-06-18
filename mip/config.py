@@ -185,11 +185,38 @@ class OptimizationConfig:
     # If True, load weights from ``encoder_ema`` rather than ``encoder`` —
     # the smoother choice for downstream feature use. Defaults to True.
     dp_use_encoder_ema: bool = True
+    # Frozen-target ablation only (LBMDiTJointPTFrozenTargetAgent): also warm-
+    # start the LIVE input encoder from the SAME DP checkpoint used for the
+    # frozen target (``dp_checkpoint_path``, key chosen by ``dp_use_encoder_ema``),
+    # so the condition encoder and the frozen target start in the SAME
+    # representation space. The input encoder stays trainable (finetuned); only
+    # the target stays frozen. Isolates whether s2e=True still degrades the
+    # policy when there is no foreign-manifold gap to cross at init. Requires
+    # ``idm_checkpoint_path`` to be null (the two are competing input-encoder
+    # warm-starts). Default False = scratch / idm-warm-start as before.
+    init_input_encoder_from_dp: bool = False
     # E2E variant only (LBMDiTJointE2EAgent): whether the target LayerNorm
     # has learnable gamma/beta. Default False removes the gamma->0 collapse
     # mode; flip to True for the UNITE-faithful variant (encoder gets more
     # expressive target normalization at the cost of a real collapse path).
     joint_target_ln_affine: bool = False
+    # Whether to keep the LayerNorm (``target_ln``) on the INPUT encoder's
+    # output before it becomes the AdaLN condition. Default True = current
+    # behavior. False feeds the RAW encoder output as the condition
+    # (``target_ln`` becomes ``nn.Identity`` — no params, so optimizer / EMA /
+    # save-load all no-op, and every ``target_ln(...)`` call site, train and
+    # eval, passes through). Intended for the FROZEN-TARGET ablation
+    # (LBMDiTJointPTFrozenTargetAgent), where ``target_ln`` is PURELY the
+    # condition normalization (the FM target is a frozen external encoder
+    # z-scored by precomputed stats, not target_ln'd). It thus cleanly toggles
+    # "per-sample LN'd condition" vs "raw condition" to probe how much of the
+    # s2e=True degradation is the condition/target normalization-space mismatch.
+    # CAVEAT for self-referential agents (E2E/DDT/PT without a frozen target):
+    # the default ``_encode_condition_target`` applies ``target_ln`` to BOTH
+    # the condition AND the FM target, so setting this False there also removes
+    # the target-side normalization (a separate, less-stable config) — it is
+    # meant to be flipped only on the frozen-target agent.
+    joint_input_ln: bool = True
     # E2E variant only (LBMDiTJointE2EAgent / DDT): use the EMA encoder +
     # EMA target_ln to compute the FM state target during training. This
     # decouples the regression target from per-step encoder updates, the
@@ -254,6 +281,30 @@ class OptimizationConfig:
     # Threshold (pre-shift base-t space) defining "near the noise end" for the
     # above: a play sample is in the avoided corner when both base t < tau.
     joint_play_both_noise_tau: float = 0.5
+    # Loss-assignment scheme over the decoupled (t_state, t_action) square.
+    #   "legacy":       both losses on every row (baseline behavior).
+    #   "noisier_all":  every row contributes only the loss of its noisier
+    #                   stream (lower t): predict the noisier stream from the
+    #                   strictly cleaner one. The diagonal partitions the
+    #                   square into a continuous IDM-like half (action loss,
+    #                   cleaner state) and an FDM-like half (state loss,
+    #                   cleaner actions). Applies to ALL data sources — the
+    #                   expert policy objective changes too (each expert row
+    #                   carries one loss instead of two).
+    #   "noisier_play": the rule above for play-source rows only (optimality
+    #                   == NULL pre-CFG-dropout); expert rows keep both
+    #                   losses, so the expert policy objective is identical
+    #                   to legacy and play adds continuous-spectrum dynamics
+    #                   supervision on top.
+    # Ties (t_state == t_action; measure-zero when decoupled) take the action
+    # loss. Non-legacy schemes require joint_decouple_t=True. They are
+    # routing-agnostic: with joint_state_loss_to_encoder=False (recommended;
+    # only the action loss shapes the encoder, so rule-governed rows on the
+    # state-noisier side contribute no encoder gradient), True is a warned
+    # ablation that lets active state-loss rows shape the encoder.
+    # Corner-avoidance (joint_play_avoid_both_noise) is inert under
+    # non-legacy schemes.
+    joint_play_scheme: str = "legacy"
     # Inference t-schedule for the (state, action) flow pair.
     #   "diagonal":    t_state = t_action = grid (single Euler walk).
     #   "state_first": clean state first (t_state ramps 0->1 in first half),
@@ -469,6 +520,20 @@ class TaskConfig:
         None  # Local path (deprecated, use dataset_repo/dataset_filename)
     )
     dataset_paths: list[str] | None = None  # Multiple HDF5 paths [expert, rollout1, ...]
+    # Rollout HDF5 paths to mix in alongside the primary (expert) dataset.
+    # Used by PushT, where the expert demos come from a zarr (dataset_repo /
+    # dataset_filename / dataset_path) but collected rollouts are robomimic-
+    # format HDF5 written by RolloutRecorder. Each path is tagged optimality=1
+    # (null/play); the expert is optimality=0. None disables mixing (expert
+    # only). On robomimic, mixing is instead done via dataset_paths above.
+    rollout_dataset_paths: list[str] | None = None
+    # Fraction of each rollout dataset actually USED (PushT mixing). 1.0 = all
+    # demos (default). 0.5 = first half (collection order), etc. NOTE the
+    # semantics are the INVERSE of val_dataset_percentage: this is the fraction
+    # KEPT, not held out. Applied per rollout path, taking the first
+    # round(n * fraction) demos. Lets you sweep the play:expert ratio without
+    # pre-slicing HDF5 files. No-op on robomimic (which mixes via dataset_paths).
+    rollout_use_fraction: float = 1.0
     filter_success: bool = False  # Filter secondary datasets to keep only successful demos (reward > 0)
     max_episode_steps: int = 400
     obs_keys: list[str] = field(

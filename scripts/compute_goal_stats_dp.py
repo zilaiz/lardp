@@ -104,7 +104,13 @@ def main():
         help="Path to pretrained LBMDiT (DP) checkpoint (top-level keys: "
              "encoder, encoder_ema, flow_map, flow_map_ema, optimizer).",
     )
-    parser.add_argument("--dataset_path", type=str, required=True)
+    parser.add_argument(
+        "--dataset_path", type=str, nargs="*", default=None,
+        help="Optional. One or more HDF5 paths overriding task.dataset_paths. "
+             "Omit to use the task config's own dataset_paths — e.g. pass a "
+             "'_mixed' task config (expert + rollouts) to compute stats over "
+             "the combined (play-inclusive) goal distribution.",
+    )
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument(
         "--normalizer_path", type=str, default=None,
@@ -203,7 +209,12 @@ def main():
         )
 
     # --- Dataset ---
-    OmegaConf.update(task_cfg, "dataset_paths", [args.dataset_path])
+    # Override task.dataset_paths only when --dataset_path is given; otherwise
+    # use the task config's own list (e.g. a _mixed config = expert + rollouts,
+    # so the stats cover the play-inclusive goal distribution).
+    if args.dataset_path:
+        OmegaConf.update(task_cfg, "dataset_paths", list(args.dataset_path))
+    loguru.logger.info(f"Dataset paths: {list(task_cfg.dataset_paths)}")
     dataset = make_idm_dataset(task_cfg, normalizer=normalizer)
     loguru.logger.info(f"Dataset size: {len(dataset)}")
 

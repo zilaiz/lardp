@@ -32,6 +32,20 @@ Loss path is identical to E2E except for the t per stream:
     action_loss = mean((v_a - act_dot)^2)    / act_dim
     loss = w_s * state_loss + w_a * action_loss
 
+``optimization.joint_play_scheme`` selects how the two losses are assigned
+over the decoupled (t_state, t_action) square:
+
+- "legacy":       both losses on every row (the path above, unchanged).
+- "noisier_all":  every row contributes only the loss of its noisier stream
+                  (lower t) — predict the noisier stream from the strictly
+                  cleaner one. The diagonal partitions the square into a
+                  continuous IDM-like half (action loss, cleaner state) and
+                  an FDM-like half (state loss, cleaner actions).
+- "noisier_play": the rule above for play-source rows only; expert rows keep
+                  both losses, so the expert policy objective is identical
+                  to legacy and play adds continuous-spectrum dynamics
+                  supervision on top.
+
 Author: Zilai Zeng
 """
 
@@ -109,9 +123,24 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
 
         # --- Target LayerNorm (replaces offline goal stats) ---
         obs_dim = config.network.encoder_out_dim or config.network.emb_dim
-        self.target_ln = nn.LayerNorm(
-            obs_dim, elementwise_affine=config.optimization.joint_target_ln_affine,
-        ).to(device)
+        if getattr(config.optimization, "joint_input_ln", True):
+            self.target_ln = nn.LayerNorm(
+                obs_dim,
+                elementwise_affine=config.optimization.joint_target_ln_affine,
+            ).to(device)
+        else:
+            # Raw encoder output as the AdaLN condition (no per-sample LN).
+            # Identity is a drop-in with no params, so it is constructed here
+            # before the optimizer/EMA below (no orphaned LN params) and every
+            # ``self.target_ln(...)`` call site (train + eval condition) passes
+            # through. See OptimizationConfig.joint_input_ln — used by the
+            # frozen-target ablation to drop the condition/target
+            # normalization-space mismatch.
+            self.target_ln = nn.Identity().to(device)
+            loguru.logger.info(
+                "joint_input_ln=False: input encoder output used RAW as the "
+                "AdaLN condition (target_ln = Identity)"
+            )
 
         # --- Encoder + target_ln EMA (matches lbmdit / TrainingAgent
         # convention: at eval, both trunk and encoder are smoothed). EMA
@@ -196,6 +225,40 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._state_loss_to_encoder = bool(
             config.optimization.joint_state_loss_to_encoder
         )
+        # --- Loss-assignment scheme over the decoupled (t_state, t_action)
+        # square. See OptimizationConfig.joint_play_scheme.
+        self._play_scheme = getattr(
+            config.optimization, "joint_play_scheme", "legacy",
+        )
+        if self._play_scheme not in ("legacy", "noisier_all", "noisier_play"):
+            raise ValueError(
+                "joint_play_scheme must be 'legacy', 'noisier_all', or "
+                f"'noisier_play'; got {self._play_scheme!r}"
+            )
+        if self._play_scheme != "legacy":
+            if not self._decouple_t:
+                raise ValueError(
+                    f"joint_play_scheme={self._play_scheme!r} requires "
+                    "joint_decouple_t=True (the noisier-stream rule needs "
+                    "independent t_state / t_action; under a shared t every "
+                    "row ties)."
+                )
+            if self._state_loss_to_encoder:
+                loguru.logger.warning(
+                    f"joint_play_scheme={self._play_scheme!r} with "
+                    "joint_state_loss_to_encoder=True: active state-loss "
+                    "rows will shape the encoder through the live condition "
+                    "path (the self-referential channel that drove the "
+                    "s2e=True collapse under legacy). Deliberate-ablation "
+                    "setting; use False for the clean scheme comparison."
+                )
+            if self._play_avoid_both_noise:
+                loguru.logger.info(
+                    "joint_play_avoid_both_noise is inert under "
+                    f"joint_play_scheme={self._play_scheme!r}: the noisier-"
+                    "stream rule already assigns the both-noise corner a "
+                    "single loss."
+                )
         # Per-stream SD3-style time shift. 1.0 = identity (no shift).
         self._shift_state = float(config.optimization.joint_t_shift_state)
         self._shift_action = float(config.optimization.joint_t_shift_action)
@@ -353,6 +416,30 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
 
     # ------------------------------- training -------------------------------
 
+    def _encode_condition_target(self, obs, goal_obs):
+        """Return ``(z_t, target)`` for one update step.
+
+        ``z_t`` is the AdaLN condition embedding on the LIVE gradient path —
+        the encoder's only gradient channel, and what the
+        ``joint_state_loss_to_encoder`` routing in ``update`` keys off.
+        ``target`` is the detached FM state-flow regression target.
+
+        Default (joint_pt / E2E behaviour): both come from the trainable
+        encoder + learnable ``target_ln``; the target optionally uses the EMA
+        encoder + EMA LN (self-distillation) and is stop-grad either way.
+        Subclasses override this to denoise toward a different state
+        representation (see ``LBMDiTJointPTFrozenTargetAgent``).
+        """
+        config = self.config.optimization
+        z_t = self.target_ln(self.encoder(obs, None))
+        if self._use_ema_target and config.ema_rate < 1:
+            with torch.no_grad():
+                target = self.target_ln_ema(self.encoder_ema(goal_obs, None))
+        else:
+            z_goal_ln = self.target_ln(self.encoder(goal_obs, None))
+            target = z_goal_ln.detach()
+        return z_t, target
+
     def update(
         self,
         act: torch.Tensor,
@@ -366,18 +453,13 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         device = act.device
         B = act.shape[0]
 
-        # 1. Condition path always uses the live encoder + LN. Target path
-        #    optionally uses the EMA encoder + EMA LN to stabilize the
-        #    regression target as the live encoder evolves (self-distillation;
-        #    fix for moving-target state_loss creep). Falls back to live
-        #    stop-grad when joint_use_ema_target is False or ema_rate >= 1.
-        z_t = self.target_ln(self.encoder(obs, None))
-        if self._use_ema_target and config.ema_rate < 1:
-            with torch.no_grad():
-                target = self.target_ln_ema(self.encoder_ema(goal_obs, None))
-        else:
-            z_goal_ln = self.target_ln(self.encoder(goal_obs, None))
-            target = z_goal_ln.detach()
+        # 1. Condition embedding (live grad path) + detached FM state target.
+        #    Factored into a hook so subclasses can swap the target
+        #    representation (e.g. a frozen external target encoder) without
+        #    duplicating the rest of update(). Default path: live encoder + LN
+        #    for the condition; EMA-or-stop-grad target_ln of the encoder for
+        #    the detached target (self-distillation when joint_use_ema_target).
+        z_t, target = self._encode_condition_target(obs, goal_obs)
 
         # 2. Optimality labels with CFG dropout. ``optimality is None`` means
         # the dataset carries no labels (unlabeled fallback) — distinct from a
@@ -419,10 +501,16 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 self._t_dist_action, self._t_dist_mu_action,
                 self._t_dist_sigma_action,
             )
-            # Apply whenever optimality labels are real (mixed OR pure-play);
-            # skip only the unlabeled fallback (optimality was None), where
-            # every sample defaults to NULL and might actually be expert.
-            if self._play_avoid_both_noise and labels_provided:
+            # Corner-avoidance (legacy scheme only — the noisier-stream rule
+            # already assigns the both-noise corner a single loss). Apply
+            # whenever optimality labels are real (mixed OR pure-play); skip
+            # only the unlabeled fallback (optimality was None), where every
+            # sample defaults to NULL and might actually be expert.
+            if (
+                self._play_scheme == "legacy"
+                and self._play_avoid_both_noise
+                and labels_provided
+            ):
                 # Play data: drop the both-near-noise corner (unconditional
                 # joint generation); lift one random stream into [tau, hi] so
                 # the sample lands in an IDM/FDM-like regime instead.
@@ -514,12 +602,56 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             v_action_gt = a_t_dot
 
         # 7. Per-stream losses (per-element MSE so weights are interpretable).
-        state_loss_unscaled = torch.mean(
-            get_norm(v_state - v_state_gt, config.norm_type)
-        ) / float(self.net.obs_dim)
-        action_loss_unscaled = torch.mean(
-            get_norm(v_action - v_action_gt, config.norm_type)
-        ) / float(self.net.act_dim)
+        #    "legacy": both losses over all rows.
+        #    "noisier_all" / "noisier_play": a rule-governed row contributes
+        #    only the loss of its noisier stream — predict the noisier stream
+        #    from the strictly cleaner one. Ties (t_state == t_action,
+        #    measure-zero under decoupled continuous draws) go to the action
+        #    loss. "noisier_play" applies the rule to play-source rows only;
+        #    expert rows keep both losses (policy objective identical to
+        #    legacy). Each loss is a masked mean over its active rows, so its
+        #    scale stays comparable to legacy. Encoder routing composes with
+        #    the masks: under s2e=False a rule-governed row on the state-
+        #    noisier side has zero action loss, hence contributes no encoder
+        #    gradient; under s2e=True (warned ablation) its masked state
+        #    loss reaches the encoder through the single live forward.
+        if self._play_scheme == "legacy":
+            state_loss_unscaled = torch.mean(
+                get_norm(v_state - v_state_gt, config.norm_type)
+            ) / float(self.net.obs_dim)
+            action_loss_unscaled = torch.mean(
+                get_norm(v_action - v_action_gt, config.norm_type)
+            ) / float(self.net.act_dim)
+        else:
+            state_rows = get_norm(
+                v_state - v_state_gt, config.norm_type
+            ).mean(dim=1)  # (B,)
+            action_rows = get_norm(
+                v_action - v_action_gt, config.norm_type
+            ).mean(dim=1)  # (B,)
+            # Compare post-shift times — the rule is about actual noise
+            # level, and the per-stream SD3 shifts change it.
+            state_noisier = t_state < t_action
+            if self._play_scheme == "noisier_all":
+                rule_rows = torch.ones_like(state_noisier)
+            else:  # noisier_play
+                # Keyed off the pre-dropout data source, like the corner-
+                # avoidance: the unlabeled fallback (optimality was None)
+                # might actually be expert, so it routes as expert.
+                rule_rows = (
+                    is_play_data if labels_provided
+                    else torch.zeros_like(is_play_data)
+                )
+            state_mask = (~rule_rows | state_noisier).float()
+            action_mask = (~rule_rows | ~state_noisier).float()
+            state_loss_unscaled = (
+                (state_rows * state_mask).sum()
+                / state_mask.sum().clamp_min(1.0)
+            ) / float(self.net.obs_dim)
+            action_loss_unscaled = (
+                (action_rows * action_mask).sum()
+                / action_mask.sum().clamp_min(1.0)
+            ) / float(self.net.act_dim)
         loss = (
             self._w_state * state_loss_unscaled
             + self._w_action * action_loss_unscaled
@@ -548,7 +680,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             target_abs_mean = target.abs().mean()
 
         del delta_t
-        return {
+        info = {
             "dp_loss": loss.detach(),
             "state_loss": state_loss_unscaled.detach(),
             "action_loss": action_loss_unscaled.detach(),
@@ -558,6 +690,13 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             "t_state_mean": t_state.mean().detach(),
             "t_action_mean": t_action.mean().detach(),
         }
+        if self._play_scheme != "legacy":
+            # Dose verification: fraction of rows contributing each loss.
+            # noisier_all -> the two sum to 1 (~0.5 each under matched t
+            # dists); noisier_play -> expert_frac + play_frac * (~0.5) each.
+            info["state_mask_frac"] = state_mask.mean().detach()
+            info["action_mask_frac"] = action_mask.mean().detach()
+        return info
 
     # ------------------------------- sampling ------------------------------
 

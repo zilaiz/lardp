@@ -111,6 +111,32 @@ def _load_normalizer_from_npz(path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Inference determinism
+# ---------------------------------------------------------------------------
+def _seed_everything(seed: int) -> None:
+    """Make the inference noise stream deterministic.
+
+    Per /predict call the only random draws are the initial action noise
+    ``act_0`` (drawn in ``predict``) and, when ``sample_mode == 'stochastic'``,
+    the sampler's own ``act_s`` (and ``cls_token_s`` for the reg sampler) in
+    ``mip/samplers.py``. All come from the global torch RNG, so one seed here
+    fixes the whole episode's noise *sequence* — a full run reproduces, but two
+    calls with identical obs still differ because the RNG advances. cuDNN
+    determinism is best-effort (no hard error) so the resnet encoder doesn't
+    trip on an op lacking a deterministic kernel.
+    """
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"[seed] inference RNG seeded with {seed}")
+
+
+# ---------------------------------------------------------------------------
 # Policy initialization
 # ---------------------------------------------------------------------------
 def initialize_policy(
@@ -120,6 +146,7 @@ def initialize_policy(
     num_steps: int | None = None,
     sample_mode: str | None = None,
     act_steps: int | None = None,
+    seed: int | None = None,
 ):
     """Build the TrainingAgent, load the checkpoint, and load the normalizer."""
     global agent, config, device, normalizer
@@ -159,6 +186,11 @@ def initialize_policy(
 
     print(f"Loading normalizer: {normalizer_path}")
     normalizer = _load_normalizer_from_npz(normalizer_path)
+
+    # Seed LAST — after model construction/load have consumed RNG for weight
+    # init — so the per-request noise stream starts deterministically at `seed`.
+    if seed is not None:
+        _seed_everything(int(seed))
 
     print("Policy initialized successfully")
     return cfg
@@ -483,6 +515,9 @@ if __name__ == "__main__":
                              "(action ODE source: stochastic noise vs zeros)")
     parser.add_argument("--act_steps", type=int, default=None,
                         help="Override task.act_steps for inference")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed the inference RNG (act_0 + stochastic "
+                             "sampler noise). Omit for nondeterministic sampling.")
     parser.add_argument("--save_obs_dir", type=str, default=None,
                         help="If set, dump received obs (PNGs + log) to this dir "
                              "for visual inspection. Useful for debugging.")
@@ -501,6 +536,7 @@ if __name__ == "__main__":
         num_steps=args.num_steps,
         sample_mode=args.sample_mode,
         act_steps=args.act_steps,
+        seed=args.seed,
     )
 
     print(f"Starting policy server on port {args.port}")

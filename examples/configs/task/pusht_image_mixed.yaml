@@ -1,0 +1,22 @@
+# @package task
+# PushT image task that mixes expert demos (zarr) with collected vanilla-DP
+# rollouts (robomimic-format HDF5 written by RolloutRecorder). The expert demos
+# come from pusht_base's local zarr (dataset_path); rollouts are listed
+# below and tagged optimality=1 (expert is 0).
+#
+# Collect the rollouts first with:
+#   uv run examples/train_pusht.py task=pusht_image mode=eval \
+#       optimization.model_path=<dp_ckpt> log.save_rollouts=True \
+#       log.max_rollout_demos=200
+# which writes data/pusht/image_rollouts.hdf5 (NFE=3 solve).
+defaults:
+  - pusht_image
+  - _self_
+
+rollout_dataset_paths:
+  - data/pusht/image_rollouts.hdf5
+
+# Fraction of expert demos held out (train on the first 1 - p). 0.0 = use all
+# expert demos. Raise to match the reduced-data protocol (rollouts always use
+# all their demos regardless of this value).
+val_dataset_percentage: 0.0

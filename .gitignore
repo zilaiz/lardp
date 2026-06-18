@@ -223,3 +223,6 @@ viz/
 examples/analysis/
 MUJOCO_LOG.TXT
 wandb_backup/
+*_mp4/
+*_analysis/
+goal_stats/

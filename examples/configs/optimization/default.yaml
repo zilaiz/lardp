@@ -151,10 +151,26 @@ dp_checkpoint_path: null
 # If True, load weights from `encoder_ema` rather than `encoder` — the
 # smoother choice for downstream feature use.
 dp_use_encoder_ema: true
+# Frozen-target ablation only: also warm-start the LIVE input encoder from the
+# SAME DP checkpoint as the frozen target (key per dp_use_encoder_ema), so the
+# condition encoder and frozen target start in the same representation space.
+# Input encoder stays trainable (finetuned); target stays frozen. Tests whether
+# s2e=true still hurts with no foreign-manifold gap. Requires idm_checkpoint_path
+# null. Default false.
+init_input_encoder_from_dp: false
 # E2E variant only (LBMDiTJointE2EAgent): learnable gamma/beta on the
 # target LayerNorm. Default false removes the gamma->0 collapse mode;
 # flip to true for the UNITE-faithful variant.
 joint_target_ln_affine: false
+# Keep the LayerNorm (target_ln) on the INPUT encoder output before it becomes
+# the AdaLN condition. Default true = current behavior. false feeds the RAW
+# encoder output as the condition (target_ln -> nn.Identity). Intended for the
+# frozen-target ablation, where target_ln is purely the condition normalization
+# (the FM target is a frozen external encoder z-scored by precomputed stats), so
+# this toggles "per-sample LN'd condition" vs "raw condition". CAVEAT: for
+# self-referential agents target_ln also normalizes the FM target, so flip this
+# only on the frozen-target agent.
+joint_input_ln: true
 # E2E + DDT variants: use EMA encoder + EMA target_ln to compute the FM
 # state target during training (self-distillation fix for moving-target).
 # Reuses ema_rate above. Active only when ema_rate < 1. Default false
@@ -193,6 +209,20 @@ joint_decouple_t: true
 # expert-only); tau = pre-shift base-t threshold. No-op when decouple_t=false.
 joint_play_avoid_both_noise: false
 joint_play_both_noise_tau: 0.5
+# Loss-assignment scheme over the decoupled (t_state, t_action) square.
+#   "legacy":       both losses on every row (baseline).
+#   "noisier_all":  every row contributes only its noisier stream's loss
+#                   (predict the noisier stream from the strictly cleaner
+#                   one); the diagonal splits the square into a continuous
+#                   IDM-like half (action loss) and FDM-like half (state
+#                   loss). Applies to all sources, expert included.
+#   "noisier_play": the rule for play-source rows only; expert rows keep
+#                   both losses (policy objective identical to legacy).
+# Ties go to the action loss. Non-legacy schemes require
+# joint_decouple_t=true; joint_state_loss_to_encoder=false is recommended
+# (true = warned ablation: active state-loss rows shape the encoder).
+# Corner-avoidance above is inert under them.
+joint_play_scheme: "legacy"
 # Inference (t_state, t_action) trajectory through [0, 1]^2.
 #   "diagonal":    t_state == t_action at every step (single Euler walk).
 #   "state_first": clean state in first half, then clean action.

@@ -5,6 +5,7 @@ Date: 2025-10-15
 """
 
 import time
+from pathlib import Path
 
 import hydra
 import loguru
@@ -23,6 +24,18 @@ from mip.scheduler import WarmupAnnealingScheduler
 from mip.torch_utils import set_seed
 
 
+def _pusht_rollout_path(config):
+    """Resolve the rollout HDF5 path, or None when rollout saving is disabled.
+
+    Mirrors the robomimic convention (``data/robomimic/<env>/<tag>_rollouts``)
+    but rooted at ``data/pusht`` since PushT has a single env.
+    """
+    if not getattr(config.log, "save_rollouts", False):
+        return None
+    obs_tag = "image" if config.task.obs_type == "image" else "low_dim"
+    return str(Path("data/pusht") / f"{obs_tag}_rollouts.hdf5")
+
+
 def train(config: Config, envs, dataset, agent, logger, resume_state=None):
     """Standalone training function.
 
@@ -38,7 +51,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
-        num_workers=4 if config.task.obs_type in ["state", "keypoint"] else 8,
+        num_workers=4,
         shuffle=True,
         # accelerate cpu-gpu transfer
         pin_memory=True,
@@ -145,10 +158,23 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
             loguru.logger.info("Evaluate model...")
             agent.eval()
             metrics = {"step": n_gradient_step}
-            num_steps_list = get_default_step_list(config.optimization.loss_type)
+            num_steps_list = config.optimization.eval_num_steps or get_default_step_list(
+                config.optimization.loss_type
+            )
+            _rollout_path = _pusht_rollout_path(config)
             for num_steps in num_steps_list:
+                _save = _rollout_path is not None and num_steps == 3
                 metrics.update(
-                    evaluate(config, envs, dataset, agent, logger, num_steps)
+                    evaluate(
+                        config,
+                        envs,
+                        dataset,
+                        agent,
+                        logger,
+                        num_steps,
+                        save_rollouts=_save,
+                        rollout_path=_rollout_path,
+                    )
                 )
 
             # Update best metrics and average metrics
@@ -212,7 +238,16 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
             agent.train()
 
 
-def evaluate(config: Config, envs, dataset, agent, logger, num_steps=1):
+def evaluate(
+    config: Config,
+    envs,
+    dataset,
+    agent,
+    logger,
+    num_steps=1,
+    save_rollouts=False,
+    rollout_path=None,
+):
     """Standalone inference function to evaluate a trained agent and optionally save a video.
 
     Args:
@@ -222,6 +257,8 @@ def evaluate(config: Config, envs, dataset, agent, logger, num_steps=1):
         agent: Trained agent
         logger: Logger for metrics
         num_steps: Number of steps for sampling
+        save_rollouts: Whether to collect and append rollout trajectories
+        rollout_path: Path to the HDF5 file rollouts are appended to
 
     Returns:
         dict: Metrics including mean step, reward, and success rate
@@ -230,6 +267,30 @@ def evaluate(config: Config, envs, dataset, agent, logger, num_steps=1):
     episode_rewards = []
     episode_steps = []
     episode_success = []
+
+    # Setup rollout recording. Image obs only: the recorder captures the dict
+    # observation flowing through MultiStepWrapper; the state/keypoint envs
+    # return flat arrays the recorder can't key by obs name.
+    recorders = None
+    if save_rollouts and rollout_path is not None:
+        if config.task.obs_type != "image":
+            loguru.logger.warning(
+                "save_rollouts is only supported for image obs; skipping "
+                f"rollout collection for obs_type={config.task.obs_type}."
+            )
+        else:
+            from mip.rollout_recorder import RolloutRecorder
+
+            rec_obs_keys = list(config.task.shape_meta["obs"].keys())
+            recorders = []
+            for env_idx in range(config.task.num_envs):
+                recorder = RolloutRecorder(
+                    obs_keys=rec_obs_keys,
+                    obs_type=config.task.obs_type,
+                    shape_meta=config.task.shape_meta,
+                )
+                envs.envs[env_idx].recorder = recorder
+                recorders.append(recorder)
 
     for i in range(config.log.eval_episodes // config.task.num_envs):
         step_reward = []
@@ -311,6 +372,19 @@ def evaluate(config: Config, envs, dataset, agent, logger, num_steps=1):
             act_normed = (
                 act_normed.detach().to("cpu").numpy()
             )  # (num_envs, horizon, action_dim)
+
+            # Inject Gaussian noise for diverse rollout collection. Done in the
+            # normalized action space (~[-1, 1] under MinMax), then clipped, so
+            # rollout_noise_std is task-agnostic — unlike robomimic's raw-space
+            # clip to the controller range, which doesn't fit PushT's pixel
+            # action space.
+            rollout_noise_std = getattr(config.log, "rollout_noise_std", 0.0)
+            if recorders is not None and rollout_noise_std > 0:
+                act_normed = act_normed + np.random.normal(
+                    0, rollout_noise_std, size=act_normed.shape
+                ).astype(act_normed.dtype)
+                act_normed = np.clip(act_normed, -1.0, 1.0)
+
             act = dataset.normalizer["action"].unnormalize(act_normed)
 
             # get action by slicing from start to end
@@ -338,6 +412,28 @@ def evaluate(config: Config, envs, dataset, agent, logger, num_steps=1):
         f"mean_reward_{num_steps}": np.nanmean(episode_rewards),
         f"mean_success_{num_steps}": np.nanmean(episode_success),
     }
+
+    # Finalize and save rollout recordings
+    if recorders is not None:
+        from mip.rollout_recorder import RolloutRecorder
+
+        for recorder in recorders:
+            recorder.end_episode()
+
+        # Merge all per-env recorders and append to a single HDF5 file.
+        combined = RolloutRecorder(
+            obs_keys=recorders[0].obs_keys,
+            obs_type=recorders[0].obs_type,
+            shape_meta=recorders[0].shape_meta,
+        )
+        for recorder in recorders:
+            combined.episodes.extend(recorder.episodes)
+        max_demos = getattr(config.log, "max_rollout_demos", 0) or None
+        combined.append_hdf5(rollout_path, max_demos=max_demos)
+
+        # Detach recorders from envs
+        for env_idx in range(config.task.num_envs):
+            envs.envs[env_idx].recorder = None
 
     return metrics
 
@@ -387,10 +483,25 @@ def main(config):
     elif config.mode == "eval":
         agent.eval()
 
-        num_steps_list = get_default_step_list(config.optimization.loss_type)
+        num_steps_list = config.optimization.eval_num_steps or get_default_step_list(
+            config.optimization.loss_type
+        )
+        _rollout_path = _pusht_rollout_path(config)
         for num_steps in num_steps_list:
+            _save = _rollout_path is not None and num_steps == 3
             metrics = {"step": num_steps}
-            metrics.update(evaluate(config, envs, dataset, agent, logger, num_steps))
+            metrics.update(
+                evaluate(
+                    config,
+                    envs,
+                    dataset,
+                    agent,
+                    logger,
+                    num_steps,
+                    save_rollouts=_save,
+                    rollout_path=_rollout_path,
+                )
+            )
             logger.log(metrics, category="eval")
 
         # print result in easy to read format

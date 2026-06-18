@@ -110,6 +110,32 @@ def _load_normalizer_from_pickle(path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Inference determinism
+# ---------------------------------------------------------------------------
+def _seed_everything(seed: int) -> None:
+    """Make the inference noise stream deterministic.
+
+    The joint sampler draws exactly two random tensors per /predict call:
+    the initial action noise ``act_0`` (drawn in ``predict``) and, when
+    ``joint_sample_mode == 'stochastic'``, the state-token init ``x_state``
+    (inside ``agent.sample``). Both come from the global torch RNG, so a
+    single seed here fixes the whole episode's noise *sequence* — a full run
+    reproduces, but two calls with identical obs still differ because the
+    RNG advances. cuDNN determinism is best-effort (no hard error) so the
+    resnet encoder doesn't trip on an op lacking a deterministic kernel.
+    """
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"[seed] inference RNG seeded with {seed}")
+
+
+# ---------------------------------------------------------------------------
 # Policy initialization
 # ---------------------------------------------------------------------------
 def initialize_policy(
@@ -126,6 +152,7 @@ def initialize_policy(
     joint_t_shift_action: float | None = None,
     joint_cfg_scale: float | None = None,
     act_steps: int | None = None,
+    seed: int | None = None,
 ):
     """Build the joint-PT-E2E agent, load the checkpoint + normalizer.
 
@@ -214,6 +241,11 @@ def initialize_policy(
 
     print(f"Loading normalizer (pickle): {normalizer_path}")
     normalizer = _load_normalizer_from_pickle(normalizer_path)
+
+    # Seed LAST — after model construction/load have consumed RNG for weight
+    # init — so the per-request noise stream starts deterministically at `seed`.
+    if seed is not None:
+        _seed_everything(int(seed))
 
     print("Policy initialized successfully")
     return cfg
@@ -550,6 +582,10 @@ if __name__ == "__main__":
     parser.add_argument("--act_steps", type=int, default=None,
                         help="Override task.act_steps for the executable slice")
 
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed the inference RNG (act_0 + stochastic state "
+                             "init). Omit for nondeterministic sampling.")
+
     parser.add_argument("--save_obs_dir", type=str, default=None,
                         help="If set, dump received obs (PNGs + log) to this dir")
     parser.add_argument("--save_obs_max", type=int, default=50,
@@ -574,6 +610,7 @@ if __name__ == "__main__":
         joint_t_shift_action=args.joint_t_shift_action,
         joint_cfg_scale=args.joint_cfg_scale,
         act_steps=args.act_steps,
+        seed=args.seed,
     )
 
     print(f"Starting policy server on port {args.port}")

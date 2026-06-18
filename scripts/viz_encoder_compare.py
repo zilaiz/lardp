@@ -358,10 +358,17 @@ def main():
                         "solo probe input). Pair with --joint_ddt2_tag to "
                         "label it in plots.")
     p.add_argument("--joint_ddt2_network", default="lbmdit_joint_ddt")
+    p.add_argument("--joint_ddt3_ckpt", default=None,
+                   help="Optional third joint_ddt checkpoint. Handled "
+                        "identically to --joint_ddt2_ckpt (target_ln applied, "
+                        "solo probe input). Pair with --joint_ddt3_tag.")
+    p.add_argument("--joint_ddt3_network", default="lbmdit_joint_ddt")
     p.add_argument("--joint_ddt_tag",  default="joint_ddt",
                    help="Display tag for the first joint_ddt ckpt.")
     p.add_argument("--joint_ddt2_tag", default="joint_ddt2",
                    help="Display tag for the second joint_ddt ckpt.")
+    p.add_argument("--joint_ddt3_tag", default="joint_ddt3",
+                   help="Display tag for the third joint_ddt ckpt.")
 
     # Shared task / dataset.
     p.add_argument("--task_config", default="tool_hang_ph_image_gp")
@@ -407,6 +414,7 @@ def main():
         ("idm",                 args.idm_ckpt,        args.idm_network),
         (args.joint_ddt_tag,    args.joint_ddt_ckpt,  args.joint_ddt_network),
         (args.joint_ddt2_tag,   args.joint_ddt2_ckpt, args.joint_ddt2_network),
+        (args.joint_ddt3_tag,   args.joint_ddt3_ckpt, args.joint_ddt3_network),
     ]
     requested = [(t, c, n) for (t, c, n) in requested if c]
     if len(requested) < 2:

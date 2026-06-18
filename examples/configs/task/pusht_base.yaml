@@ -7,14 +7,27 @@ env_name: "pusht"
 env_type: "ph"
 abs_action: false
 
-# Common dataset configuration
-dataset_repo: "ChaoyiPan/mip-dataset"
-dataset_filename: "pusht/pusht_cchi_v7_replay.zarr.zip"
+# Dataset configuration — read the expert zarr directly from the local path,
+# no HuggingFace lookup. Download it once with:
+#   hf ChaoyiPan/mip-dataset : pusht/pusht_cchi_v7_replay.zarr.zip -> data/pusht
+# dataset_path takes precedence in make_dataset; the HF fields are nulled so the
+# online repo is never consulted (set them to re-enable auto-download).
+dataset_path: "data/pusht/pusht_cchi_v7_replay.zarr"
+dataset_repo: null
+dataset_filename: null
 
-# Alternative: Use local path
-# dataset_path: "dev/pusht/pusht_cchi_v7_replay.zarr"
+# Rollout mixing (PushT). rollout_dataset_paths: null = expert-only (overridden
+# by _mixed task configs). rollout_use_fraction: fraction of rollout demos used
+# (first-N, collection order); 1.0 = all. Declared here so they're valid struct
+# keys / CLI-overridable on any pusht task.
+rollout_dataset_paths: null
+rollout_use_fraction: 1.0
 
 max_episode_steps: 300
+
+# Referenced by main.yaml's exp_name interpolation (${task.latent_type}); kept
+# null since PushT has no LAM/DINO latent variants.
+latent_type: null
 
 # Common required keys
 obs_steps: 2
