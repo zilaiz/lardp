@@ -52,6 +52,7 @@ dependencies = [
     "torchmetrics>=1.8.2",
     "jupyter>=1.1.1",
     "notebook>=7.5.4",
+    "transformers<5",
 ]
 
 [project.optional-dependencies]

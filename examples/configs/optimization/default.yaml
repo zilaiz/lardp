@@ -158,6 +158,18 @@ dp_use_encoder_ema: true
 # s2e=true still hurts with no foreign-manifold gap. Requires idm_checkpoint_path
 # null. Default false.
 init_input_encoder_from_dp: false
+# Frozen-target ablation: which pluggable TargetEncoder produces the FM
+# state-flow target (mip/target_encoders.py). "dp" = frozen DP/LBMDiT encoder
+# from dp_checkpoint_path (current behavior); "lewm"/"dinov2" = foreign
+# pretrained features (added incrementally). z-score (goal_stats_path) applies
+# on top regardless.
+target_encoder_type: dp
+# Checkpoint path/dir for non-DP target encoders (e.g. the LeWM HF ViT dir with
+# weights.pt + config.json). DP uses dp_checkpoint_path.
+target_encoder_path: null
+# Which rgb obs key the image-only foreign target encoder consumes (null =
+# auto single rgb key; set explicitly for multi-camera tasks). pusht -> image.
+target_encoder_image_key: null
 # E2E variant only (LBMDiTJointE2EAgent): learnable gamma/beta on the
 # target LayerNorm. Default false removes the gamma->0 collapse mode;
 # flip to true for the UNITE-faithful variant.

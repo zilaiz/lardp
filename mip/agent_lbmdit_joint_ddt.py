@@ -618,7 +618,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         if self._play_scheme == "legacy":
             state_loss_unscaled = torch.mean(
                 get_norm(v_state - v_state_gt, config.norm_type)
-            ) / float(self.net.obs_dim)
+            ) / float(getattr(self.net, "state_dim", self.net.obs_dim))
             action_loss_unscaled = torch.mean(
                 get_norm(v_action - v_action_gt, config.norm_type)
             ) / float(self.net.act_dim)
@@ -647,7 +647,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             state_loss_unscaled = (
                 (state_rows * state_mask).sum()
                 / state_mask.sum().clamp_min(1.0)
-            ) / float(self.net.obs_dim)
+            ) / float(getattr(self.net, "state_dim", self.net.obs_dim))
             action_loss_unscaled = (
                 (action_rows * action_mask).sum()
                 / action_mask.sum().clamp_min(1.0)
@@ -835,12 +835,16 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
 
         z_t = target_ln(encoder(obs, None))
         obs_dim = z_t.shape[-1]
+        # State-stream dim may be decoupled from the condition/obs dim (a
+        # foreign target encoder of a different dim); init x_state at the
+        # trunk's state dim, falling back to obs_dim for legacy trunks.
+        state_dim = getattr(net, "state_dim", obs_dim)
 
         if self._sample_mode == "stochastic":
-            x_state = torch.randn(B, 1, obs_dim, device=device)
+            x_state = torch.randn(B, 1, state_dim, device=device)
             x_action = act_0
         else:
-            x_state = torch.zeros(B, 1, obs_dim, device=device)
+            x_state = torch.zeros(B, 1, state_dim, device=device)
             x_action = torch.zeros_like(act_0)
 
         expert_idx = torch.full(
@@ -909,12 +913,16 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
 
         z_t = target_ln(encoder(obs, None))
         obs_dim = z_t.shape[-1]
+        # State-stream dim may be decoupled from the condition/obs dim (a
+        # foreign target encoder of a different dim); init x_state at the
+        # trunk's state dim, falling back to obs_dim for legacy trunks.
+        state_dim = getattr(net, "state_dim", obs_dim)
 
         if self._sample_mode == "stochastic":
-            x_state = torch.randn(B, 1, obs_dim, device=device)
+            x_state = torch.randn(B, 1, state_dim, device=device)
             x_action = act_0
         else:
-            x_state = torch.zeros(B, 1, obs_dim, device=device)
+            x_state = torch.zeros(B, 1, state_dim, device=device)
             x_action = torch.zeros_like(act_0)
 
         expert_idx = torch.full(

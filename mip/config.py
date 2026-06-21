@@ -195,6 +195,22 @@ class OptimizationConfig:
     # ``idm_checkpoint_path`` to be null (the two are competing input-encoder
     # warm-starts). Default False = scratch / idm-warm-start as before.
     init_input_encoder_from_dp: bool = False
+    # Frozen-target ablation (LBMDiTJointPTFrozenTargetAgent): which pluggable
+    # TargetEncoder produces the FM state-flow target (see mip/target_encoders.py).
+    # "dp"  -> a frozen DP/LBMDiT MultiImageObsEncoder loaded from
+    #          dp_checkpoint_path (current behavior). Foreign pretrained visual
+    #          encoders ("lewm", "dinov2", ...) are added incrementally behind
+    #          the same interface. The per-dim z-score (goal_stats_path) is
+    #          applied on top regardless of source.
+    target_encoder_type: str = "dp"
+    # Frozen-target ablation: checkpoint path/dir for non-DP target encoders
+    # (e.g. the LeWM HF ViT dir containing weights.pt + config.json). The DP
+    # target uses dp_checkpoint_path; foreign encoders use this.
+    target_encoder_path: str | None = None
+    # Which rgb obs key the (image-only) foreign target encoder consumes. None
+    # = auto-pick the single rgb key in task.shape_meta (errors if 0 or >1, e.g.
+    # multi-camera robomimic — set it explicitly there). pusht -> "image".
+    target_encoder_image_key: str | None = None
     # E2E variant only (LBMDiTJointE2EAgent): whether the target LayerNorm
     # has learnable gamma/beta. Default False removes the gamma->0 collapse
     # mode; flip to True for the UNITE-faithful variant (encoder gets more
@@ -421,6 +437,12 @@ class NetworkConfig:
     max_freq: float = 100.0
     # Encoder output dimension override (None = use emb_dim)
     encoder_out_dim: int | None = None
+    # Joint trunk only: decouple the STATE-stream (FM target) dim from the
+    # condition/obs dim. None = use obs_dim (encoder_out_dim or emb_dim), the
+    # current coupled behavior. Set to the target encoder's output dim (e.g.
+    # 192 for a LeWM CLS+projector target) when denoising toward a foreign
+    # representation whose dim differs from the input encoder's.
+    state_target_dim: int | None = None
     # REPA specific
     projector_dim: int = 2048
     z_dims: list[int] | None = None

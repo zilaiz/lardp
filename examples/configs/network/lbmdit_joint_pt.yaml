@@ -15,6 +15,7 @@ num_layers: 8               # depth (transformer blocks)
 dropout: 0.0
 timestep_emb_dim: 128       # decoupled from d_model
 encoder_out_dim: 256        # encoder output dim (= obs_dim fed to network)
+state_target_dim: null      # FM-target/state-stream dim (null = obs_dim); set to a foreign target dim (e.g. 192 for LeWM)
 
 # DiT specific
 n_heads: 8

@@ -70,6 +70,7 @@ class LBMDiTJointPT(BaseNetwork):
         timestep_emb_dim: int = 128,
         opt_emb_dim: int | None = None,
         cond_compose: str = "add",
+        state_dim: int | None = None,
     ):
         # BaseNetwork stores act_dim / Ta / obs_dim / To / emb_dim / n_layers
         # as attrs; we use d_model as ``emb_dim`` and depth as ``n_layers``.
@@ -85,6 +86,10 @@ class LBMDiTJointPT(BaseNetwork):
 
         self.d_model = d_model
         self.depth = depth
+        # State-stream (FM target) dim, decoupled from the condition/obs dim.
+        # None -> obs_dim (the coupled default). Drives the state token's input
+        # projection, output head, and the noise/target the agent denoises.
+        self.state_dim = state_dim if state_dim is not None else obs_dim
         self._timestep_emb_dim = timestep_emb_dim
         self._opt_emb_dim = opt_emb_dim if opt_emb_dim is not None else d_model
         self.cond_compose = cond_compose
@@ -110,7 +115,7 @@ class LBMDiTJointPT(BaseNetwork):
         self.opt_mlp = nn.Linear(self._opt_emb_dim, d_model)
 
         # --- Input projections (state and action tokens) ---
-        self.state_input_proj = nn.Linear(obs_dim, d_model)
+        self.state_input_proj = nn.Linear(self.state_dim, d_model)
         self.action_input_proj = nn.Linear(act_dim, d_model)
 
         # --- Learned 1D pos embedding over (Ta+1) tokens ---
@@ -130,7 +135,7 @@ class LBMDiTJointPT(BaseNetwork):
         ])
 
         # --- Output heads (per-token AdaLN final, then linear) ---
-        self.state_final = _DDTFinalLayer(d_model, obs_dim, cond_dim=self._cond_dim)
+        self.state_final = _DDTFinalLayer(d_model, self.state_dim, cond_dim=self._cond_dim)
         self.action_final = _DDTFinalLayer(d_model, act_dim, cond_dim=self._cond_dim)
 
         self._initialize_weights()

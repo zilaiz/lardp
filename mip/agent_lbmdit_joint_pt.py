@@ -43,4 +43,7 @@ class LBMDiTJointPTAgent(LBMDiTJointDDTAgent):
             # Same backward-compat fallback as ``LBMDiTJointDDTAgent._build_net``:
             # older configs without ``joint_cond_compose`` default to "add".
             cond_compose=getattr(config.network, "joint_cond_compose", "add"),
+            # Decouple the state/target dim from obs_dim when set (e.g. a
+            # foreign target encoder of a different dim); None -> obs_dim.
+            state_dim=getattr(config.network, "state_target_dim", None) or obs_dim,
         ).to(device)

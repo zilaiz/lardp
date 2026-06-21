@@ -74,7 +74,13 @@ def compute_stats(
             else:
                 goal_obs = goal_batch.to(device)
 
-            z_goal = encoder(goal_obs, None)         # (B, 1, emb_dim)
+            # A pluggable TargetEncoder exposes .embed(goal)->(B,1,D); a raw
+            # encoder is called as encoder(goal, None). Support both.
+            z_goal = (
+                encoder.embed(goal_obs)
+                if hasattr(encoder, "embed")
+                else encoder(goal_obs, None)
+            )                                        # (B, 1, emb_dim)
             z_goal = z_goal.squeeze(1).double()      # (B, emb_dim) f64
 
             if total_sum is None:

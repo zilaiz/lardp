@@ -7,12 +7,15 @@ feed the AdaLN condition, and ``joint_state_loss_to_encoder`` still routes the
 state-flow loss into (or away from) that input encoder. The ONLY thing swapped
 is the **FM state-flow target**: instead of ``target_ln(encoder(goal_obs))``
 (self-referential, learnable), the next-state target is the output of a
-**frozen, pretrained encoder** loaded from a separate checkpoint, z-scored by
-**precomputed per-dimension goal statistics** (``goal_stats_path``).
+**frozen, pretrained encoder** — a pluggable ``TargetEncoder`` (see
+``mip/target_encoders.py``) selected by ``optimization.target_encoder_type`` —
+z-scored by **precomputed per-dimension goal statistics** (``goal_stats_path``).
 
 This isolates "what state representation is the policy asked to denoise toward"
 as a single knob, holding the rest of the joint_pt pipeline (trunk, decoupled
-t, schedules, CFG, EMA of the *input* rep, the s2e knob) fixed.
+t, schedules, CFG, EMA of the *input* rep, the s2e knob) fixed. Swapping the
+target representation (DP/LBMDiT, LeWM, DINOv2, ...) is a ``target_encoder_type``
+change, not agent surgery.
 
 Why precomputed z-score (not a learnable LayerNorm) on the frozen target:
 standard practice for denoising a pretrained latent (LDM's fixed scalar,
@@ -24,19 +27,17 @@ preserves the representation being ablated and puts every encoder's target on
 a comparable ~unit-variance scale. Export stats with
 ``scripts/compute_goal_stats_dp.py`` (robomimic).
 
-Encoder source: a pretrained **LBMDiT (DP)** checkpoint (``dp_checkpoint_path``,
-top-level ``encoder`` / ``encoder_ema``; pick via ``dp_use_encoder_ema``). The
-loader mirrors ``LBMDiTJointDDTFrozenDPAgent``. The target encoder is never
-EMA'd, runs in eval (deterministic center-crop embeddings, matching the EO/EP
-baseline whose target came from the eval EMA encoder), and is used at TRAINING
-ONLY — inference is byte-identical to ``LBMDiTJointPTAgent`` (the target encoder
-is not touched in ``sample`` / ``sample_joint``), so the deployed policy
-structure is unchanged across ablation arms.
+The target encoder is never EMA'd, runs in eval (deterministic embeddings,
+matching the EO/EP baseline whose target came from the eval EMA encoder), and is
+used at TRAINING ONLY — inference is byte-identical to ``LBMDiTJointPTAgent``
+(the target encoder is not touched in ``sample`` / ``sample_joint``), so the
+deployed policy structure is unchanged across ablation arms.
 
 Note: the frozen target encoder + z-score stats are NOT serialized into the
 agent checkpoint (they are deterministic and reconstructed in ``__init__``).
-``dp_checkpoint_path`` and ``goal_stats_path`` must therefore stay valid for
-resume; deploy does not need them (inference never calls the target encoder).
+The target-encoder source (e.g. ``dp_checkpoint_path``) and ``goal_stats_path``
+must therefore stay valid for resume; deploy does not need them (inference never
+calls the target encoder).
 
 Author: Zilai Zeng
 """
@@ -48,12 +49,12 @@ import torch
 
 from mip.agent_lbmdit_joint_pt import LBMDiTJointPTAgent
 from mip.config import Config
-from mip.network_utils import get_encoder
+from mip.target_encoders import get_target_encoder
 
 
 class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
-    """joint_pt single-trunk agent with a frozen, externally-sourced FM-target
-    encoder + precomputed per-dim z-score. See module docstring.
+    """joint_pt single-trunk agent with a frozen, pluggable FM-target encoder
+    + precomputed per-dim z-score. See module docstring.
     """
 
     def __init__(self, config: Config):
@@ -63,57 +64,46 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
         device = config.optimization.device
         opt = config.optimization
 
-        # --- Frozen target encoder from a pretrained LBMDiT (DP) checkpoint ---
-        dp_path = opt.dp_checkpoint_path
-        if dp_path is None:
+        # --- Frozen target encoder (pluggable; see mip/target_encoders.py) ---
+        # Produces the FM state-flow target. "dp" = frozen DP/LBMDiT encoder;
+        # other types (lewm, dinov2, ...) swap the target representation behind
+        # the same interface. It is frozen (requires_grad off) and eval-always.
+        self.target_encoder = get_target_encoder(config)
+
+        # Guardrail: the trunk's state-stream dim must equal the target dim. The
+        # trunk was built (in super().__init__) with state_dim = state_target_dim
+        # or obs_dim, so a foreign target encoder requires network.state_target_dim
+        # to be set to its output dim.
+        obs_dim = config.network.encoder_out_dim or config.network.emb_dim
+        trunk_state_dim = getattr(config.network, "state_target_dim", None) or obs_dim
+        if self.target_encoder.output_dim != trunk_state_dim:
             raise ValueError(
-                "optimization.dp_checkpoint_path must be set for "
-                "LBMDiTJointPTFrozenTargetAgent — it is the frozen encoder "
-                "that produces the FM state-flow target."
+                f"target encoder output_dim={self.target_encoder.output_dim} != "
+                f"trunk state dim={trunk_state_dim}. Set "
+                f"network.state_target_dim={self.target_encoder.output_dim} "
+                f"(the target encoder's output dim)."
             )
-        loguru.logger.info(
-            f"Loading FROZEN target encoder from {dp_path} (DP/LBMDiT)"
-        )
-        state_dict = torch.load(dp_path, map_location=device, weights_only=False)
-        encoder_key = "encoder_ema" if opt.dp_use_encoder_ema else "encoder"
-        if encoder_key not in state_dict:
-            available = sorted(k for k in state_dict if "encoder" in k)
-            raise KeyError(
-                f"DP checkpoint {dp_path} has no '{encoder_key}' key. "
-                f"Available encoder-like keys: {available}. Toggle "
-                f"optimization.dp_use_encoder_ema or pick another checkpoint."
-            )
-        encoder_sd = state_dict[encoder_key]
-        # LBMDiT does not wrap the encoder; a leading 'encoder.' prefix or an
-        # 'uncond_emb' means this is an IDM / GoalDropout checkpoint by mistake.
-        if "uncond_emb" in encoder_sd or any(
-            k.startswith("encoder.") for k in encoder_sd
-        ):
-            raise RuntimeError(
-                f"DP checkpoint {dp_path} key '{encoder_key}' looks like a "
-                f"GoalDropoutEncoder / IDM state dict (has 'encoder.' prefix "
-                f"or 'uncond_emb'). Point dp_checkpoint_path at an LBMDiT (DP) "
-                f"checkpoint instead."
+        # RAE (arXiv 2510.11690): the diffusion trunk width (emb_dim / d_model)
+        # must be >= the target feature dim, else the flow-matching loss has an
+        # irreducible floor (the tail eigenvalues) and a wide target is unfairly
+        # penalized. Non-blocking warning so a mis-set sweep emb_dim is caught.
+        d_model = config.network.emb_dim
+        if d_model < self.target_encoder.output_dim:
+            loguru.logger.warning(
+                f"network.emb_dim={d_model} < target dim "
+                f"{self.target_encoder.output_dim}: per RAE the diffusion trunk "
+                f"width should be >= the target feature dim, or the FM loss has "
+                f"an irreducible floor. Raise network.emb_dim to >= "
+                f"{self.target_encoder.output_dim}."
             )
 
-        # Build with the SAME network/task config as the trainable encoder so
-        # the output dim equals obs_dim (no trunk change needed). load_state_dict
-        # is the architecture guardrail — it errors loudly on any mismatch
-        # (e.g. a DP checkpoint trained at a different encoder_out_dim).
-        self.target_encoder = get_encoder(config.network, config.task).to(device)
-        self.target_encoder.load_state_dict(encoder_sd)
-        self.target_encoder.requires_grad_(False)
-        self.target_encoder.eval()
-        loguru.logger.info(
-            f"Loaded {encoder_key} into frozen target encoder "
-            f"({sum(v.numel() for v in encoder_sd.values()):,} params)"
-        )
-
-        # --- Optionally warm-start the LIVE input encoder from the SAME DP
+        # --- Optionally warm-start the LIVE input encoder from the SAME source
         # encoder, so the condition and the frozen target start in the same
-        # representation space (isolates whether s2e=True still hurts when
-        # there is no foreign-manifold gap to cross at init). The input encoder
-        # stays trainable / finetuned; only the target encoder is frozen.
+        # representation space (isolates whether s2e=True still hurts when there
+        # is no foreign-manifold gap at init). Input encoder stays trainable;
+        # only the target is frozen. Only valid when the target encoder can
+        # produce a state_dict compatible with our MultiImageObsEncoder (e.g.
+        # the DP target); foreign ViT targets return None and error here.
         if opt.init_input_encoder_from_dp:
             if opt.idm_checkpoint_path is not None:
                 raise ValueError(
@@ -121,10 +111,16 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
                     "idm_checkpoint_path (two competing input-encoder warm-"
                     "starts). Set optimization.idm_checkpoint_path=null."
                 )
-            # Same arch as the target encoder (both get_encoder(network, task)),
-            # which already load_state_dict'd encoder_sd — so this is safe and
-            # makes the input encoder identical to the frozen target at step 0.
-            self.encoder.load_state_dict(encoder_sd)
+            init_sd = self.target_encoder.input_encoder_init_state_dict()
+            if init_sd is None:
+                raise ValueError(
+                    "init_input_encoder_from_dp=True but target_encoder_type="
+                    f"{opt.target_encoder_type!r} cannot initialize the input "
+                    "encoder (architecturally incompatible with the "
+                    "MultiImageObsEncoder). Use target_encoder_type='dp', or "
+                    "set init_input_encoder_from_dp=false."
+                )
+            self.encoder.load_state_dict(init_sd)
             self.encoder.requires_grad_(True)  # stays live (finetune)
             # encoder_ema was deepcopied from the pre-warm-start (scratch)
             # encoder in the parent __init__; re-sync it so the EMA and the
@@ -132,9 +128,9 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
             # (mirrors the idm-warmstart path, which deepcopies AFTER loading).
             self.encoder_ema.load_state_dict(self.encoder.state_dict())
             loguru.logger.info(
-                f"init_input_encoder_from_dp=True: input encoder warm-started "
-                f"from {encoder_key} of {dp_path} (LIVE / finetuned); "
-                f"encoder_ema re-synced to match"
+                "init_input_encoder_from_dp=True: input encoder warm-started "
+                "from the target encoder's source weights (LIVE / finetuned); "
+                "encoder_ema re-synced to match"
             )
 
         # --- Precomputed per-dim z-score stats for the frozen target ---
@@ -170,7 +166,7 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
     # ------------------------------------------------------------------
     def _encode_condition_target(self, obs, goal_obs):
         """Condition from the trainable input encoder (+ target_ln, live grad);
-        target from the FROZEN external encoder, z-scored by precomputed stats.
+        target from the FROZEN ``TargetEncoder``, z-scored by precomputed stats.
 
         The condition path is byte-identical to the parent so the encoder's
         gradient channel and the ``joint_state_loss_to_encoder`` routing in
@@ -179,14 +175,13 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
         """
         z_t = self.target_ln(self.encoder(obs, None))
         with torch.no_grad():
-            z_goal = self.target_encoder(goal_obs, None)
-            target = self._normalize_goal(z_goal)
+            target = self._normalize_goal(self.target_encoder.embed(goal_obs))
         return z_t, target
 
     # ------------------------------------------------------------------
     # Modes: keep the frozen target encoder deterministic (eval) always.
     # save/load are inherited — the target encoder + stats are reconstructed
-    # in __init__ from dp_checkpoint_path / goal_stats_path, so they need no
+    # in __init__ from the configured source / goal_stats_path, so they need no
     # checkpoint round-trip.
     # ------------------------------------------------------------------
     def eval(self):
@@ -196,5 +191,5 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
     def train(self):
         super().train()
         # Frozen target stays in eval: deterministic goal embeddings (no
-        # CropRandomizer / dropout noise in the regression target).
+        # CropRandomizer / dropout / BN-batch noise in the regression target).
         self.target_encoder.eval()
