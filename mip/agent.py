@@ -47,6 +47,32 @@ class TrainingAgent:
         self.encoder_ema = deepcopy(self.encoder).requires_grad_(False)
         self.flow_map_ema = deepcopy(self.flow_map).requires_grad_(False)
 
+        # Optional optimality (expert/play) conditioning for the vanilla
+        # LBMDiT. Off by default => behavior/checkpoints unchanged. When on,
+        # the per-sample label is threaded through the policy loss into the
+        # network's optimality slot (with CFG dropout), and inference
+        # conditions on the expert slot. Reuses the existing mixed-data infra
+        # (dataset optimality labels + optimization.expert_sample_fraction).
+        self._use_optimality = bool(getattr(config.network, "use_optimality", False))
+        self._cfg_dropout_prob = float(
+            getattr(config.optimization, "opt_cfg_dropout_prob", 0.0)
+        )
+        self._expert_idx = int(getattr(net, "EXPERT_IDX", 0))
+        self._null_idx = int(getattr(net, "NULL_IDX", 1))
+        if self._use_optimality:
+            _supported = {"flow", "flow_beta", "flow_reverse_beta", "flow_ns"}
+            if config.optimization.loss_type not in _supported:
+                raise ValueError(
+                    "network.use_optimality=True is only wired for loss_type "
+                    f"in {_supported}; got {config.optimization.loss_type!r}."
+                )
+            if not getattr(net, "use_optimality", False):
+                raise ValueError(
+                    "network.use_optimality=True but the network "
+                    f"({type(net).__name__}) has no optimality embedding. Use "
+                    "network_type='lbmdit' with network.use_optimality=true."
+                )
+
         # Create detached models for CUDA graphs (if enabled)
         self.use_cudagraphs = config.optimization.use_cudagraphs
         if self.use_cudagraphs:
@@ -216,16 +242,42 @@ class TrainingAgent:
             obs = data["obs"]
             delta_t = data["delta_t"]
 
-            # Forward pass and compute loss
-            loss, _info = self.loss_fn(
-                self.config.optimization,
-                self.flow_map,
-                self.encoder,
-                self.interpolant,
-                act,
-                obs,
-                delta_t,
-            )
+            if self._use_optimality:
+                # Per-sample optimality label with CFG dropout (relabel a
+                # fraction of expert samples to the null/play slot so it trains
+                # as an unconditional reference).
+                optimality = data["optimality"]
+                if self.flow_map.training and self._cfg_dropout_prob > 0:
+                    drop = (
+                        torch.empty_like(optimality, dtype=torch.float).uniform_(0, 1)
+                        < self._cfg_dropout_prob
+                    )
+                    optimality = torch.where(
+                        drop,
+                        torch.full_like(optimality, self._null_idx),
+                        optimality,
+                    )
+                loss, _info = self.loss_fn(
+                    self.config.optimization,
+                    self.flow_map,
+                    self.encoder,
+                    self.interpolant,
+                    act,
+                    obs,
+                    delta_t,
+                    optimality_idx=optimality,
+                )
+            else:
+                # Forward pass and compute loss
+                loss, _info = self.loss_fn(
+                    self.config.optimization,
+                    self.flow_map,
+                    self.encoder,
+                    self.interpolant,
+                    act,
+                    obs,
+                    delta_t,
+                )
 
             # Backward pass
             loss.backward()
@@ -276,6 +328,7 @@ class TrainingAgent:
         act: torch.Tensor,
         obs: torch.Tensor | dict | TensorDict,
         delta_t: torch.Tensor,
+        optimality: torch.Tensor | None = None,
     ):
         """Update the model parameters with a training batch.
 
@@ -283,6 +336,9 @@ class TrainingAgent:
             act: Action tensor of shape (batch_size, Ta, act_dim)
             obs: Observation tensor of shape (batch_size, To, obs_dim) or dict of tensors for images
             delta_t: Time step differences of shape (batch_size,)
+            optimality: Optional (batch_size,) long labels in {0=expert,
+                1=null/play}. Used only when ``network.use_optimality=True``;
+                ignored otherwise. None defaults to the expert slot.
 
         Returns:
             Dictionary containing loss and gradient norm statistics
@@ -303,14 +359,23 @@ class TrainingAgent:
             torch.compiler.cudagraph_mark_step_begin()
 
         # Wrap inputs in TensorDict - simple flat structure only (no dicts or nested structures)
-        data = TensorDict(
-            {
-                "act": act,
-                "obs": obs,  # obs can be dict or tensor - TensorDict will handle it
-                "delta_t": delta_t,
-            },
-            batch_size=act.shape[0],
-        )
+        data_dict = {
+            "act": act,
+            "obs": obs,  # obs can be dict or tensor - TensorDict will handle it
+            "delta_t": delta_t,
+        }
+        if self._use_optimality:
+            # Always include the slot so the compiled graph sees a static
+            # structure across steps. Unlabeled batches default to expert.
+            if optimality is None:
+                optimality = torch.full(
+                    (act.shape[0],), self._expert_idx,
+                    dtype=torch.long, device=act.device,
+                )
+            data_dict["optimality"] = optimality.to(
+                device=act.device, dtype=torch.long
+            )
+        data = TensorDict(data_dict, batch_size=act.shape[0])
         result = self._compiled_update(data)
 
         # Convert TensorDict to regular dict with scalar values
@@ -351,6 +416,16 @@ class TrainingAgent:
         Returns:
             Sampled action tensor
         """
+        if self._use_optimality:
+            # Condition on the expert slot at inference.
+            optimality_idx = torch.full(
+                (act_0.shape[0],), self._expert_idx,
+                dtype=torch.long, device=act_0.device,
+            )
+            return self.sampler(
+                config, flow_map, encoder, act_0, obs,
+                optimality_idx=optimality_idx,
+            )
         return self.sampler(config, flow_map, encoder, act_0, obs)
 
     def sample(

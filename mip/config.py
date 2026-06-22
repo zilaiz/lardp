@@ -162,6 +162,16 @@ class OptimizationConfig:
     # Inference-time CFG strength `w` in v_guided = (1+w)*v_cond - w*v_uncond.
     # 0 = plain conditional sampling (one network call per ODE step).
     joint_cfg_scale: float = 0.0
+    # Whether to condition the trunk on the optimality (expert/play) label.
+    # True (default): the net receives the source label and CFG applies — the
+    # current behavior. False: RETIRE the optimality conditioning — the net
+    # gets optimality_idx=None (constant null embedding), CFG dropout and
+    # inference-time CFG are both disabled, so the expert/play separation rests
+    # entirely on the LOSS GATING (e.g. joint_play_scheme=region's tau gates).
+    # The true source label is still consumed for that loss masking; this knob
+    # only controls whether it also drives the network's conditioning. Used to
+    # test whether geometric region-gating alone can replace the learned label.
+    joint_use_optimality: bool = True
     # ODE source for sampling (state/action streams share the same mode).
     # "stochastic" = Gaussian noise, "zero" = deterministic.
     joint_sample_mode: str = "stochastic"
@@ -282,6 +292,13 @@ class OptimizationConfig:
     # reweighting (falls back to uniform shuffle = natural proportions). No-op
     # when the dataset is a single source (no rollouts).
     expert_sample_fraction: float | None = 0.5
+    # Vanilla LBMDiT optimality conditioning (network.use_optimality=True):
+    # CFG dropout fraction — randomly relabel expert->null during training so
+    # the null slot trains as an unconditional reference. 0 = off (play data
+    # already trains the null slot directly). Mirrors joint_cfg_dropout_prob
+    # but for the plain DP path. At inference the policy conditions on the
+    # expert slot (EXPERT_IDX). No-op when use_optimality=False.
+    opt_cfg_dropout_prob: float = 0.0
     # DDT/decoupled-time variant only (LBMDiTJointDDTAgent):
     # If True, sample independent t_state and t_action per batch during
     # training (DF-style decoupled noising). If False, the same scalar t
@@ -320,7 +337,36 @@ class OptimizationConfig:
     # ablation that lets active state-loss rows shape the encoder.
     # Corner-avoidance (joint_play_avoid_both_noise) is inert under
     # non-legacy schemes.
+    #   "region":       per-stream honesty gate over the (t_state, t_action)
+    #                   square. Each stream is compared to its OWN threshold
+    #                   (post-shift):
+    #                       s_clean = t_state  >= joint_region_tau_state
+    #                       a_clean = t_action >= joint_region_tau_action
+    #                   EXPERT optimizes BOTH losses everywhere: for expert no
+    #                   region is contaminating or harmful (at worst low-signal
+    #                   when predicting the already-clean stream), so dropping
+    #                   any of it would only waste the scarce expert set.
+    #                   ROLLOUT optimizes a loss only where it is honest
+    #                   dynamics, i.e. that loss's CONDITIONER stream is clean:
+    #                     action loss (IDM) needs s_clean (next-state known);
+    #                     state  loss (FDM) needs a_clean (action known).
+    #                   So over the cells, rollout supplies:
+    #                     corner ~s&~a : neither (policy+plan = expert only)
+    #                     UL      s&~a : action loss only (IDM)
+    #                     LR     ~s& a : state loss only (FDM)
+    #                     TR      s& a : both (both honest dynamics)
+    #                   Requires joint_decouple_t=True.
     joint_play_scheme: str = "legacy"
+    # "region" scheme thresholds (post-shift time). A stream is "clean enough"
+    # to be an honest dynamics conditioner once its time is >= its threshold;
+    # below it, rollout predicting the OTHER stream would be policy/plan
+    # (optimality-laden), so only expert supplies it there. tau_state gates the
+    # ROLLOUT action loss (how known the next-state must be for IDM); tau_action
+    # gates the ROLLOUT state loss (how known the action must be for FDM). They
+    # may differ — inverse and forward dynamics have different identifiability.
+    # Expert is unaffected by these (it optimizes both losses everywhere).
+    joint_region_tau_state: float = 0.5
+    joint_region_tau_action: float = 0.5
     # Inference t-schedule for the (state, action) flow pair.
     #   "diagonal":    t_state = t_action = grid (single Euler walk).
     #   "state_first": clean state first (t_state ramps 0->1 in first half),
@@ -443,6 +489,16 @@ class NetworkConfig:
     # 192 for a LeWM CLS+projector target) when denoising toward a foreign
     # representation whose dim differs from the input encoder's.
     state_target_dim: int | None = None
+    # Vanilla LBMDiT optional optimality conditioning (expert=0 / play=1),
+    # mirroring the joint trunks' optimality embedding but for the plain DP
+    # DiT. Off by default = byte-identical to the original LBMDiT (no extra
+    # params, loads old checkpoints unchanged). Module names match
+    # franka_diff's LBMDiT so checkpoints stay deploy-compatible. Consumed by
+    # TrainingAgent only when ``use_optimality=True``; reuses the same
+    # ``optimization.expert_sample_fraction`` / ``opt_cfg_dropout_prob`` knobs.
+    use_optimality: bool = False
+    opt_emb_dim: int | None = None  # optimality embedding width (None -> d_model)
+    opt_cond_compose: str = "add"   # "add" (into time features) | "concat" (append)
     # REPA specific
     projector_dim: int = 2048
     z_dims: list[int] | None = None

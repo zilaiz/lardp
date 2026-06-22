@@ -209,6 +209,13 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._w_action = config.optimization.joint_action_loss_weight
         self._cfg_dropout_prob = config.optimization.joint_cfg_dropout_prob
         self._cfg_scale = config.optimization.joint_cfg_scale
+        # Whether the trunk is conditioned on the optimality label at all. When
+        # False, the net sees no source label and CFG is disabled, so expert/
+        # play separation rests entirely on the loss gating. See
+        # OptimizationConfig.joint_use_optimality.
+        self._use_optimality = bool(
+            getattr(config.optimization, "joint_use_optimality", True)
+        )
         self._sample_mode = config.optimization.joint_sample_mode
         self._num_steps = config.optimization.joint_num_steps
         self._decouple_t = config.optimization.joint_decouple_t
@@ -230,11 +237,22 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._play_scheme = getattr(
             config.optimization, "joint_play_scheme", "legacy",
         )
-        if self._play_scheme not in ("legacy", "noisier_all", "noisier_play"):
+        if self._play_scheme not in (
+            "legacy", "noisier_all", "noisier_play", "region",
+        ):
             raise ValueError(
-                "joint_play_scheme must be 'legacy', 'noisier_all', or "
-                f"'noisier_play'; got {self._play_scheme!r}"
+                "joint_play_scheme must be 'legacy', 'noisier_all', "
+                f"'noisier_play', or 'region'; got {self._play_scheme!r}"
             )
+        # "region" scheme: per-stream cleanliness thresholds (post-shift).
+        # Expert optimizes both losses everywhere; rollout supplies a loss only
+        # where its conditioner stream is clean enough. See OptimizationConfig.
+        self._region_tau_state = float(
+            getattr(config.optimization, "joint_region_tau_state", 0.5)
+        )
+        self._region_tau_action = float(
+            getattr(config.optimization, "joint_region_tau_action", 0.5)
+        )
         if self._play_scheme != "legacy":
             if not self._decouple_t:
                 raise ValueError(
@@ -475,13 +493,23 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         # relabels some expert samples to NULL; corner-avoidance keys off the
         # data source, so dropped-expert keeps the full t-distribution).
         is_play_data = optimality == LBMDiTJoint.NULL_IDX
-        if self.net.training and self._cfg_dropout_prob > 0:
+        # CFG dropout is meaningless when optimality conditioning is retired, so
+        # skip it then. ``is_play_data`` (the true source) is captured above and
+        # still drives the loss gating regardless of this knob.
+        if (
+            self._use_optimality
+            and self.net.training
+            and self._cfg_dropout_prob > 0
+        ):
             drop_mask = torch.rand(B, device=device) < self._cfg_dropout_prob
             optimality = torch.where(
                 drop_mask,
                 torch.full_like(optimality, LBMDiTJoint.NULL_IDX),
                 optimality,
             )
+        # What the trunk is conditioned on. None retires the conditioning: the
+        # net adds a constant null embedding, so it cannot distinguish source.
+        net_optimality = optimality if self._use_optimality else None
 
         # 3. Per-stream flow time. Each stream:
         #    (a) draws a base t from joint_t_dist (uniform or logit_normal),
@@ -553,7 +581,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 s=t_state,
                 t=t_action,
                 condition=z_t,
-                optimality_idx=optimality,
+                optimality_idx=net_optimality,
             )
         else:
             s_head, _, _ = self.net(
@@ -562,7 +590,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 s=t_state,
                 t=t_action,
                 condition=z_t.detach(),
-                optimality_idx=optimality,
+                optimality_idx=net_optimality,
             )
             _, a_head, _ = self.net(
                 x_state=s_t,
@@ -570,7 +598,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 s=t_state,
                 t=t_action,
                 condition=z_t,
-                optimality_idx=optimality,
+                optimality_idx=net_optimality,
             )
 
         # 6. Per-stream parameterization.
@@ -621,6 +649,47 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             ) / float(getattr(self.net, "state_dim", self.net.obs_dim))
             action_loss_unscaled = torch.mean(
                 get_norm(v_action - v_action_gt, config.norm_type)
+            ) / float(self.net.act_dim)
+        elif self._play_scheme == "region":
+            # Per-stream honesty gate over the (t_state, t_action) square. Each
+            # stream is compared to its OWN post-shift threshold:
+            #   s_clean = t_state  >= tau_state   (next-state known)
+            #   a_clean = t_action >= tau_action  (action known)
+            # EXPERT optimizes BOTH losses everywhere: for expert there is no
+            # region where a loss is contaminating or harmful — at worst it is
+            # low-signal (predicting the already-clean stream) — so dropping any
+            # of it would only waste the scarce expert set.
+            # ROLLOUT optimizes a loss only where it is honest dynamics, i.e.
+            # that loss's CONDITIONER stream is clean enough:
+            #   action loss (IDM) needs s_clean (predict action <- known state);
+            #   state  loss (FDM) needs a_clean (predict state  <- known action).
+            # => rollout cells: corner ~s&~a none (policy+plan = expert only),
+            #    UL s&~a action, LR ~s&a state, TR s&a both. No one-per-row for
+            #    rollout: wherever a loss is honest dynamics, rollout helps.
+            state_rows = get_norm(
+                v_state - v_state_gt, config.norm_type
+            ).mean(dim=1)  # (B,)
+            action_rows = get_norm(
+                v_action - v_action_gt, config.norm_type
+            ).mean(dim=1)  # (B,)
+            s_clean = t_state >= self._region_tau_state
+            a_clean = t_action >= self._region_tau_action
+            # True data source (pre-CFG-dropout). Unlabeled fallback (optimality
+            # was None) -> treat as expert (both losses), mirroring noisier_play.
+            play_src = (
+                is_play_data if labels_provided
+                else torch.zeros_like(is_play_data)
+            )
+            expert_src = ~play_src
+            state_mask = (expert_src | a_clean).float()
+            action_mask = (expert_src | s_clean).float()
+            state_loss_unscaled = (
+                (state_rows * state_mask).sum()
+                / state_mask.sum().clamp_min(1.0)
+            ) / float(getattr(self.net, "state_dim", self.net.obs_dim))
+            action_loss_unscaled = (
+                (action_rows * action_mask).sum()
+                / action_mask.sum().clamp_min(1.0)
             ) / float(self.net.act_dim)
         else:
             state_rows = get_norm(
@@ -830,7 +899,9 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         encoder, target_ln = self._eval_encoder_modules(use_ema)
         device = act_0.device
         B = act_0.shape[0]
-        cfg_scale = self._cfg_scale
+        # Retiring optimality conditioning disables CFG (no expert/null contrast
+        # to guide with) — force a single conditionless forward per step.
+        cfg_scale = self._cfg_scale if self._use_optimality else 0.0
         steps = self._num_steps if num_steps < 1 else int(num_steps)
 
         z_t = target_ln(encoder(obs, None))
@@ -853,6 +924,9 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         null_idx = torch.full(
             (B,), LBMDiTJoint.NULL_IDX, device=device, dtype=torch.long,
         )
+        # Conditioned forward uses the expert slot normally, or no label (None
+        # -> constant null embedding) when optimality conditioning is retired.
+        cond_idx = expert_idx if self._use_optimality else None
 
         t_state_grid, t_action_grid = self._build_schedule(steps)
 
@@ -866,7 +940,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             t_action_b = torch.full((B,), ta_now, device=device)
 
             s_head_cond, a_head_cond, _ = net(
-                x_state, x_action, t_state_b, t_action_b, z_t, expert_idx,
+                x_state, x_action, t_state_b, t_action_b, z_t, cond_idx,
             )
             if cfg_scale > 0:
                 s_head_un, a_head_un, _ = net(
@@ -908,7 +982,9 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         encoder, target_ln = self._eval_encoder_modules(use_ema)
         device = act_0.device
         B = act_0.shape[0]
-        cfg_scale = self._cfg_scale
+        # Retiring optimality conditioning disables CFG (no expert/null contrast
+        # to guide with) — force a single conditionless forward per step.
+        cfg_scale = self._cfg_scale if self._use_optimality else 0.0
         steps = self._num_steps if num_steps < 1 else int(num_steps)
 
         z_t = target_ln(encoder(obs, None))
@@ -931,6 +1007,9 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         null_idx = torch.full(
             (B,), LBMDiTJoint.NULL_IDX, device=device, dtype=torch.long,
         )
+        # Conditioned forward uses the expert slot normally, or no label (None
+        # -> constant null embedding) when optimality conditioning is retired.
+        cond_idx = expert_idx if self._use_optimality else None
 
         t_state_grid, t_action_grid = self._build_schedule(steps)
 
@@ -944,7 +1023,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
             t_action_b = torch.full((B,), ta_now, device=device)
 
             s_head_cond, a_head_cond, _ = net(
-                x_state, x_action, t_state_b, t_action_b, z_t, expert_idx,
+                x_state, x_action, t_state_b, t_action_b, z_t, cond_idx,
             )
             if cfg_scale > 0:
                 s_head_un, a_head_un, _ = net(

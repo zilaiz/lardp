@@ -21,7 +21,10 @@ os.environ["MUJOCO_GL"] = "egl"  # noqa: E402
 # Import mip modules after setting environment variables
 from mip.agent import TrainingAgent  # noqa: E402
 from mip.config import Config  # noqa: E402
-from mip.dataset_utils import loop_dataloader  # noqa: E402
+from mip.dataset_utils import (  # noqa: E402
+    loop_dataloader,
+    make_expert_weighted_sampler,
+)
 from mip.datasets.robomimic_dataset import make_dataset  # noqa: E402
 from mip.envs.robomimic.robomimic_env import make_vec_env  # noqa: E402
 from mip.logger import (  # noqa: E402
@@ -60,12 +63,19 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
         logger: Logger for metrics
         resume_state: Optional dict with training state to resume from
     """
-    # dataloader
+    # dataloader. For a mixed (expert + rollout) ConcatDataset, optionally
+    # rebalance batches to optimization.expert_sample_fraction; otherwise the
+    # sampler is None and we fall back to plain shuffling. No-op for a single
+    # source.
+    sampler = make_expert_weighted_sampler(
+        dataset, config.optimization.expert_sample_fraction
+    )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,
         num_workers=4,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         pin_memory=True,
         persistent_workers=True,
         # IMPORTANT: drop_last=True is required for CUDA graphs (static shapes)
@@ -161,6 +171,11 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
                     ]  # (B, obs_horizon, obs_dim)
                 act = batch["action"].to(config.optimization.device)
                 act = act[:, : config.task.horizon, :]  # (B, horizon, act_dim)
+                # Optional optimality (expert/play) labels — present when the
+                # dataset is mixed; consumed only when network.use_optimality.
+                optimality = batch.get("optimality")
+                if optimality is not None:
+                    optimality = optimality.to(config.optimization.device)
 
             # update diffusion
             with timed("update", perf_times):
@@ -169,7 +184,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
                 delta_t = torch.full(
                     (batch_size,), delta_t_scalar, device=config.optimization.device
                 )
-                info = agent.update(act, obs, delta_t)
+                info = agent.update(act, obs, delta_t, optimality=optimality)
                 lr_scheduler.step()
 
             for k, v in info.items():

@@ -167,9 +167,17 @@ class FlowMap(nn.Module):
             s, t, xs, tangent, label
         )
 
-    def get_velocity(self, t, xs, label):
-        """Get the velocity field of the flow."""
-        net_output = self.net(xs, t, t, label)
+    def get_velocity(self, t, xs, label, optimality_idx=None):
+        """Get the velocity field of the flow.
+
+        ``optimality_idx`` (optional, (B,) long) is threaded to the network
+        only when provided, so networks without an optimality slot (and all
+        existing 3-arg callers) are unaffected.
+        """
+        if optimality_idx is None:
+            net_output = self.net(xs, t, t, label)
+        else:
+            net_output = self.net(xs, t, t, label, optimality_idx=optimality_idx)
         bt = net_output[0]
         return bt
 

@@ -226,3 +226,4 @@ wandb_backup/
 *_mp4/
 *_analysis/
 goal_stats/
+inference/

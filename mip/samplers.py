@@ -60,6 +60,7 @@ def ode_ns_sampler(
     act_0: torch.Tensor,
     obs: torch.Tensor,
     padding_len: int = 0,
+    optimality_idx: torch.Tensor | None = None,
 ):
     """Euler ODE sampler that walks a noise-shifted t-grid.
 
@@ -94,7 +95,7 @@ def ode_ns_sampler(
         t_val = float(t_schedule[i + 1])
         s = torch.full((bs,), s_val, device=act_0.device)
         t = torch.full((bs,), t_val, device=act_0.device)
-        b_s = flow_map.get_velocity(s, act_s, obs_emb)
+        b_s = flow_map.get_velocity(s, act_s, obs_emb, optimality_idx=optimality_idx)
         s_expanded = at_least_ndim(s, act_s.dim())
         t_expanded = at_least_ndim(t, act_s.dim())
         act_s = act_s + b_s * (t_expanded - s_expanded)
@@ -108,6 +109,7 @@ def ode_sampler(
     act_0: torch.Tensor,
     obs: torch.Tensor,
     padding_len: int = 0,
+    optimality_idx: torch.Tensor | None = None,
 ):
     num_steps = config.num_steps
     sample_mode = config.sample_mode
@@ -126,7 +128,7 @@ def ode_sampler(
         t_val = t_schedule[i + 1]
         s = torch.full((bs,), s_val, device=act_0.device)
         t = torch.full((bs,), t_val, device=act_0.device)
-        b_s = flow_map.get_velocity(s, act_s, obs_emb)
+        b_s = flow_map.get_velocity(s, act_s, obs_emb, optimality_idx=optimality_idx)
         s_expanded = at_least_ndim(s, act_s.dim())
         t_expanded = at_least_ndim(t, act_s.dim())
         act_s = act_s + b_s * (t_expanded - s_expanded)

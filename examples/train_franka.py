@@ -166,13 +166,18 @@ def train(
 
             with timed("preprocess", perf):
                 obs, act = _preprocess_batch(batch, config)
+                # Optional optimality (expert/play) labels — present only for a
+                # mixed franka dataset; consumed only when network.use_optimality.
+                optimality = batch.get("optimality")
+                if optimality is not None:
+                    optimality = optimality.to(config.optimization.device)
 
             with timed("update", perf):
                 delta_t_scalar = warmup_scheduler(n_gradient_step)
                 delta_t = torch.full(
                     (act.shape[0],), delta_t_scalar, device=config.optimization.device
                 )
-                info = agent.update(act, obs, delta_t)
+                info = agent.update(act, obs, delta_t, optimality=optimality)
                 lr_scheduler.step()
 
             for k, v in info.items():

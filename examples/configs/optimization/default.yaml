@@ -130,6 +130,12 @@ joint_cfg_dropout_prob: 0.0
 # Inference-time CFG strength `w` in v_guided = (1+w)*v_cond - w*v_uncond.
 # 0 = plain conditional sampling (one fwd pass per ODE step).
 joint_cfg_scale: 0.0
+# Whether to condition the trunk on the optimality (expert/play) label. true =
+# current behavior (label + CFG). false = RETIRE the conditioning: the net gets
+# optimality_idx=None (constant null embedding), CFG dropout + inference CFG are
+# disabled, so expert/play separation rests entirely on the loss gating (e.g.
+# joint_play_scheme=region). The true label is still consumed for that gating.
+joint_use_optimality: true
 # ODE source for sampling (state and action streams share this).
 joint_sample_mode: "stochastic"  # "stochastic" | "zero"
 # Default Euler steps for joint ODE sampling. The training-time eval loop
@@ -211,6 +217,13 @@ joint_replace_x_state: false
 # null disables the reweighting (uniform shuffle = natural proportions).
 # No-op when the dataset is a single source (no rollouts).
 expert_sample_fraction: 0.5
+# Vanilla LBMDiT optimality conditioning (network.use_optimality=true): CFG
+# dropout fraction — randomly relabel expert->null during training so the null
+# slot trains as an unconditional reference. 0 = off (play data already trains
+# the null slot). Mirrors joint_cfg_dropout_prob but for the plain DP path; at
+# inference the policy conditions on the expert slot. No-op when use_optimality
+# is false.
+opt_cfg_dropout_prob: 0.0
 # DDT/decoupled-time variant only (LBMDiTJointDDTAgent) ------------------
 # If true, sample independent t_state and t_action per batch (DF-style
 # decoupled noising). If false, share a single t between streams (recovers
@@ -235,6 +248,14 @@ joint_play_both_noise_tau: 0.5
 # (true = warned ablation: active state-loss rows shape the encoder).
 # Corner-avoidance above is inert under them.
 joint_play_scheme: "legacy"
+# "region" scheme thresholds (post-shift time). Gate ROLLOUT only: a rollout
+# loss fires only where its conditioner stream is clean enough — action loss
+# (IDM) needs t_state >= tau_state; state loss (FDM) needs t_action >= tau_action.
+# Below threshold the rollout prediction would be policy/plan, so only expert
+# supplies it. May differ (inverse vs forward dynamics identifiability). Expert
+# optimizes both losses everywhere regardless of these.
+joint_region_tau_state: 0.5
+joint_region_tau_action: 0.5
 # Inference (t_state, t_action) trajectory through [0, 1]^2.
 #   "diagonal":    t_state == t_action at every step (single Euler walk).
 #   "state_first": clean state in first half, then clean action.

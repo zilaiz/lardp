@@ -186,15 +186,18 @@ def _make_multi_image_dataset(task_config, mode="train"):
         ),
     )
 
-    # Primary (expert) dataset with val split
+    # Primary (expert) dataset with val split. Tagged optimality=0 (expert);
+    # every additional path is tagged optimality=1 (null/play) so CFG-aware
+    # agents (network.use_optimality=True) see real per-sample labels.
     datasets = []
     primary_ds = RobomimicImageDataset(
         dataset_dir=paths[0],
         val_dataset_percentage=task_config.val_dataset_percentage,
+        optimality_label=0,
         **common_kwargs,
     )
     datasets.append(primary_ds)
-    logger.info(f"Primary dataset: {len(primary_ds)} samples")
+    logger.info(f"Primary dataset (optimality=0/expert): {len(primary_ds)} samples")
 
     # Secondary (rollout) datasets — each with own normalizer first
     for path in paths[1:]:
@@ -202,10 +205,11 @@ def _make_multi_image_dataset(task_config, mode="train"):
             dataset_dir=path,
             val_dataset_percentage=0.0,
             filter_success=filter_success,
+            optimality_label=1,
             **common_kwargs,
         )
         datasets.append(ds)
-        logger.info(f"Secondary dataset: {len(ds)} samples")
+        logger.info(f"Secondary dataset (optimality=1/play): {len(ds)} samples")
 
     if len(datasets) == 1:
         return datasets[0]
@@ -441,6 +445,7 @@ class RobomimicImageDataset(BaseDataset):
         mode="train",
         normalizer=None,
         filter_success=False,
+        optimality_label: int = 0,
         delta_action_anchor: str | None = None,
         delta_action_normalizer: str = "quantile",
     ):
@@ -450,6 +455,11 @@ class RobomimicImageDataset(BaseDataset):
         )
         self.val_dataset_percentage = val_dataset_percentage
         self.mode = mode
+        # Optimality slot carried into every batch sample: 0 = expert, 1 =
+        # null/play. Read by CFG-aware agents (e.g. TrainingAgent with
+        # network.use_optimality=True). Default 0 keeps single-source training
+        # silent (everything tagged expert).
+        self.optimality_label = int(optimality_label)
         # Only consulted on the delta-action (current_obs) branch of
         # get_normalizer(); robomimic abs/relative tasks never set
         # delta_action_anchor, so this leaves their MinMax path untouched.
@@ -633,6 +643,7 @@ class RobomimicImageDataset(BaseDataset):
         torch_data = {
             "obs": dict_apply(obs_dict, torch.tensor),
             "action": torch.tensor(action),
+            "optimality": torch.tensor(self.optimality_label, dtype=torch.long),
         }
         return torch_data
 

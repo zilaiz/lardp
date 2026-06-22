@@ -92,6 +92,7 @@ def flow_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    optimality_idx: torch.Tensor | None = None,
 ) -> float:
     """Flow model loss, matching the velocity field.
 
@@ -116,7 +117,7 @@ def flow_loss(
     # predict
     act_t = interp.calc_It(t, act_0, act_1)
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
-    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb, optimality_idx=optimality_idx)
 
     # compute loss
     loss = get_norm(b_t - act_t_dot, config.norm_type)
@@ -238,6 +239,7 @@ def flow_ns_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    optimality_idx: torch.Tensor | None = None,
 ) -> float:
     """Flow matching loss with SD3-style noise-shift on the flow time.
 
@@ -269,7 +271,7 @@ def flow_ns_loss(
 
     act_t = interp.calc_It(t, act_0, act_1)
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
-    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb, optimality_idx=optimality_idx)
 
     loss = get_norm(b_t - act_t_dot, config.norm_type)
     loss = config.loss_scale * torch.mean(loss)
@@ -284,6 +286,7 @@ def flow_beta_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    optimality_idx: torch.Tensor | None = None,
 ) -> float:
     """Flow model loss with Beta distribution timestep sampling.
 
@@ -317,7 +320,7 @@ def flow_beta_loss(
     # predict
     act_t = interp.calc_It(t, act_0, act_1)
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
-    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb, optimality_idx=optimality_idx)
 
     # compute loss
     loss = get_norm(b_t - act_t_dot, config.norm_type)
@@ -333,6 +336,7 @@ def flow_reverse_beta_loss(
     act: torch.Tensor,
     obs: torch.Tensor,
     delta_t: torch.Tensor,
+    optimality_idx: torch.Tensor | None = None,
 ) -> float:
     """Reproduces the original (pre-fix) flow_beta schedule.
 
@@ -348,7 +352,7 @@ def flow_reverse_beta_loss(
 
     act_t = interp.calc_It(t, act_0, act_1)
     act_t_dot = interp.calc_It_dot(t, act_0, act_1)
-    b_t = flow_map.get_velocity(t, act_t, obs_emb)
+    b_t = flow_map.get_velocity(t, act_t, obs_emb, optimality_idx=optimality_idx)
 
     loss = get_norm(b_t - act_t_dot, config.norm_type)
     loss = config.loss_scale * torch.mean(loss)

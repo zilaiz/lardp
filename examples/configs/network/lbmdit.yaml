@@ -13,3 +13,13 @@ encoder_out_dim: 256
 # LBMDiT specific configs
 n_heads: 8  # Number of attention heads
 timestep_emb_type: "positional"  # Options: positional, sinusoidal, fourier
+
+# --- Optimality conditioning (play/expert), vanilla LBMDiT ---
+# Off by default => byte-identical to plain DP (no extra params, loads old
+# checkpoints unchanged). Mirrors franka_diff's network/lbmdit.yaml so the same
+# checkpoints stay deploy-compatible. Consumed by TrainingAgent only when
+# use_optimality=true; reuses optimization.expert_sample_fraction /
+# optimization.opt_cfg_dropout_prob.
+use_optimality: false      # master toggle; false = byte-identical to plain DP
+opt_emb_dim: null          # embedding width (null -> emb_dim)
+opt_cond_compose: "add"    # "add" (into time features) | "concat" (append)

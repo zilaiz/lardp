@@ -163,6 +163,13 @@ def get_network(network_config: NetworkConfig, task_config: TaskConfig):
             depth=network_config.num_layers,
             dropout=network_config.dropout,
             timestep_emb_type=network_config.timestep_emb_type,
+            # Optimality conditioning (play/expert). getattr fallbacks keep
+            # older configs without these fields working unchanged — important
+            # for deploying franka_diff checkpoints whose saved config predates
+            # the optimality knobs.
+            use_optimality=getattr(network_config, "use_optimality", False),
+            opt_emb_dim=getattr(network_config, "opt_emb_dim", None),
+            cond_compose=getattr(network_config, "opt_cond_compose", "add"),
         )
 
     elif network_config.network_type == "lbmdit_ddt":

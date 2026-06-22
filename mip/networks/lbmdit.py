@@ -174,7 +174,18 @@ class LBMDiT(BaseNetwork):
 
     Adapted from the Multi-Task DiT Policy (Bryson Jones) to the MIP
     framework interface (x, s, t, condition) -> (action, scalar).
+
+    Optionally conditions on a binary optimality label (0=expert, 1=null/play)
+    via a 2-slot embedding folded into the AdaLN conditioning. The module names
+    (``optimality_embedding`` / ``opt_mlp``) and slot indices (``EXPERT_IDX`` /
+    ``NULL_IDX``) match the joint trunks and the franka_diff ``LBMDiT`` so a
+    checkpoint deploys against a matching network. Disabled
+    (``use_optimality=False``) leaves the network byte-identical to the
+    original DP (no extra params, loads old checkpoints unchanged).
     """
+
+    EXPERT_IDX = 0
+    NULL_IDX = 1  # also used by play-data conditioning at training time
 
     def __init__(
         self,
@@ -192,12 +203,22 @@ class LBMDiT(BaseNetwork):
         use_rope: bool = False,
         use_positional_encoding: bool = True,
         rope_base: float = 10000.0,
+        use_optimality: bool = False,
+        opt_emb_dim: int | None = None,
+        cond_compose: str = "add",
     ):
         super().__init__(act_dim, Ta, obs_dim, To, d_model, depth)
+
+        if cond_compose not in ("add", "concat"):
+            raise ValueError(
+                f"cond_compose must be 'add' or 'concat'; got {cond_compose!r}"
+            )
 
         self.d_model = d_model
         self.disable_time_embedding = disable_time_embedding
         self.use_rope = use_rope
+        self.use_optimality = use_optimality
+        self.cond_compose = cond_compose
 
         # --- Time embeddings for s and t ---
         timestep_emb_params = timestep_emb_params or {}
@@ -220,8 +241,20 @@ class LBMDiT(BaseNetwork):
             nn.GELU(),
         )
 
-        # Conditioning dimension fed to AdaLN = time + obs concatenated
+        # --- Optimality embedding (2 slots: expert + null/play) ---
+        # Folded into the AdaLN cond either by adding into the time features
+        # ("add", cond_dim unchanged) or by appending ("concat", cond_dim +=
+        # d_model). Only instantiated when enabled, so disabled runs add no
+        # parameters and load old checkpoints unchanged.
+        if self.use_optimality:
+            _opt_emb_dim = opt_emb_dim if opt_emb_dim is not None else d_model
+            self.optimality_embedding = nn.Embedding(2, _opt_emb_dim)
+            self.opt_mlp = nn.Linear(_opt_emb_dim, d_model)
+
+        # Conditioning dimension fed to AdaLN = time + obs (+ optimality if concat)
         cond_dim = d_model + obs_dim * To  # time_features + flattened obs
+        if self.use_optimality and self.cond_compose == "concat":
+            cond_dim += d_model  # appended optimality features
 
         # --- Input projection ---
         self.input_proj = nn.Linear(act_dim, d_model)
@@ -271,12 +304,16 @@ class LBMDiT(BaseNetwork):
         s: Tensor,
         t: Tensor,
         condition: Tensor | None = None,
+        optimality_idx: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Args:
             x:         (b, Ta, act_dim) noisy action sequence
             s:         (b,) source time parameter
             t:         (b,) target time parameter
             condition: (b, To, obs_dim) or None
+            optimality_idx: (b,) long in {0=expert, 1=null/play}, or None.
+                Ignored when ``use_optimality=False``. When enabled and None,
+                defaults to the null/play slot.
 
         Returns:
             y:      (b, Ta, act_dim) predicted action / velocity
@@ -301,8 +338,22 @@ class LBMDiT(BaseNetwork):
         else:
             cond_flat = torch.zeros(batch_size, self.obs_dim * self.To, device=device)
 
-        # Concatenate time and obs features -> full conditioning vector
-        cond_vec = torch.cat([time_features, cond_flat], dim=-1)  # (b, d_model + To*obs_dim)
+        # --- Optimality conditioning (optional) ---
+        if self.use_optimality:
+            if optimality_idx is None:
+                optimality_idx = torch.full(
+                    (batch_size,), self.NULL_IDX, device=device, dtype=torch.long,
+                )
+            opt_feat = self.opt_mlp(self.optimality_embedding(optimality_idx))  # (b, d_model)
+            if self.cond_compose == "add":
+                # Fold into time features; cond_dim (and the blocks) unchanged.
+                time_features = time_features + opt_feat
+                cond_vec = torch.cat([time_features, cond_flat], dim=-1)
+            else:  # concat: keep optimality in its own subspace
+                cond_vec = torch.cat([time_features, cond_flat, opt_feat], dim=-1)
+        else:
+            # Concatenate time and obs features -> full conditioning vector
+            cond_vec = torch.cat([time_features, cond_flat], dim=-1)  # (b, d_model + To*obs_dim)
 
         # --- Input projection ---
         h = self.input_proj(x)  # (b, Ta, d_model)
