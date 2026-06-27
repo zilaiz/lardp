@@ -1,0 +1,45 @@
+# @package network
+# Single-trunk joint flow-matching DiT (LBMDiTJointPT) on top of a FROZEN
+# pretrained ViT encoder. Same trunk as lbmdit_joint_pt; the only change is the
+# input encoder: encoder_type="frozen_vit" swaps the from-scratch ResNets for a
+# frozen backbone (DINOv2/SigLIP) + a trainable per-camera attentive-pool (MAP)
+# adapter over patch tokens. The encoder is shared for the AdaLN condition and
+# the FM state target (target uses the EMA adapter over the frozen backbone).
+defaults:
+  - _base
+  - _self_
+
+network_type: "lbmdit_joint_pt"
+emb_dim: 256                # d_model of the single trunk
+num_layers: 8               # depth (transformer blocks)
+dropout: 0.0
+timestep_emb_dim: 128       # decoupled from d_model
+encoder_out_dim: 256        # encoder output dim (= obs_dim fed to network)
+state_target_dim: null      # null = coupled to obs_dim (shared encoder)
+
+# DiT specific
+n_heads: 8
+timestep_emb_type: "positional"
+
+# Optimality embedding width (null -> d_model)
+joint_opt_emb_dim: null
+
+# Per-token cond composition: "add" or "concat"
+joint_cond_compose: "add"
+
+# Decouple the state vs action streams inside each transformer block: separate
+# AdaLN modulation AND separate MLP per stream (attention stays shared; cond
+# front-end + output heads unchanged). false = shared (original). PT trunk only.
+joint_decouple_streams: false
+
+# --- Frozen pretrained ViT encoder ---
+encoder_type: "frozen_vit"
+frozen_vit_backbone: "dinov2"   # "dinov2" | "siglip"
+# REQUIRED: local HF model dir. Override per machine, e.g.:
+#   network.frozen_vit_path=~/data/zzeng28/ckpts/dinov2_small
+frozen_vit_path: null
+frozen_vit_n_query: 1           # MAP probes per camera view
+frozen_vit_n_heads: 8           # MAP attention heads
+target_include_proprio: true    # include low-dim proprio in the FM state target
+frozen_vit_autocast_bf16: true  # bf16 the frozen backbone forward on CUDA (~2x)
+frozen_vit_backbone_chunk_size: null  # cap images/backbone-forward (null = all at once)

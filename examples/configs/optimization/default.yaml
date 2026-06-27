@@ -199,6 +199,14 @@ joint_use_ema_target: false
 # still flows into the encoder via the live z_t forward used for v_action.
 # Costs ~2x trunk compute. Default true preserves baseline behavior.
 joint_state_loss_to_encoder: true
+# Companion routing knob for the action/IDM loss (mirror of the state flag
+# above). Default true = baseline: action loss always shapes the encoder via the
+# live z_t. false detaches the action head's condition so action loss does NOT
+# reach the encoder. The two flags span the 2x2 of which losses shape the
+# encoder: (state F, action T)=action-only; (T,T)=both; (T,F)=state-only;
+# (F,F)=neither. update() runs one trunk forward when both heads share a
+# condition, two when they differ.
+joint_action_loss_to_encoder: true
 # Encoder + target_ln LR multiplier relative to trunk LR. 1.0 = single param
 # group (baseline). < 1 slows the representation vs the trunk (JEDI uses 0.3;
 # anti-collapse lever when state_loss flows into the encoder).

@@ -232,6 +232,28 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         self._state_loss_to_encoder = bool(
             config.optimization.joint_state_loss_to_encoder
         )
+        # Companion routing knob for the action/IDM loss (default True =
+        # baseline: action always shapes the encoder). See OptimizationConfig.
+        # The two flags span the 2x2 of which losses shape the input encoder;
+        # the forward in update() feeds each head a live or detached condition.
+        self._action_loss_to_encoder = bool(
+            getattr(config.optimization, "joint_action_loss_to_encoder", True)
+        )
+        if not self._state_loss_to_encoder and not self._action_loss_to_encoder:
+            loguru.logger.warning(
+                "joint_state_loss_to_encoder=False AND "
+                "joint_action_loss_to_encoder=False: NEITHER loss shapes the "
+                "input encoder via the condition — it moves only through the "
+                "(detached/EMA) target path; for a frozen_vit encoder the MAP "
+                "adapter then receives NO gradient at all. Did you mean "
+                "state-only (state=True, action=False)?"
+            )
+        else:
+            loguru.logger.info(
+                f"Encoder gradient routing: "
+                f"state_loss_to_encoder={self._state_loss_to_encoder}, "
+                f"action_loss_to_encoder={self._action_loss_to_encoder}"
+            )
         # --- Loss-assignment scheme over the decoupled (t_state, t_action)
         # square. See OptimizationConfig.joint_play_scheme.
         self._play_scheme = getattr(
@@ -450,11 +472,24 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         """
         config = self.config.optimization
         z_t = self.target_ln(self.encoder(obs, None))
+        # Optionally exclude proprio (low_dim) from the FM state TARGET while the
+        # condition keeps it (frozen_vit encoder only — it zeros the low_dim
+        # slot). Pass the kwarg only when actually dropping proprio so every
+        # other encoder's forward(obs, mask) signature is untouched (default
+        # True = parity with the standard target).
+        tgt_include_proprio = getattr(
+            self.config.network, "target_include_proprio", True
+        )
+        goal_kwargs = {} if tgt_include_proprio else {"include_proprio": False}
         if self._use_ema_target and config.ema_rate < 1:
             with torch.no_grad():
-                target = self.target_ln_ema(self.encoder_ema(goal_obs, None))
+                target = self.target_ln_ema(
+                    self.encoder_ema(goal_obs, None, **goal_kwargs)
+                )
         else:
-            z_goal_ln = self.target_ln(self.encoder(goal_obs, None))
+            z_goal_ln = self.target_ln(
+                self.encoder(goal_obs, None, **goal_kwargs)
+            )
             target = z_goal_ln.detach()
         return z_t, target
 
@@ -566,21 +601,28 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
         a_t_dot = self.interpolant.calc_It_dot(t_action, a_noise, act)
 
         # 5. Joint forward — DDT trunk takes the two times directly.
-        #    If state_loss is configured to NOT flow into the encoder, run
-        #    two forward passes: one with z_t.detach() to produce the state
-        #    head output (encoder receives no state_loss grad), one with
-        #    live z_t to produce the action head output (encoder still
-        #    receives action_loss grad). Otherwise a single forward feeds
-        #    both heads. ``s_head`` and ``a_head`` are raw head outputs;
-        #    their meaning depends on the per-stream parameterization
-        #    (velocity directly, or x1-estimate to be converted in step 6).
-        if self._state_loss_to_encoder:
+        #    Per-head encoder-gradient routing: a head's loss reaches the input
+        #    encoder ONLY if that head's condition is the LIVE z_t; a detached
+        #    condition severs that head's gradient to the encoder (the trunk's
+        #    own weights still train either way). The two {state,action}_loss_
+        #    to_encoder flags pick live vs detached per head, spanning the 2x2:
+        #      both live     -> ONE forward  (both: old s2e=True)
+        #      both detached -> ONE forward  (neither: encoder frozen)
+        #      differ        -> TWO forwards (action-only=old s2e False; state-only)
+        #    Reusing the SAME z_t / z_t_det objects makes the ``is`` check select
+        #    one vs two forwards exactly. ``s_head``/``a_head`` are raw head
+        #    outputs; their meaning depends on the per-stream parameterization
+        #    (velocity directly, or x1-estimate converted in step 6).
+        z_t_det = z_t.detach()
+        cond_state = z_t if self._state_loss_to_encoder else z_t_det
+        cond_action = z_t if self._action_loss_to_encoder else z_t_det
+        if cond_state is cond_action:
             s_head, a_head, _ = self.net(
                 x_state=s_t,
                 x_action=a_t,
                 s=t_state,
                 t=t_action,
-                condition=z_t,
+                condition=cond_state,
                 optimality_idx=net_optimality,
             )
         else:
@@ -589,7 +631,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 x_action=a_t,
                 s=t_state,
                 t=t_action,
-                condition=z_t.detach(),
+                condition=cond_state,
                 optimality_idx=net_optimality,
             )
             _, a_head, _ = self.net(
@@ -597,7 +639,7 @@ class LBMDiTJointDDTAgent(LBMDiTJointE2EAgent):
                 x_action=a_t,
                 s=t_state,
                 t=t_action,
-                condition=z_t,
+                condition=cond_action,
                 optimality_idx=net_optimality,
             )
 

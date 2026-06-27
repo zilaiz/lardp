@@ -14,8 +14,8 @@ dataset_paths:
   - data/franka_coffee_pod_cog/image.hdf5
   - data/franka_coffee_pod_cog/image_rollout.hdf5
   - data/franka_coffee_pod_cog/image_rollout_2.hdf5
-  - data/franka_coffee_pod_cog/image_play.hdf5
-  - data/franka_coffee_pod_cog/image_play_2.hdf5
+  # - data/franka_coffee_pod_cog/image_play.hdf5
+  # - data/franka_coffee_pod_cog/image_play_2.hdf5
 
 # Play data has no reward signal in this dataset, so success-filtering would
 # drop everything. Keep all play episodes.

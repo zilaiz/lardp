@@ -287,12 +287,21 @@ class LBMDiTJointE2EAgent(LBMDiTJointAgent):
         super()._ema_update()
         rate = self.config.optimization.ema_rate
         with torch.no_grad():
-            # Encoder parameters
+            # Encoder parameters. Skip params shared by identity between the live
+            # encoder and its EMA copy (``p is p_ema``): a frozen-ViT encoder
+            # shares ONE backbone with encoder_ema (FrozenVisionBackbone
+            # __deepcopy__ returns self), and the in-place ``mul_(rate).add_(p,
+            # 1-rate)`` would alias — reading p AFTER scaling it — slowly
+            # decaying those (meant-to-be-frozen) weights. EMA of a param against
+            # itself is a no-op anyway, so skipping is both correct and a no-op
+            # for the normal (fully-copied) case.
             for p, p_ema in zip(
                 self.encoder.parameters(),
                 self.encoder_ema.parameters(),
                 strict=False,
             ):
+                if p is p_ema:
+                    continue
                 p_ema.data.mul_(rate).add_(p.data, alpha=1.0 - rate)
             # Encoder buffers (BN running stats etc.) — copy not EMA, since
             # they track distributional statistics rather than learned params.
@@ -301,6 +310,8 @@ class LBMDiTJointE2EAgent(LBMDiTJointAgent):
                 self.encoder_ema.buffers(),
                 strict=False,
             ):
+                if b is b_ema:
+                    continue
                 b_ema.data.copy_(b.data)
             # Target LayerNorm parameters (gamma/beta when affine=True).
             for p, p_ema in zip(

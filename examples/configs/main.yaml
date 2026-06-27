@@ -12,4 +12,16 @@ mode: "train"
 # Auto-generated experiment name
 log:
   exp_name: "${task.env_name}_${task.env_type}_${task.obs_type}_${optimization.loss_type}_${task.latent_type}_${network.network_type}_${network.emb_dim}_seed${optimization.seed}${suffix:${log.exp_note}}"
-  log_dir: "logs/${log.exp_name}/${now:%Y_%m_%d_%H_%M_%S}"
+  # Per-run dir for logs/models AND Hydra's .hydra/config.yaml (see hydra.run.dir).
+  # The SLURM_JOB_ID suffix (microseconds fallback for local runs) makes this dir
+  # unique per job, so simultaneously-launched runs can no longer collide/corrupt.
+  log_dir: "logs/${log.exp_name}/${now:%Y_%m_%d_%H_%M_%S}_${oc.env:SLURM_JOB_ID,${now:%f}}"
+
+# Write Hydra's run output (.hydra/config.yaml) into the same per-run dir as the
+# logs/models above, instead of the default outputs/<date>/<time>. chdir stays
+# False so the app keeps writing relative paths from the repo root.
+hydra:
+  job:
+    chdir: False
+  run:
+    dir: "${log.log_dir}"

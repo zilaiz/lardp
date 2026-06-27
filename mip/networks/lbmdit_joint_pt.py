@@ -71,6 +71,7 @@ class LBMDiTJointPT(BaseNetwork):
         opt_emb_dim: int | None = None,
         cond_compose: str = "add",
         state_dim: int | None = None,
+        decouple_streams: bool = False,
     ):
         # BaseNetwork stores act_dim / Ta / obs_dim / To / emb_dim / n_layers
         # as attrs; we use d_model as ``emb_dim`` and depth as ``n_layers``.
@@ -93,6 +94,8 @@ class LBMDiTJointPT(BaseNetwork):
         self._timestep_emb_dim = timestep_emb_dim
         self._opt_emb_dim = opt_emb_dim if opt_emb_dim is not None else d_model
         self.cond_compose = cond_compose
+        # Decouple the state vs action streams (AdaLN + MLP) inside each block.
+        self.decouple_streams = decouple_streams
         # Cond width fed to block / final-layer AdaLN modulation.
         self._cond_dim = 3 * d_model if cond_compose == "concat" else d_model
 
@@ -124,12 +127,15 @@ class LBMDiTJointPT(BaseNetwork):
         )
 
         # --- Single stack of per-token-AdaLN blocks ---
+        # The state token is position 0 (n_state=1); the action tokens follow.
         self.blocks = nn.ModuleList([
             _DDTBlock(
                 hidden_size=d_model,
                 num_heads=n_heads,
                 cond_dim=self._cond_dim,
                 dropout=dropout,
+                decouple_streams=decouple_streams,
+                n_state=1,
             )
             for _ in range(depth)
         ])
@@ -146,10 +152,12 @@ class LBMDiTJointPT(BaseNetwork):
         )
 
     def _initialize_weights(self):
-        # AdaLN-Zero: zero the last Linear of every block's modulation
+        # AdaLN-Zero: zero the last Linear of every block's modulation MLP(s)
+        # (one shared, or separate state/action MLPs when decouple_streams).
         for blk in self.blocks:
-            nn.init.constant_(blk.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(blk.adaLN_modulation[-1].bias, 0)
+            for mod in blk._modulation_mlps():
+                nn.init.constant_(mod[-1].weight, 0)
+                nn.init.constant_(mod[-1].bias, 0)
         # Final-layer AdaLN modulation + output linear: zero
         for final in (self.state_final, self.action_final):
             nn.init.constant_(final.adaLN_modulation[-1].weight, 0)
@@ -348,6 +356,96 @@ def test_lbmdit_joint_pt():
     assert torch.allclose(v_a, torch.zeros_like(v_a)), \
         "action final should be zero at init"
     print("AdaLN-Zero init verified (final outputs are zero at init).")
+
+    # ---- Decoupled state/action streams inside the block (decouple_streams) ----
+    # Separate AdaLN modulation AND separate MLP per stream; attention stays
+    # shared (the joint op); cond front-end + output heads unchanged.
+    shared = LBMDiTJointPT(
+        act_dim=act_dim, Ta=Ta, obs_dim=obs_dim, To=To,
+        d_model=128, depth=4, n_heads=4, timestep_emb_dim=64,
+    )
+    model_dec = LBMDiTJointPT(
+        act_dim=act_dim, Ta=Ta, obs_dim=obs_dim, To=To,
+        d_model=128, depth=4, n_heads=4, timestep_emb_dim=64,
+        decouple_streams=True,
+    )
+    # Structure: per block, separate state/action modulation AND mlp; shared attn.
+    for blk in model_dec.blocks:
+        assert blk.decouple_streams
+        assert hasattr(blk, "adaLN_modulation_state") and hasattr(blk, "mlp_state")
+        assert hasattr(blk, "adaLN_modulation_action") and hasattr(blk, "mlp_action")
+        assert not hasattr(blk, "adaLN_modulation") and not hasattr(blk, "mlp")
+        assert blk.adaLN_modulation_state is not blk.adaLN_modulation_action
+        assert blk.mlp_state is not blk.mlp_action
+        assert isinstance(blk.attn, nn.MultiheadAttention)  # attention shared
+    n_shared = sum(p.numel() for p in shared.parameters())
+    n_dec = sum(p.numel() for p in model_dec.parameters())
+    assert n_dec > n_shared, "decoupling adds a 2nd modulation MLP + 2nd mlp/block"
+    print(f"[decouple] params {n_dec} > shared {n_shared} (+{n_dec - n_shared})")
+
+    # Forward shapes + identity at init (modulation gates zero -> zero output).
+    v_s_d, v_a_d, _ = model_dec(x_state, x_action, t_state, t_action, cond, opt)
+    assert v_s_d.shape == (B, 1, obs_dim) and v_a_d.shape == (B, Ta, act_dim)
+    model_dec.eval()
+    with torch.no_grad():
+        v_s0, v_a0, _ = model_dec(x_state, x_action, t_state, t_action, cond)
+    assert torch.allclose(v_s0, torch.zeros_like(v_s0))
+    assert torch.allclose(v_a0, torch.zeros_like(v_a0))
+    print("[decouple] forward OK + identity-at-init verified")
+
+    # Decisive routing test: the state token (pos 0) goes through the STATE
+    # modulation + STATE mlp; action tokens (pos 1..) through the ACTION ones.
+    # Set each to emit a distinct constant and read the per-token output.
+    blk = model_dec.blocks[0]
+    with torch.no_grad():
+        nn.init.constant_(blk.adaLN_modulation_state[-1].weight, 0)
+        nn.init.constant_(blk.adaLN_modulation_state[-1].bias, 1.0)
+        nn.init.constant_(blk.adaLN_modulation_action[-1].weight, 0)
+        nn.init.constant_(blk.adaLN_modulation_action[-1].bias, 2.0)
+        # mlp -> constant c: zero both Linears' weights, set the last bias to c.
+        for m, c in ((blk.mlp_state, 3.0), (blk.mlp_action, 4.0)):
+            nn.init.constant_(m[0].weight, 0)
+            nn.init.constant_(m[0].bias, 0)
+            nn.init.constant_(m[2].weight, 0)
+            nn.init.constant_(m[2].bias, c)
+    cond_probe = torch.randn(B, Ta + 1, model_dec._cond_dim)
+    mod = blk._modulate_cond(cond_probe)
+    assert torch.allclose(mod[:, :1], torch.ones_like(mod[:, :1])), \
+        "state token (pos 0) must use the STATE modulation MLP"
+    assert torch.allclose(mod[:, 1:], 2.0 * torch.ones_like(mod[:, 1:])), \
+        "action tokens (pos 1..) must use the ACTION modulation MLP"
+    h_probe = torch.randn(B, Ta + 1, 128)
+    mlp_out = blk._apply_mlp(h_probe)
+    assert torch.allclose(mlp_out[:, :1], 3.0 * torch.ones_like(mlp_out[:, :1])), \
+        "state token (pos 0) must use the STATE mlp"
+    assert torch.allclose(mlp_out[:, 1:], 4.0 * torch.ones_like(mlp_out[:, 1:])), \
+        "action tokens (pos 1..) must use the ACTION mlp"
+    print("[decouple] routing verified (modulation + mlp split state vs action)")
+
+    # All four per-stream weight groups receive gradient.
+    model_dec2 = LBMDiTJointPT(
+        act_dim=act_dim, Ta=Ta, obs_dim=obs_dim, To=To,
+        d_model=128, depth=2, n_heads=4, decouple_streams=True,
+    )
+    with torch.no_grad():  # break AdaLN-Zero so gradients flow end-to-end
+        for b in model_dec2.blocks:
+            nn.init.normal_(b.adaLN_modulation_state[-1].weight, std=0.02)
+            nn.init.normal_(b.adaLN_modulation_action[-1].weight, std=0.02)
+        for fin in (model_dec2.state_final, model_dec2.action_final):
+            nn.init.normal_(fin.adaLN_modulation[-1].weight, std=0.02)
+            nn.init.normal_(fin.linear.weight, std=0.02)
+    model_dec2.train()
+    v_s2, v_a2, _ = model_dec2(x_state, x_action, t_state, t_action, cond, opt)
+    (v_s2.sum() + v_a2.sum()).backward()
+    b0 = model_dec2.blocks[0]
+    for name, p in (
+        ("mod_state", b0.adaLN_modulation_state[-1].weight),
+        ("mod_action", b0.adaLN_modulation_action[-1].weight),
+        ("mlp_state", b0.mlp_state[0].weight),
+        ("mlp_action", b0.mlp_action[0].weight),
+    ):
+        assert p.grad is not None and p.grad.abs().sum() > 0, f"{name} got no grad"
+    print("[decouple] all 4 per-stream weight groups receive gradient")
 
     print("=" * 50)
     print("LBMDiTJointPT test completed!")

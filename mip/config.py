@@ -20,8 +20,15 @@ class LogConfig:
     eval_episodes: int = 10
     save_video: bool = False
     save_rollouts: bool = False
-    rollout_noise_std: float = 0.0  # Gaussian noise std injected into actions during rollout collection
+    rollout_noise_std: float = (
+        0.0  # Gaussian noise std injected into actions during rollout collection
+    )
     max_rollout_demos: int = 0  # Max rollout episodes to save (0 = unlimited)
+    # Whether new-best models are copied to the repo-root ``checkpoints/`` dir
+    # (the global, success-rate-named store). Off by default to avoid cluttering
+    # checkpoints/ on sweeps; the per-run ``models/model_best.pt`` is still saved.
+    # Set ``log.save_global_checkpoints=true`` for runs you want in the global store.
+    save_global_checkpoints: bool = False
 
 
 @dataclass
@@ -30,7 +37,7 @@ class OptimizationConfig:
     loss_type: str = "flow"
     loss_scale: float = 100.0
     cls_loss_scale: float = 0.03
-    repa_scale: float = 0.0 # REPA loss coefficient
+    repa_scale: float = 0.0  # REPA loss coefficient
     s_align_depth: int | list[int] = 2
     t_align_depth: int | list[int] = 2
     norm_type: str = "l2"
@@ -68,21 +75,33 @@ class OptimizationConfig:
     use_cudagraphs: bool = False  # Whether to use CUDA graphs (requires static shapes)
     auto_resume: bool = True  # Whether to automatically resume from checkpoint
     # IDM goal dropout (classifier-free guidance style)
-    goal_dropout_prob: float = 0.0  # Probability of zeroing out goal frame during IDM training
+    goal_dropout_prob: float = (
+        0.0  # Probability of zeroing out goal frame during IDM training
+    )
     # IDM encoder local-linearity regularizer weight (0 disables)
     local_linearity_coef: float = 0.0
     # Goal predictor specific
-    idm_checkpoint_path: str | None = None  # Path to pretrained IDM checkpoint (for goal predictor training)
-    state_matching_weight: float = 0.0  # Lambda for state-matching loss ||g_hat - encoder(s_{t+k})||^2
+    idm_checkpoint_path: str | None = (
+        None  # Path to pretrained IDM checkpoint (for goal predictor training)
+    )
+    state_matching_weight: float = (
+        0.0  # Lambda for state-matching loss ||g_hat - encoder(s_{t+k})||^2
+    )
     cfg_scale: float = 1.0  # CFG scale for goal predictor inference (1.0 = no guidance)
     # Goal predictor DiT specific
     goal_flow_num_steps: int = 5  # ODE steps for goal generation at inference
     goal_flow_loss_scale: float = 1.0  # weight for state flow loss
     action_reg_weight: float = 1.0  # weight for action regularization loss
-    action_reg_t_weighting: str = "linear"  # per-sample weighting of action loss by t_flow: "none" | "linear"
+    action_reg_t_weighting: str = (
+        "linear"  # per-sample weighting of action loss by t_flow: "none" | "linear"
+    )
     action_reg_num_steps: int = 1  # K Euler steps from x_t -> g_hat for action_reg_loss; 1 = original one-step shortcut
-    goal_stats_path: str | None = None  # path to precomputed goal normalization stats (.pt)
-    delta_stats_path: str | None = None  # path to precomputed delta (= z_goal - z_last_obs) stats (.pt) for the delta predictor
+    goal_stats_path: str | None = (
+        None  # path to precomputed goal normalization stats (.pt)
+    )
+    delta_stats_path: str | None = (
+        None  # path to precomputed delta (= z_goal - z_last_obs) stats (.pt) for the delta predictor
+    )
     # Goal predictor DDT-NS (noise-shift) variant only. SD3-style time shift on
     # the single goal flow time, plus a configurable base-t distribution and
     # endpoint clamp. Identity defaults so leaving them untouched recovers the
@@ -116,7 +135,7 @@ class OptimizationConfig:
     retrieval_distance: str = "l2"  # "l2" | "cosine"
     retrieval_top_k: int = 1
     retrieval_aggregation: str = "top1"  # "top1" | "weighted"
-    retrieval_temperature: float = 1.0   # softmax temperature for "weighted"
+    retrieval_temperature: float = 1.0  # softmax temperature for "weighted"
     # If True, retrieve both obs_summary (= index keys) and goal embedding
     # (= index values) from the nearest training row, and inject the pair
     # directly into the IDM action trunk via ``forward_with_summary``,
@@ -136,7 +155,9 @@ class OptimizationConfig:
     # is sometimes the smoother / preferred downstream artifact.
     joint_use_encoder_ema_for_init: bool = False
     # IDM + FDM joint training (lbmidm_v2 / IDMFDMAgent)
-    fdm_loss_scale: float = 0.0  # weight for forward-dynamics auxiliary loss (0 = disabled)
+    fdm_loss_scale: float = (
+        0.0  # weight for forward-dynamics auxiliary loss (0 = disabled)
+    )
     # Ortho regularizer: hinge-form penalty on cos_sim(z_obs[-1], z_goal),
     # active only when cos_sim > ortho_reg_threshold. The hinge gives a
     # stable equilibrium (no runaway orthogonality) and avoids the
@@ -147,7 +168,9 @@ class OptimizationConfig:
     ortho_reg_threshold: float = 0.5
     # Dropout annealing for condistill extra_cond_encoder
     extra_cond_dropout_warmup_steps: int = 5000  # number of steps to keep dropout at 0
-    extra_cond_dropout_rampup_steps: int = 10000  # number of steps to linearly ramp dropout from 0 to max
+    extra_cond_dropout_rampup_steps: int = (
+        10000  # number of steps to linearly ramp dropout from 0 to max
+    )
     # Diagnostic: measure how much extra_cond affects teacher representations
     diagnose_teacher_delta: bool = False
     # LBMDiTJoint (single-stage joint state+action DiT) -------------------
@@ -262,6 +285,22 @@ class OptimizationConfig:
     # action_loss and destabilize encoder training. Default True preserves
     # baseline behavior (single forward, state_loss shapes encoder).
     joint_state_loss_to_encoder: bool = True
+    # Companion routing knob for the ACTION/IDM loss (mirror of the state flag
+    # above). Default True = baseline: the action loss always reaches the encoder
+    # via the LIVE condition (the collapse-free external-action-target anchor).
+    # Set False to detach the action head's condition so the action loss does NOT
+    # shape the encoder. Together the two flags span the 2x2 of which losses
+    # shape the input encoder:
+    #   (state F, action T) = action-only  (recommended baseline; old s2e=False)
+    #   (state T, action T) = both         (old s2e=True; warned ablation)
+    #   (state T, action F) = state-only   (FDM-only encoder; the new cell —
+    #                         tests whether next-state prediction ALONE yields an
+    #                         action-sufficient encoder, i.e. retention not just
+    #                         geometry)
+    #   (state F, action F) = neither      (encoder gets no live grad; degenerate)
+    # update() implements this by feeding each head a live or detached condition:
+    # ONE forward when both heads share a condition, TWO when they differ.
+    joint_action_loss_to_encoder: bool = True
     # E2E/DDT/PT variant only: LR multiplier for the encoder + target_ln
     # param group, relative to the trunk LR (``lr``). 1.0 = single group
     # (baseline, exact checkpoint/optimizer compat). Values < 1 slow the
@@ -400,7 +439,9 @@ class OptimizationConfig:
     # is intrinsic); leave joint_t_shift_* at 1.0 to match PI-0 exactly.
     # "reverse_beta" reproduces the original (pre-fix) flow_beta: t ~ Beta(1.5,
     # 1.0) directly, mass at t≈1 (data end). For A/B comparisons only.
-    joint_t_dist: str = "uniform"  # "uniform" | "logit_normal" | "beta" | "reverse_beta"
+    joint_t_dist: str = (
+        "uniform"  # "uniform" | "logit_normal" | "beta" | "reverse_beta"
+    )
     joint_t_dist_mu: float = 0.0
     joint_t_dist_sigma: float = 1.0
     # Optional per-stream overrides of the base t distribution (only used when
@@ -455,7 +496,9 @@ class NetworkConfig:
     emb_dim: int = 512
     dropout: float = 0.1
     encoder_dropout: float = 0.0
-    encoder_type: str | None = None  # "mlp", "per_step_mlp", "identity", "image", "dino"
+    encoder_type: str | None = (
+        None  # "mlp", "per_step_mlp", "identity", "image", "dino"
+    )
     extra_cond_encoder_dropout: float = 0.4
     expansion_factor: int = 4
     timestep_emb_dim: int = 128
@@ -489,6 +532,39 @@ class NetworkConfig:
     # 192 for a LeWM CLS+projector target) when denoising toward a foreign
     # representation whose dim differs from the input encoder's.
     state_target_dim: int | None = None
+    # Frozen pretrained ViT encoder (encoder_type="frozen_vit"): a frozen
+    # backbone (DINOv2/SigLIP) + a trainable per-camera attentive-pool (MAP)
+    # adapter over its patch tokens, concatenated with low-dim state and
+    # projected to encoder_out_dim. Shared for the AdaLN condition and the FM
+    # state target in the joint_pt pipeline (the target uses the EMA adapter;
+    # the frozen backbone is shared, so the target is anchored to fixed
+    # pretrained features and cannot collapse).
+    frozen_vit_backbone: str = "dinov2"  # "dinov2" | "siglip"
+    frozen_vit_path: str | None = None  # local HF model dir (required)
+    frozen_vit_n_query: int = 1  # MAP probes per camera view
+    frozen_vit_n_heads: int = 8  # MAP attention heads
+    # bf16-autocast the frozen backbone forward on CUDA (frozen + no-grad, so a
+    # safe ~2x speedup; the trainable MAP head stays fp32). Disable for exact
+    # fp32 features.
+    frozen_vit_autocast_bf16: bool = True
+    # Cap images per backbone forward to bound peak activation memory (null /
+    # <=0 = one forward over all cameras*frames). Raise headroom for big
+    # backbones / many cameras (e.g. transport) / large batch; no-op when large.
+    frozen_vit_backbone_chunk_size: int | None = None
+    # FM state TARGET proprio toggle (frozen_vit only). The condition always
+    # includes low-dim proprio; when False the target zeros the low-dim slot so
+    # the state stream denoises toward a pure visual next-state. Default True =
+    # parity with the standard joint_pt target (proprio in the target).
+    target_include_proprio: bool = True
+    # Expose the frozen backbone's NATIVE pooled descriptor (DINOv2 CLS /
+    # SigLIP pooler_output) so it can be reused as the FM state target by the
+    # shared-backbone frozen-target ablation (LBMDiTJointPTFrozenViTTargetAgent).
+    # For SigLIP this keeps the pretraining MAP pooler head (otherwise dropped
+    # via vision_use_head=False); for DINOv2 the CLS is always present, so this
+    # is a no-op there. The input MAP-adapter path never consumes the pooled
+    # descriptor, so leaving this on for the plain frozen_vit input encoder is
+    # harmless (the head is frozen and stripped from the checkpoint).
+    frozen_vit_expose_pooled: bool = False
     # Vanilla LBMDiT optional optimality conditioning (expert=0 / play=1),
     # mirroring the joint trunks' optimality embedding but for the plain DP
     # DiT. Off by default = byte-identical to the original LBMDiT (no extra
@@ -498,7 +574,7 @@ class NetworkConfig:
     # ``optimization.expert_sample_fraction`` / ``opt_cfg_dropout_prob`` knobs.
     use_optimality: bool = False
     opt_emb_dim: int | None = None  # optimality embedding width (None -> d_model)
-    opt_cond_compose: str = "add"   # "add" (into time features) | "concat" (append)
+    opt_cond_compose: str = "add"  # "add" (into time features) | "concat" (append)
     # REPA specific
     projector_dim: int = 2048
     z_dims: list[int] | None = None
@@ -544,6 +620,17 @@ class NetworkConfig:
     # by 3x and letting the AdaLN modulation linear learn the mixing
     # weights instead of receiving a fixed-coefficient sum.
     joint_cond_compose: str = "add"  # "add" | "concat"
+    # Decouple the state vs action streams INSIDE each joint-PT transformer
+    # block: when True, the state token and the action tokens get SEPARATE AdaLN
+    # modulation AND SEPARATE MLP weights, so the next-state (FDM) and action
+    # (IDM) streams are processed independently within the block. Self-attention
+    # stays shared (the joint mixing op); the cond front-end (time/obs/opt MLPs)
+    # stays shared; the output heads were already separate. False (default): one
+    # shared modulation + one shared MLP per block (original; checkpoints load
+    # unchanged). Used to test whether the state/action coupling inside the block
+    # drives the state_loss_to_encoder=True harm. LBMDiTJointPT trunk only;
+    # ~+1 modulation MLP and +1 MLP per block in params.
+    joint_decouple_streams: bool = False
     # LBMDiTJointDDT (joint DiT with encoder/decoder width split)
     joint_ddt_enc_depth: int = 8
     joint_ddt_dec_depth: int = 2
@@ -597,7 +684,9 @@ class TaskConfig:
     dataset_path: str | None = (
         None  # Local path (deprecated, use dataset_repo/dataset_filename)
     )
-    dataset_paths: list[str] | None = None  # Multiple HDF5 paths [expert, rollout1, ...]
+    dataset_paths: list[str] | None = (
+        None  # Multiple HDF5 paths [expert, rollout1, ...]
+    )
     # Rollout HDF5 paths to mix in alongside the primary (expert) dataset.
     # Used by PushT, where the expert demos come from a zarr (dataset_repo /
     # dataset_filename / dataset_path) but collected rollouts are robomimic-
@@ -612,7 +701,9 @@ class TaskConfig:
     # round(n * fraction) demos. Lets you sweep the play:expert ratio without
     # pre-slicing HDF5 files. No-op on robomimic (which mixes via dataset_paths).
     rollout_use_fraction: float = 1.0
-    filter_success: bool = False  # Filter secondary datasets to keep only successful demos (reward > 0)
+    filter_success: bool = (
+        False  # Filter secondary datasets to keep only successful demos (reward > 0)
+    )
     max_episode_steps: int = 400
     obs_keys: list[str] = field(
         default_factory=lambda: [
@@ -641,17 +732,22 @@ class TaskConfig:
     use_seq: bool = True
     # REPA specific
     latent_type: str | None = None  # "lam" or "dino"
-    use_precomputed: bool = False  # True = load from HDF5, False = on-the-fly LAM inference
-    camera_keys: list[str] | None = None  # e.g., ["agentview_image"]; None = auto-detect from HDF5
+    use_precomputed: bool = (
+        False  # True = load from HDF5, False = on-the-fly LAM inference
+    )
+    camera_keys: list[str] | None = (
+        None  # e.g., ["agentview_image"]; None = auto-detect from HDF5
+    )
 
     lam_frame_skips: list[int] | None = None  # e.g., [1, 8]; None = no LAM
     lam_latent_type: str | None = None  # None = no LAM; "prebn" or "bn" = enable
 
     dino_types: list[str] | None = None  # ["cls", "patch_mean"]
     dino_model: str | None = None  # e.g. vits16plus, vitb16
-    dino_align_target: str | None = None # "fd" or "id"
+    dino_align_target: str | None = None  # "fd" or "id"
     dino_ckpt_dir: str = "/oscar/data/csun45/zzeng28/cache/torch/dinov3"
     dino_repo: str = "/oscar/data/csun45/zzeng28/cache/torch/dinov3/dinov3"
+
 
 @dataclass
 class LAMConfig:
@@ -664,6 +760,7 @@ class LAMConfig:
     lam_num_heads: int = 16
     lam_dropout: float = 0.0
     lam_ckpt_path: str = None
+
 
 @dataclass
 class Config:

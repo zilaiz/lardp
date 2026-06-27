@@ -46,4 +46,8 @@ class LBMDiTJointPTAgent(LBMDiTJointDDTAgent):
             # Decouple the state/target dim from obs_dim when set (e.g. a
             # foreign target encoder of a different dim); None -> obs_dim.
             state_dim=getattr(config.network, "state_target_dim", None) or obs_dim,
+            # Decouple state vs action streams (AdaLN + MLP) inside each block.
+            decouple_streams=getattr(
+                config.network, "joint_decouple_streams", False
+            ),
         ).to(device)

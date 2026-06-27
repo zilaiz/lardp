@@ -26,3 +26,8 @@ joint_opt_emb_dim: null
 
 # Per-token cond composition: "add" (sum at d_model) or "concat" (3*d_model)
 joint_cond_compose: "add"
+
+# Decouple the state vs action streams inside each transformer block: separate
+# AdaLN modulation AND separate MLP per stream (attention stays shared; cond
+# front-end + output heads unchanged). false = shared (original). PT trunk only.
+joint_decouple_streams: false

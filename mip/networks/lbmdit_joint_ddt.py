@@ -73,6 +73,8 @@ class _DDTBlock(nn.Module):
         num_heads: int,
         cond_dim: int,
         dropout: float = 0.0,
+        decouple_streams: bool = False,
+        n_state: int = 1,
     ):
         super().__init__()
         self.attn = nn.MultiheadAttention(
@@ -80,14 +82,69 @@ class _DDTBlock(nn.Module):
         )
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidden_size * 4, hidden_size),
-        )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(cond_dim, 6 * hidden_size, bias=True),
-        )
+        # State/action stream weights INSIDE the block. When ``decouple_streams``
+        # the first ``n_state`` tokens (the state token) and the remaining action
+        # tokens get SEPARATE AdaLN modulation AND SEPARATE MLP weights, so the
+        # next-state (FDM) and action (IDM) streams are processed independently
+        # within the block. Self-attention stays SHARED (the joint mixing op).
+        # Off (default) builds one shared modulation + one shared MLP under the
+        # same attribute names/shapes as the original block, so existing
+        # checkpoints load unchanged.
+        self.decouple_streams = decouple_streams
+        self.n_state = n_state
+
+        def _make_modulation():
+            return nn.Sequential(
+                nn.SiLU(), nn.Linear(cond_dim, 6 * hidden_size, bias=True),
+            )
+
+        def _make_mlp():
+            return nn.Sequential(
+                nn.Linear(hidden_size, hidden_size * 4),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(hidden_size * 4, hidden_size),
+            )
+
+        if decouple_streams:
+            self.adaLN_modulation_state = _make_modulation()
+            self.adaLN_modulation_action = _make_modulation()
+            self.mlp_state = _make_mlp()
+            self.mlp_action = _make_mlp()
+        else:
+            self.adaLN_modulation = _make_modulation()
+            self.mlp = _make_mlp()
+
+    def _modulation_mlps(self) -> list[nn.Module]:
+        """AdaLN modulation Sequential(s) to zero-init (AdaLN-Zero)."""
+        if self.decouple_streams:
+            return [self.adaLN_modulation_state, self.adaLN_modulation_action]
+        return [self.adaLN_modulation]
+
+    def _modulate_cond(self, cond: Tensor) -> Tensor:
+        """Per-token AdaLN params ``(B, L, 6*hidden)`` — one shared modulation
+        MLP, or separate state/action modulation MLPs split at ``n_state`` when
+        ``decouple_streams``.
+        """
+        if not self.decouple_streams:
+            return self.adaLN_modulation(cond)
+        ns = self.n_state
+        return torch.cat([
+            self.adaLN_modulation_state(cond[:, :ns]),
+            self.adaLN_modulation_action(cond[:, ns:]),
+        ], dim=1)
+
+    def _apply_mlp(self, h: Tensor) -> Tensor:
+        """Block MLP — one shared MLP, or separate state/action MLPs split at
+        ``n_state`` when ``decouple_streams`` (independent feed-forward weights
+        per stream; per-token, no cross-token mixing either way).
+        """
+        if not self.decouple_streams:
+            return self.mlp(h)
+        ns = self.n_state
+        return torch.cat([
+            self.mlp_state(h[:, :ns]),
+            self.mlp_action(h[:, ns:]),
+        ], dim=1)
 
     def forward(self, x: Tensor, cond: Tensor) -> Tensor:
         """Args:
@@ -95,14 +152,14 @@ class _DDTBlock(nn.Module):
             cond: (B, L, cond_dim)  — per-token conditioning row
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(cond).chunk(6, dim=-1)
+            self._modulate_cond(cond).chunk(6, dim=-1)
         )
         attn_in = _modulate(self.norm1(x), shift_msa, scale_msa)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in)  # shared (joint) op
         x = x + gate_msa * attn_out
 
         mlp_in = _modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp * self.mlp(mlp_in)
+        x = x + gate_mlp * self._apply_mlp(mlp_in)
         return x
 
 

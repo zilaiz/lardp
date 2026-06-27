@@ -1,0 +1,52 @@
+# @package network
+# Frozen-ViT input + shared-backbone FROZEN-TARGET joint flow-matching DiT.
+# Same trunk + input encoder as lbmdit_joint_pt_frozenvit (frozen DINOv2/SigLIP
+# backbone + trainable per-camera MAP adapter for the AdaLN condition). The ONLY
+# change vs lbmdit_joint_pt_frozenvit is the FM state-flow TARGET: instead of the
+# EMA of the trainable adapter, it is the frozen backbone's NATIVE pooled
+# descriptor (DINOv2 CLS / SigLIP pooler_output) — computed by REUSING the same
+# backbone (frozen_vit_expose_pooled=true) — z-scored by precomputed goal stats.
+# Built by LBMDiTJointPTFrozenViTTargetAgent.
+#
+# Dims DECOUPLE (frozentgt design): the target dim is the backbone hidden size,
+# so set state_target_dim = D and emb_dim >= D per arm (RAE), with encoder_out_dim
+# (the condition width) fixed at 256.
+defaults:
+  - _base
+  - _self_
+
+network_type: "lbmdit_joint_pt"
+emb_dim: 256                # d_model of the single trunk (override per-arm to D)
+num_layers: 8               # depth (transformer blocks)
+dropout: 0.0
+timestep_emb_dim: 128       # decoupled from d_model
+encoder_out_dim: 256        # condition width (= obs_dim fed to the trunk); FIXED
+state_target_dim: null      # override per-arm to the target dim D (decoupled)
+
+# DiT specific
+n_heads: 8
+timestep_emb_type: "positional"
+
+# Optimality embedding width (null -> d_model)
+joint_opt_emb_dim: null
+
+# Per-token cond composition: "add" or "concat"
+joint_cond_compose: "add"
+joint_decouple_streams: false
+
+# --- Frozen pretrained ViT INPUT encoder (shared with the target) ---
+encoder_type: "frozen_vit"
+frozen_vit_backbone: "dinov2"   # "dinov2" | "siglip"
+# REQUIRED: local HF model dir. Override per machine / per arm, e.g.:
+#   network.frozen_vit_path=~/data/zzeng28/ckpts/dinov2_small
+frozen_vit_path: null
+frozen_vit_n_query: 1           # MAP probes per camera view (condition side)
+frozen_vit_n_heads: 8           # MAP attention heads (condition side)
+# No-op here for the target (the FM target is a pure-visual pooled descriptor,
+# not the input-encoder output); kept for parity with the frozen_vit input.
+target_include_proprio: true
+frozen_vit_autocast_bf16: true  # bf16 the frozen backbone forward on CUDA (~2x)
+frozen_vit_backbone_chunk_size: null  # cap imgs/backbone-forward (null = all)
+# REQUIRED for this ablation: keep the backbone's native pooled descriptor so it
+# can be reused as the FM target (SigLIP keeps its pooler head; no-op for DINOv2).
+frozen_vit_expose_pooled: true

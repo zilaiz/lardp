@@ -65,7 +65,8 @@ class TargetEncoder(nn.Module):
         if key is not None:
             return key
         rgb = [
-            k for k, a in config.task.shape_meta["obs"].items()
+            k
+            for k, a in config.task.shape_meta["obs"].items()
             if a.get("type") == "rgb"
         ]
         if len(rgb) != 1:
@@ -112,9 +113,7 @@ class DPTargetEncoder(TargetEncoder):
                 "target_encoder_type='dp' — it is the frozen encoder that "
                 "produces the FM state-flow target."
             )
-        loguru.logger.info(
-            f"Loading FROZEN target encoder from {dp_path} (DP/LBMDiT)"
-        )
+        loguru.logger.info(f"Loading FROZEN target encoder from {dp_path} (DP/LBMDiT)")
         state_dict = torch.load(dp_path, map_location=device, weights_only=False)
         encoder_key = "encoder_ema" if opt.dp_use_encoder_ema else "encoder"
         if encoder_key not in state_dict:
@@ -219,12 +218,12 @@ class LeWMTargetEncoder(TargetEncoder):
             patch_size=self._PATCH,
         )
         self.vit = ViTModel(
-            vit_cfg, add_pooling_layer=False, use_mask_token=False,
+            vit_cfg,
+            add_pooling_layer=False,
+            use_mask_token=False,
         ).to(device)
         enc_sd = {
-            k[len("encoder."):]: v
-            for k, v in sd.items()
-            if k.startswith("encoder.")
+            k[len("encoder.") :]: v for k, v in sd.items() if k.startswith("encoder.")
         }
         missing, unexpected = self.vit.load_state_dict(enc_sd, strict=False)
         # Tolerate missing non-persistent buffers (e.g. position_ids); every
@@ -245,7 +244,7 @@ class LeWMTargetEncoder(TargetEncoder):
             nn.Linear(self._PROJ_HIDDEN, self._HIDDEN),
         ).to(device)
         proj_sd = {
-            k[len("projector.net."):]: v
+            k[len("projector.net.") :]: v
             for k, v in sd.items()
             if k.startswith("projector.net.")
         }
@@ -281,11 +280,13 @@ class LeWMTargetEncoder(TargetEncoder):
         from torchvision.transforms import InterpolationMode
         from torchvision.transforms.v2 import functional as tvf
 
-        img = (img + 1.0) / 2.0                   # our x*2-1 -> [0,1]
-        img = (img - self._mean) / self._std      # ImageNet (x-mean)/std
+        img = (img + 1.0) / 2.0  # our x*2-1 -> [0,1]
+        img = (img - self._mean) / self._std  # ImageNet (x-mean)/std
         return tvf.resize(
-            img, self._IMG,
-            interpolation=InterpolationMode.BILINEAR, antialias=True,
+            img,
+            self._IMG,
+            interpolation=InterpolationMode.BILINEAR,
+            antialias=True,
         )
 
     def embed(self, goal_obs) -> torch.Tensor:
@@ -296,7 +297,7 @@ class LeWMTargetEncoder(TargetEncoder):
         cls = self.vit(
             pixel_values=flat, interpolate_pos_encoding=True
         ).last_hidden_state[:, 0]  # (B*T, 192)
-        emb = self.projector(cls)                                  # (B*T, 192)
+        emb = self.projector(cls)  # (B*T, 192)
         return emb.reshape(B, T, self.output_dim)
 
 
@@ -353,20 +354,22 @@ class DINOv2TargetEncoder(TargetEncoder):
         from torchvision.transforms import InterpolationMode
         from torchvision.transforms.v2 import functional as tvf
 
-        img = (img + 1.0) / 2.0                  # our x*2-1 -> [0,1]
-        img = tvf.resize(                        # shortest-edge -> 256, BICUBIC
-            img, self._RESIZE,
-            interpolation=InterpolationMode.BICUBIC, antialias=True,
+        img = (img + 1.0) / 2.0  # our x*2-1 -> [0,1]
+        img = tvf.resize(  # shortest-edge -> 256, BICUBIC
+            img,
+            self._RESIZE,
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
         )
-        img = tvf.center_crop(img, self._CROP)   # 224
-        return (img - self._mean) / self._std    # ImageNet (x-mean)/std
+        img = tvf.center_crop(img, self._CROP)  # 224
+        return (img - self._mean) / self._std  # ImageNet (x-mean)/std
 
     def embed(self, goal_obs) -> torch.Tensor:
         flat, B, T = self._flatten_images(goal_obs)
         flat = self._preprocess(flat.to(self._mean.dtype))
         cls = self.vit(
             pixel_values=flat, interpolate_pos_encoding=True
-        ).last_hidden_state[:, 0]                # (B*T, D)
+        ).last_hidden_state[:, 0]  # (B*T, D)
         return cls.reshape(B, T, self.output_dim)
 
 
@@ -420,17 +423,68 @@ class SiglipTargetEncoder(TargetEncoder):
         from torchvision.transforms import InterpolationMode
         from torchvision.transforms.v2 import functional as tvf
 
-        img = (img + 1.0) / 2.0                   # our x*2-1 -> [0,1]
-        img = tvf.resize(                         # 224x224 square, BICUBIC
-            img, [self._IMG, self._IMG],
-            interpolation=InterpolationMode.BICUBIC, antialias=True,
+        img = (img + 1.0) / 2.0  # our x*2-1 -> [0,1]
+        img = tvf.resize(  # 224x224 square, BICUBIC
+            img,
+            [self._IMG, self._IMG],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
         )
-        return (img - self._mean) / self._std     # (x-0.5)/0.5 -> [-1,1]
+        return (img - self._mean) / self._std  # (x-0.5)/0.5 -> [-1,1]
 
     def embed(self, goal_obs) -> torch.Tensor:
         flat, B, T = self._flatten_images(goal_obs)
         flat = self._preprocess(flat.to(self._mean.dtype))
-        pooled = self.vit(pixel_values=flat).pooler_output   # (B*T, D)
+        pooled = self.vit(pixel_values=flat).pooler_output  # (B*T, D)
+        return pooled.reshape(B, T, self.output_dim)
+
+
+class SharedBackboneTargetEncoder(TargetEncoder):
+    """FM target = native pooled descriptor of an ALREADY-LOADED frozen backbone.
+
+    Unlike the other ``TargetEncoder``s, this one does NOT ``from_pretrained`` a
+    fresh model: it holds a reference to the ``FrozenVisionBackbone`` already
+    instantiated by the agent's input ``FrozenViTMultiObsEncoder`` (a frozen
+    DINOv2 / SigLIP backbone built with ``with_pooled=True``). The target is that
+    backbone's native global descriptor (``backbone.pooled`` — DINOv2 CLS /
+    SigLIP ``pooler_output``), so it is byte-for-byte identical to the standalone
+    ``DINOv2TargetEncoder`` / ``SiglipTargetEncoder`` (same weights, pooling,
+    preprocessing, and target camera) — meaning their precomputed goal z-score
+    stats are directly reusable.
+
+    This powers the frozen-ViT frozen-target ablation: the same pretrained
+    backbone serves both the input adapter (via patch tokens) AND the FM state
+    target (via this pooled descriptor), with only ONE backbone in memory. The
+    input-side crop augmentation is deliberately NOT applied here — the target
+    is the deterministic full-image descriptor, matching the standalone target
+    encoders the goal stats were computed with.
+
+    ``output_dim`` = ``backbone.token_dim`` (DINOv2-S = 384, SigLIP-B = 768).
+    """
+
+    def __init__(self, backbone, image_key: str):
+        super().__init__()
+        # Shared, frozen, eval-always — the SAME object as the input encoder's
+        # backbone (no duplicate load). It is already requires_grad_(False).
+        self.backbone = backbone
+        self.output_dim = int(backbone.token_dim)
+        self._image_key = image_key
+
+        self.requires_grad_(False)
+        self.eval()
+        loguru.logger.info(
+            f"SharedBackboneTargetEncoder reusing input backbone "
+            f"(D={self.output_dim}, image_key={self._image_key!r})"
+        )
+
+    @torch.no_grad()
+    def embed(self, goal_obs) -> torch.Tensor:
+        flat, B, T = self._flatten_images(goal_obs)
+        # backbone.preprocess owns resize/crop + the backbone's normalization;
+        # backbone.pooled runs fp32 (no bf16 autocast) so the target matches the
+        # standalone *TargetEncoder the goal stats were exported with.
+        flat = self.backbone.preprocess(flat)
+        pooled = self.backbone.pooled(flat)  # (B*T, D)
         return pooled.reshape(B, T, self.output_dim)
 
 

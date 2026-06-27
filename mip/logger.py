@@ -27,6 +27,15 @@ def make_dir(dir_path):
     return dir_path
 
 
+# Metric keys (before the train/eval category is prepended) to drop from wandb.
+# These declutter the dashboard but are still written to the console log and
+# local metrics.jsonl.
+#   prefixes -> train/perf/*, eval/perf/*, eval/avg_perf/* (timing noise)
+#   exact    -> step (duplicates the wandb x-axis), total_time / delta_t (train)
+_WANDB_EXCLUDE_PREFIXES = ("perf/", "avg_perf/")
+_WANDB_EXCLUDE_KEYS = ("step", "total_time", "delta_t")
+
+
 class Logger:
     """Primary logger object. Logs in wandb."""
 
@@ -104,9 +113,13 @@ class Logger:
         with (self._log_dir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps(json_safe_dict) + "\n")
 
-        # Prepare wandb logging dict with category prefix
+        # Prepare wandb logging dict with category prefix, dropping the excluded
+        # metrics (see _WANDB_EXCLUDE_PREFIXES / _WANDB_EXCLUDE_KEYS). "step" is
+        # still passed below as the wandb x-axis via d["step"].
         _d = {}
         for k, v in d.items():
+            if k.startswith(_WANDB_EXCLUDE_PREFIXES) or k in _WANDB_EXCLUDE_KEYS:
+                continue
             _d[category + "/" + k] = v
 
         # Log to wandb
@@ -130,6 +143,9 @@ class Logger:
             training_state: Optional dict with training state (n_gradient_step, best_metrics, eval_history)
         """
         if not agent:
+            return
+
+        if not getattr(self.config, "save_global_checkpoints", True):
             return
 
         success_rate_pct = int(success_rate * 100)

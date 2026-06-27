@@ -63,13 +63,17 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None, dino_
         logger: Logger for metrics
         resume_state: Optional dict with training state to resume from
     """
-    # dataloader. For a mixed (expert + rollout) ConcatDataset, optionally
-    # rebalance batches to optimization.expert_sample_fraction; otherwise the
-    # sampler is None and we fall back to plain shuffling. No-op for a single
-    # source.
-    sampler = make_expert_weighted_sampler(
-        dataset, config.optimization.expert_sample_fraction
-    )
+    # dataloader. Expert-weighted sampling belongs to the optimality (mixed
+    # expert/play) training regime, so it is gated on network.use_optimality:
+    # when off, plain training keeps its previous behavior exactly (sampler=None
+    # -> shuffle=True, natural proportions). When on with a mixed (expert +
+    # rollout) ConcatDataset, rebalance batches to expert_sample_fraction
+    # (still a no-op for a single source, where the helper returns None).
+    sampler = None
+    if getattr(config.network, "use_optimality", False):
+        sampler = make_expert_weighted_sampler(
+            dataset, config.optimization.expert_sample_fraction
+        )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=config.optimization.batch_size,

@@ -68,7 +68,10 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
         # Produces the FM state-flow target. "dp" = frozen DP/LBMDiT encoder;
         # other types (lewm, dinov2, ...) swap the target representation behind
         # the same interface. It is frozen (requires_grad off) and eval-always.
-        self.target_encoder = get_target_encoder(config)
+        # Routed through a hook so subclasses can build a target that depends on
+        # the already-constructed input encoder (e.g. reusing its frozen
+        # backbone — see LBMDiTJointPTFrozenViTTargetAgent).
+        self.target_encoder = self._build_target_encoder(config)
 
         # Guardrail: the trunk's state-stream dim must equal the target dim. The
         # trunk was built (in super().__init__) with state_dim = state_target_dim
@@ -160,6 +163,15 @@ class LBMDiTJointPTFrozenTargetAgent(LBMDiTJointPTAgent):
                 "and external; EMA-target would reference the condition encoder."
             )
         self._use_ema_target = False
+
+    # ------------------------------------------------------------------
+    # Target-encoder construction hook. Default: the config-selected pluggable
+    # TargetEncoder (dp / lewm / dinov2 / siglip), which loads its own weights.
+    # Subclasses override to build a target that reuses the input encoder
+    # (already constructed in super().__init__) — see the shared-backbone agent.
+    # ------------------------------------------------------------------
+    def _build_target_encoder(self, config: Config):
+        return get_target_encoder(config)
 
     # ------------------------------------------------------------------
     # The one swapped piece: the FM state-flow target.

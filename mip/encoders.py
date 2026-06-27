@@ -358,7 +358,13 @@ class GoalDropoutEncoder(BaseEncoder):
     Used for classifier-free guidance style IDM training.
     """
 
-    def __init__(self, encoder: BaseEncoder, emb_dim: int, obs_steps: int, goal_dropout_prob: float = 0.0):
+    def __init__(
+        self,
+        encoder: BaseEncoder,
+        emb_dim: int,
+        obs_steps: int,
+        goal_dropout_prob: float = 0.0,
+    ):
         super().__init__()
         self.encoder = encoder
         self.obs_steps = obs_steps
@@ -978,7 +984,9 @@ class PrecomputedDINOEncoder(BaseEncoder):
 
     def forward(self, obs: dict, mask: torch.Tensor = None):
         # Separate DINO keys from low_dim keys
-        dino_features = [obs[k] for k in sorted(obs.keys()) if k not in self.low_dim_keys]
+        dino_features = [
+            obs[k] for k in sorted(obs.keys()) if k not in self.low_dim_keys
+        ]
         low_dim_features = [obs[k] for k in self.low_dim_keys if k in obs]
 
         x = torch.cat(dino_features + low_dim_features, dim=-1)  # (b, To, concat_dim)
@@ -994,6 +1002,305 @@ class PrecomputedDINOEncoder(BaseEncoder):
             x.dim(),
         )
         return self.proj(x) * mask
+
+
+class AttentivePool(nn.Module):
+    """Multihead Attention Pooling (MAP) head — the trainable per-view adapter.
+
+    A small set of learned query "probes" do ONE cross-attention pass over the
+    backbone's patch tokens (probes = queries; patch tokens = keys/values), then
+    a LayerNorm + MLP residual on the pooled output. The attention is
+    ``(n_query x N_patch)`` — there is no token-to-token (N x N) mixing here;
+    that already happened inside the frozen backbone. So the cost is linear in
+    the number of patch tokens.
+
+    This is the same structure as ``SiglipMultiheadAttentionPoolingHead`` (the
+    head behind SigLIP's ``pooler_output``), but trainable on the control task
+    and applied over a *frozen* backbone's patch tokens. With a frozen backbone
+    it doubles as the adapter: it both pools the token grid AND provides the
+    task-adaptive capacity (the LN + MLP), so no separate adapter MLP is needed.
+
+    Input:  ``(B, N_patch, dim)``  patch tokens (treated as constant — frozen).
+    Output: ``(B, n_query * dim)``  pooled, adapted per-view feature.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_heads: int = 8,
+        n_query: int = 1,
+        mlp_ratio: int = 4,
+    ):
+        super().__init__()
+        self.n_query = n_query
+        self.dim = dim
+        self.probe = nn.Parameter(torch.randn(1, n_query, dim) * 0.02)
+        self.attention = nn.MultiheadAttention(
+            dim,
+            num_heads=n_heads,
+            batch_first=True,
+        )
+        self.layernorm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(dim * mlp_ratio, dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        B = tokens.shape[0]
+        probe = self.probe.expand(B, -1, -1)  # (B, n_query, dim)
+        h, _ = self.attention(probe, tokens, tokens, need_weights=False)
+        h = h + self.mlp(self.layernorm(h))  # (B, n_query, dim)
+        return h.reshape(B, self.n_query * self.dim)  # (B, n_query*dim)
+
+
+class FrozenViTMultiObsEncoder(BaseEncoder):
+    """Frozen pretrained ViT backbone + trainable per-view attentive pooling.
+
+    Drop-in replacement for ``MultiImageObsEncoder`` (same
+    ``forward(obs_dict, mask) -> (B, To, emb_dim)`` contract) that swaps the
+    from-scratch per-camera ResNets for ONE shared frozen ViT backbone
+    (DINOv2 / SigLIP / ...) plus an INDEPENDENT trainable ``AttentivePool``
+    (MAP head) per camera view. Per-view pooled features are concatenated with
+    the raw low-dim state and projected to ``emb_dim`` by a small fusion MLP.
+
+    In the joint_pt pipeline this one encoder is shared for both roles: the live
+    pass produces the AdaLN condition ``z_t``; the agent's EMA copy produces the
+    detached FM state target. Because the backbone is frozen, only the per-view
+    MAP heads + the fusion MLP are trainable (and EMA'd), so the regression
+    target is anchored to fixed pretrained features (cannot collapse) while the
+    adapter still adapts to the control task.
+
+    ``include_proprio=False`` zeros the low-dim slot — used by the agent's
+    target path (via ``network.target_include_proprio``) to make the FM state
+    target a pure visual next-state representation while the condition keeps
+    proprio. Zeroing (rather than dropping) preserves the fusion-MLP input width,
+    so condition and target stay in one ``emb_dim`` space with no shape change.
+
+    Assumes rgb input ``(B, To, C, H, W)`` and low_dim input ``(B, To, D)`` when
+    ``use_seq=True`` (the joint pipeline default).
+    """
+
+    def __init__(
+        self,
+        shape_meta: dict,
+        backbone_name: str,
+        backbone_path: str,
+        emb_dim: int = 256,
+        n_query: int = 1,
+        n_heads: int = 8,
+        use_seq: bool = True,
+        keep_horizon_dims: bool = True,
+        dropout: float = 0.0,
+        autocast_bf16: bool = True,
+        backbone_chunk_size: int | None = None,
+        crop_shape=None,
+        random_crop: bool = True,
+        expose_pooled: bool = False,
+    ):
+        super().__init__()
+        # Lazy import so encoders.py stays importable without transformers
+        # unless a frozen-ViT encoder is actually constructed.
+        from mip.vision_backbones import get_vision_backbone
+
+        self.dropout = dropout
+        self.use_seq = use_seq
+        self.keep_horizon_dims = keep_horizon_dims
+        self.n_query = n_query
+        # bf16-autocast the frozen backbone forward on CUDA (frozen + no-grad ->
+        # a safe ~2x-faster approximation; the trainable MAP head stays fp32).
+        self.autocast_bf16 = autocast_bf16
+        # Cap images per backbone forward to bound peak activation memory (None /
+        # <=0 = one forward over all cameras*frames). Useful for big backbones /
+        # many cameras / large batches; a no-op when >= the actual batch.
+        self.backbone_chunk_size = backbone_chunk_size
+
+        # Shared frozen backbone (one instance across all camera views).
+        # ``expose_pooled`` keeps the backbone's native pooled descriptor (CLS /
+        # pooler_output) available so a SharedBackboneTargetEncoder can reuse
+        # this same frozen backbone as the FM state target — no second load.
+        self.backbone = get_vision_backbone(
+            backbone_name, backbone_path, with_pooled=expose_pooled
+        )
+        token_dim = self.backbone.token_dim
+
+        # Split obs keys into rgb / low_dim (sorted for deterministic order).
+        rgb_keys, low_dim_keys, low_dim_total = [], [], 0
+        for key, attr in shape_meta["obs"].items():
+            if attr.get("type", "low_dim") == "rgb":
+                rgb_keys.append(key)
+            else:
+                low_dim_keys.append(key)
+                low_dim_total += int(attr["shape"][0])
+        self.rgb_keys = sorted(rgb_keys)
+        self.low_dim_keys = sorted(low_dim_keys)
+        self.low_dim_total = low_dim_total
+
+        # Independent per-view MAP head (agentview vs wrist see different scenes).
+        self.pools = nn.ModuleDict(
+            {
+                key: AttentivePool(token_dim, n_heads=n_heads, n_query=n_query)
+                for key in self.rgb_keys
+            }
+        )
+
+        # Fusion: concat(per-view pooled, low_dim) -> emb_dim.
+        concat_dim = n_query * token_dim * len(self.rgb_keys) + low_dim_total
+        self.fusion = nn.Sequential(
+            nn.Linear(concat_dim, emb_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+        # --- Image augmentation: identical to the ResNet path. Reuse the same
+        # CropRandomizer (random crop to crop_shape in train, center crop in
+        # eval, per image), applied to the raw images BEFORE the backbone resize.
+        # Gated by the module's train/eval mode, so the condition (live encoder,
+        # train) is augmented while the FM target (encoder_ema, eval) is a
+        # deterministic center crop — the same asymmetry as the baseline. ---
+        self.cropper = None
+        if crop_shape is not None and self.rgb_keys:
+            ch, cw = (
+                crop_shape[self.rgb_keys[0]]
+                if isinstance(crop_shape, dict)
+                else crop_shape
+            )
+            in_shape = tuple(shape_meta["obs"][self.rgb_keys[0]]["shape"])
+            if random_crop:
+                self.cropper = CropRandomizer(
+                    input_shape=in_shape,
+                    crop_height=ch,
+                    crop_width=cw,
+                    num_crops=1,
+                )
+            else:
+                self.cropper = torchvision.transforms.CenterCrop(size=(ch, cw))
+
+    def _backbone_forward(self, imgs: torch.Tensor) -> torch.Tensor:
+        """Run the frozen backbone over a (possibly large) image batch.
+
+        Chunks the forward to bound peak activation memory, and runs it in
+        bfloat16 on CUDA — the backbone is frozen + no-grad, so bf16 is a safe,
+        ~2x-faster approximation, and the output is cast back to fp32 for the
+        trainable MAP head. The ViT encodes each image independently (LayerNorm,
+        no cross-sample statistics), so chunking is numerically identical to a
+        single forward in fp32.
+        """
+        use_ac = self.autocast_bf16 and imgs.device.type == "cuda"
+        cs = self.backbone_chunk_size
+        step = imgs.shape[0] if (cs is None or cs <= 0) else int(cs)
+        outs = []
+        for i in range(0, imgs.shape[0], step):
+            with torch.autocast(
+                device_type=imgs.device.type,
+                dtype=torch.bfloat16,
+                enabled=use_ac,
+            ):
+                tok = self.backbone.patch_tokens(imgs[i : i + step])
+            outs.append(tok.float())  # fp32 for the trainable MAP head
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
+
+    def _encode_views(self, obs_dict):
+        """Stack all camera frames, run the shared frozen backbone ONCE (batched
+        across cameras + frames), then apply each camera's MAP head.
+
+        Returns ``(pooled_per_view, batch_size, seq_len)``. Batching the cameras
+        into a single backbone forward (vs a per-camera loop) cuts kernel
+        launches and improves GPU utilization; it is numerically identical since
+        each image is encoded independently.
+        """
+        if not self.rgb_keys:
+            return [], None, None
+        batch_size = seq_len = None
+        imgs = []
+        for key in self.rgb_keys:
+            img = obs_dict[key]
+            if self.use_seq:
+                if batch_size is None:
+                    batch_size, seq_len = img.shape[0], img.shape[1]
+                img = img.reshape(batch_size * seq_len, *img.shape[2:])
+            else:
+                if batch_size is None:
+                    batch_size = img.shape[0]
+            imgs.append(img)
+        # (n_cams*N, 3, H, W) -> crop-aug (train) / center-crop (eval) ->
+        # preprocess -> ONE (chunked) backbone forward.
+        stacked = torch.cat(imgs, dim=0)
+        if self.cropper is not None:
+            stacked = self.cropper(stacked)
+        stacked = self.backbone.preprocess(stacked)
+        tokens = self._backbone_forward(stacked)  # (n_cams*N, N_patch, D)
+        pooled = [
+            self.pools[key](tok)
+            for key, tok in zip(
+                self.rgb_keys, tokens.chunk(len(self.rgb_keys), dim=0), strict=True
+            )
+        ]
+        return pooled, batch_size, seq_len
+
+    def forward(self, obs_dict, mask=None, include_proprio: bool = True):
+        # --- rgb views: shared frozen backbone (no grad, batched) -> MAP pool ---
+        features, batch_size, seq_len = self._encode_views(obs_dict)
+
+        # --- low_dim state (zeroed when proprio excluded from the target) ---
+        for key in self.low_dim_keys:
+            data = obs_dict[key]
+            if self.use_seq:
+                if batch_size is None:
+                    batch_size, seq_len = data.shape[0], data.shape[1]
+                data = data.reshape(batch_size * seq_len, *data.shape[2:])
+            else:
+                if batch_size is None:
+                    batch_size = data.shape[0]
+            if not include_proprio:
+                data = torch.zeros_like(data)
+            features.append(data)
+
+        result = self.fusion(torch.cat(features, dim=-1))
+        if self.use_seq:
+            if self.keep_horizon_dims:
+                result = result.view(batch_size, seq_len, -1)
+            else:
+                result = result.view(batch_size, -1)
+
+        mask = at_least_ndim(
+            get_mask(
+                mask,
+                (batch_size,),
+                self.dropout,
+                self.training,
+                result.device,
+            ),
+            result.dim(),
+        )
+        return result * mask
+
+    # --- checkpoint hygiene: never serialize the frozen backbone ---
+    # The backbone is reconstructed from ``from_pretrained`` in __init__ (same
+    # pattern as the frozen TargetEncoder), so keeping it out of the checkpoint
+    # avoids tens of MB of redundant frozen weights (twice — encoder +
+    # encoder_ema). Only the trainable pools + fusion are saved.
+    def state_dict(self, *args, **kwargs):
+        sd = super().state_dict(*args, **kwargs)
+        for k in list(sd.keys()):
+            if k.startswith("backbone.") or ".backbone." in k:
+                del sd[k]
+        return sd
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        missing, unexpected = super().load_state_dict(state_dict, strict=False)
+        # The backbone is expected to be missing (reconstructed in __init__);
+        # anything else missing/unexpected is a real error.
+        bad_missing = [
+            k for k in missing if not (k.startswith("backbone.") or ".backbone." in k)
+        ]
+        if bad_missing or unexpected:
+            raise RuntimeError(
+                f"FrozenViTMultiObsEncoder load mismatch: "
+                f"missing={bad_missing}, unexpected={list(unexpected)}"
+            )
+        return missing, unexpected
 
 
 class PrecomputedLAMEncoder(BaseEncoder):
