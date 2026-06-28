@@ -543,6 +543,17 @@ class NetworkConfig:
     frozen_vit_path: str | None = None  # local HF model dir (required)
     frozen_vit_n_query: int = 1  # MAP probes per camera view
     frozen_vit_n_heads: int = 8  # MAP attention heads
+    # How each camera view's patch tokens become the per-view feature fed to the
+    # fusion MLP:
+    #   "map"    : trainable per-view AttentivePool (MAP) head over the patch
+    #              tokens (default; n_query/n_heads above apply).
+    #   "frozen" : use the backbone's NATIVE pooled descriptor (DINOv2 CLS /
+    #              SigLIP pooler_output) directly — NO trainable per-view adapter,
+    #              so the fusion MLP over concat(views, proprio) is the only
+    #              trainable image-side capacity. n_query/n_heads are ignored, and
+    #              the backbone is forced to load with_pooled=True (keeps SigLIP's
+    #              pooler head; no-op for DINOv2).
+    frozen_vit_input_pool: str = "map"  # "map" | "frozen"
     # bf16-autocast the frozen backbone forward on CUDA (frozen + no-grad, so a
     # safe ~2x speedup; the trainable MAP head stays fp32). Disable for exact
     # fp32 features.

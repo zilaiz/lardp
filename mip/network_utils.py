@@ -471,6 +471,11 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
                 "frozen_vit_expose_pooled",
                 NetworkConfig.frozen_vit_expose_pooled,
             ),
+            input_pool=getattr(
+                network_config,
+                "frozen_vit_input_pool",
+                NetworkConfig.frozen_vit_input_pool,
+            ),
         )
     else:
         raise ValueError(f"Invalid encoder type: {encoder_type}")

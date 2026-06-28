@@ -38,8 +38,12 @@ frozen_vit_backbone: "dinov2"   # "dinov2" | "siglip"
 # REQUIRED: local HF model dir. Override per machine, e.g.:
 #   network.frozen_vit_path=~/data/zzeng28/ckpts/dinov2_small
 frozen_vit_path: null
-frozen_vit_n_query: 1           # MAP probes per camera view
-frozen_vit_n_heads: 8           # MAP attention heads
+frozen_vit_n_query: 1           # MAP probes per camera view (input_pool=map only)
+frozen_vit_n_heads: 8           # MAP attention heads (input_pool=map only)
+# Per-view pooling: "map" = trainable MAP adapter over patch tokens (default);
+# "frozen" = use the backbone's native pooled descriptor directly (no per-view
+# adapter; the fusion MLP is the only trainable image-side capacity).
+frozen_vit_input_pool: "map"    # "map" | "frozen"
 target_include_proprio: true    # include low-dim proprio in the FM state target
 frozen_vit_autocast_bf16: true  # bf16 the frozen backbone forward on CUDA (~2x)
 frozen_vit_backbone_chunk_size: null  # cap images/backbone-forward (null = all at once)

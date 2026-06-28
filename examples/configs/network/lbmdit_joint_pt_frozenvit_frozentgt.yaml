@@ -40,8 +40,13 @@ frozen_vit_backbone: "dinov2"   # "dinov2" | "siglip"
 # REQUIRED: local HF model dir. Override per machine / per arm, e.g.:
 #   network.frozen_vit_path=~/data/zzeng28/ckpts/dinov2_small
 frozen_vit_path: null
-frozen_vit_n_query: 1           # MAP probes per camera view (condition side)
-frozen_vit_n_heads: 8           # MAP attention heads (condition side)
+frozen_vit_n_query: 1           # MAP probes per camera view (input_pool=map only)
+frozen_vit_n_heads: 8           # MAP attention heads (input_pool=map only)
+# Per-view pooling for the INPUT/condition encoder: "map" = trainable MAP adapter
+# over patch tokens (default); "frozen" = native pooled descriptor directly (no
+# per-view adapter). Independent of the FM target, which is always the shared
+# backbone's pooled descriptor in this ablation.
+frozen_vit_input_pool: "map"    # "map" | "frozen"
 # No-op here for the target (the FM target is a pure-visual pooled descriptor,
 # not the input-encoder output); kept for parity with the frozen_vit input.
 target_include_proprio: true

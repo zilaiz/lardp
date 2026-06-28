@@ -1065,6 +1065,14 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
     (MAP head) per camera view. Per-view pooled features are concatenated with
     the raw low-dim state and projected to ``emb_dim`` by a small fusion MLP.
 
+    ``input_pool`` selects how each view's patch tokens are pooled into that
+    per-view feature: ``"map"`` (default) learns the per-view MAP adapter;
+    ``"frozen"`` skips it and feeds each view's NATIVE frozen pooled descriptor
+    (DINOv2 CLS / SigLIP pooler_output) straight to the fusion MLP — so the
+    fusion MLP becomes the only trainable image-side capacity (a pure
+    frozen-feature probe). ``"frozen"`` forces the backbone to load
+    ``with_pooled=True`` (keeps SigLIP's pooler head).
+
     In the joint_pt pipeline this one encoder is shared for both roles: the live
     pass produces the AdaLN condition ``z_t``; the agent's EMA copy produces the
     detached FM state target. Because the backbone is frozen, only the per-view
@@ -1098,12 +1106,18 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
         crop_shape=None,
         random_crop: bool = True,
         expose_pooled: bool = False,
+        input_pool: str = "map",
     ):
         super().__init__()
         # Lazy import so encoders.py stays importable without transformers
         # unless a frozen-ViT encoder is actually constructed.
         from mip.vision_backbones import get_vision_backbone
 
+        if input_pool not in ("map", "frozen"):
+            raise ValueError(
+                f"frozen_vit input_pool must be 'map' or 'frozen', got {input_pool!r}."
+            )
+        self.input_pool = input_pool
         self.dropout = dropout
         self.use_seq = use_seq
         self.keep_horizon_dims = keep_horizon_dims
@@ -1120,8 +1134,12 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
         # ``expose_pooled`` keeps the backbone's native pooled descriptor (CLS /
         # pooler_output) available so a SharedBackboneTargetEncoder can reuse
         # this same frozen backbone as the FM state target — no second load.
+        # input_pool="frozen" also needs that pooled descriptor (it IS the
+        # per-view input feature), so force it on regardless of expose_pooled.
         self.backbone = get_vision_backbone(
-            backbone_name, backbone_path, with_pooled=expose_pooled
+            backbone_name,
+            backbone_path,
+            with_pooled=expose_pooled or input_pool == "frozen",
         )
         token_dim = self.backbone.token_dim
 
@@ -1137,16 +1155,25 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
         self.low_dim_keys = sorted(low_dim_keys)
         self.low_dim_total = low_dim_total
 
-        # Independent per-view MAP head (agentview vs wrist see different scenes).
-        self.pools = nn.ModuleDict(
-            {
-                key: AttentivePool(token_dim, n_heads=n_heads, n_query=n_query)
-                for key in self.rgb_keys
-            }
-        )
+        # Per-view pooling into the fusion feature:
+        #   "map"    : independent trainable MAP head per view (agentview vs wrist
+        #              see different scenes) over the patch tokens.
+        #   "frozen" : no trainable per-view adapter — each view's native pooled
+        #              descriptor (token_dim) feeds the fusion MLP directly.
+        if input_pool == "map":
+            self.pools = nn.ModuleDict(
+                {
+                    key: AttentivePool(token_dim, n_heads=n_heads, n_query=n_query)
+                    for key in self.rgb_keys
+                }
+            )
+            per_view_dim = n_query * token_dim
+        else:
+            self.pools = nn.ModuleDict()  # frozen pooled features, no adapter
+            per_view_dim = token_dim
 
         # Fusion: concat(per-view pooled, low_dim) -> emb_dim.
-        concat_dim = n_query * token_dim * len(self.rgb_keys) + low_dim_total
+        concat_dim = per_view_dim * len(self.rgb_keys) + low_dim_total
         self.fusion = nn.Sequential(
             nn.Linear(concat_dim, emb_dim),
             nn.GELU(approximate="tanh"),
@@ -1177,19 +1204,25 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
             else:
                 self.cropper = torchvision.transforms.CenterCrop(size=(ch, cw))
 
-    def _backbone_forward(self, imgs: torch.Tensor) -> torch.Tensor:
+    def _backbone_forward(
+        self, imgs: torch.Tensor, pooled: bool = False
+    ) -> torch.Tensor:
         """Run the frozen backbone over a (possibly large) image batch.
 
-        Chunks the forward to bound peak activation memory, and runs it in
-        bfloat16 on CUDA — the backbone is frozen + no-grad, so bf16 is a safe,
-        ~2x-faster approximation, and the output is cast back to fp32 for the
-        trainable MAP head. The ViT encodes each image independently (LayerNorm,
-        no cross-sample statistics), so chunking is numerically identical to a
-        single forward in fp32.
+        Returns patch tokens ``(N, N_patch, D)`` (``pooled=False``) or the
+        backbone's native pooled descriptor ``(N, D)`` (``pooled=True``, the
+        input_pool="frozen" path). Chunks the forward to bound peak activation
+        memory, and runs it in bfloat16 on CUDA — the backbone is frozen +
+        no-grad, so bf16 is a safe, ~2x-faster approximation, and the output is
+        cast back to fp32 for the trainable MAP head / fusion MLP. The ViT
+        encodes each image independently (LayerNorm, no cross-sample
+        statistics), so chunking is numerically identical to a single forward in
+        fp32.
         """
         use_ac = self.autocast_bf16 and imgs.device.type == "cuda"
         cs = self.backbone_chunk_size
         step = imgs.shape[0] if (cs is None or cs <= 0) else int(cs)
+        fn = self.backbone.pooled if pooled else self.backbone.patch_tokens
         outs = []
         for i in range(0, imgs.shape[0], step):
             with torch.autocast(
@@ -1197,8 +1230,8 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
                 dtype=torch.bfloat16,
                 enabled=use_ac,
             ):
-                tok = self.backbone.patch_tokens(imgs[i : i + step])
-            outs.append(tok.float())  # fp32 for the trainable MAP head
+                out = fn(imgs[i : i + step])
+            outs.append(out.float())  # fp32 for the trainable MAP head / fusion
         return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
 
     def _encode_views(self, obs_dict):
@@ -1230,13 +1263,19 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
         if self.cropper is not None:
             stacked = self.cropper(stacked)
         stacked = self.backbone.preprocess(stacked)
-        tokens = self._backbone_forward(stacked)  # (n_cams*N, N_patch, D)
-        pooled = [
-            self.pools[key](tok)
-            for key, tok in zip(
-                self.rgb_keys, tokens.chunk(len(self.rgb_keys), dim=0), strict=True
-            )
-        ]
+        if self.input_pool == "frozen":
+            # Native pooled descriptor per view (no trainable MAP head); the
+            # fusion MLP is the only trainable capacity over these features.
+            feats = self._backbone_forward(stacked, pooled=True)  # (n_cams*N, D)
+            pooled = list(feats.chunk(len(self.rgb_keys), dim=0))
+        else:
+            tokens = self._backbone_forward(stacked)  # (n_cams*N, N_patch, D)
+            pooled = [
+                self.pools[key](tok)
+                for key, tok in zip(
+                    self.rgb_keys, tokens.chunk(len(self.rgb_keys), dim=0), strict=True
+                )
+            ]
         return pooled, batch_size, seq_len
 
     def forward(self, obs_dict, mask=None, include_proprio: bool = True):
