@@ -471,6 +471,13 @@ class SharedBackboneTargetEncoder(TargetEncoder):
         self._image_key = image_key
 
         self.requires_grad_(False)
+        # The backbone is SHARED with the input encoder. requires_grad_(False)
+        # above just froze it — including any LoRA adapters the input encoder had
+        # kept trainable — which would silently disable input-side LoRA finetuning
+        # (target is detached via no_grad regardless, so freezing here is only
+        # needed for the base). Re-freeze base-only so shared LoRA stays trainable.
+        if getattr(self.backbone, "has_lora", False):
+            self.backbone.freeze_base()
         self.eval()
         loguru.logger.info(
             f"SharedBackboneTargetEncoder reusing input backbone "

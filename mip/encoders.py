@@ -1325,15 +1325,19 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
         return result * mask
 
     def requires_grad_(self, requires_grad: bool = True):
-        # The agent calls ``encoder.requires_grad_(True)`` after construction to
-        # make the trainable encoder trainable. For a frozen_vit encoder the
-        # backbone base must stay frozen regardless: re-apply the base freeze so
-        # only the injected LoRA adapters (if any) receive gradients. No-op when
-        # the backbone has no LoRA (freeze_base then freezes everything, which
-        # the base is already, so behavior is unchanged).
+        # The agent calls ``encoder.requires_grad_(True)`` to make the trainable
+        # encoder trainable, and ``encoder_ema.requires_grad_(False)`` to freeze
+        # the EMA copy. For a frozen_vit encoder the backbone BASE must stay
+        # frozen regardless; the injected LoRA adapters (if any) follow the
+        # requested flag — True on the live encoder so they train, False on the
+        # EMA copy so it is fully frozen. (Note: ``freeze_base`` forces LoRA on,
+        # so it must NOT be used here or ``requires_grad_(False)`` would leave the
+        # EMA's LoRA trainable.) No-op when the backbone has no LoRA.
         super().requires_grad_(requires_grad)
         if getattr(self.backbone, "has_lora", False):
-            self.backbone.freeze_base()
+            for name, p in self.backbone.named_parameters():
+                if ".lora_" not in name:
+                    p.requires_grad_(False)  # base never trains; LoRA keeps flag
         return self
 
     # --- checkpoint hygiene: serialize the trainable weights, not the frozen
