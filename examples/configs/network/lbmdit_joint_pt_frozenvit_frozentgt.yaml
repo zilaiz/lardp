@@ -55,12 +55,12 @@ frozen_vit_backbone_chunk_size: null  # cap imgs/backbone-forward (null = all)
 # REQUIRED for this ablation: keep the backbone's native pooled descriptor so it
 # can be reused as the FM target (SigLIP keeps its pooler head; no-op for DINOv2).
 frozen_vit_expose_pooled: true
-# --- LoRA finetuning of the frozen backbone (ON by default at r=8) ---
-# rank > 0 adapts ONLY the input/condition path; the FM target stays the NATIVE
-# frozen pooled descriptor (adapters disabled for the target pass), so precomputed
-# goal stats stay valid. Set frozen_vit_lora_rank<=0 (e.g.
-# -e "network.frozen_vit_lora_rank=0") to fully freeze the backbone (unchanged).
-frozen_vit_lora_rank: 8         # <=0 = off (fully frozen backbone)
+# --- Optional LoRA finetuning of the frozen backbone (OFF by default) ---
+# rank <= 0 keeps the backbone fully frozen (unchanged). Enable via
+# -e "network.frozen_vit_lora_rank=8": rank > 0 adapts ONLY the input/condition
+# path; the FM target stays the NATIVE frozen pooled descriptor (adapters disabled
+# for the target pass), so precomputed goal stats stay valid.
+frozen_vit_lora_rank: 0         # <=0 = off (fully frozen backbone)
 frozen_vit_lora_alpha: 16.0     # scaling = alpha / rank (= 2.0 at r=8)
 frozen_vit_lora_dropout: 0.0    # inactive under the eval-locked backbone
 frozen_vit_lora_targets: null   # null = per-backbone default (dinov2: query,value; siglip: q_proj,v_proj)
