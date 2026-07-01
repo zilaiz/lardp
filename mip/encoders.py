@@ -9,6 +9,7 @@ Date: 2025-10-03
 import copy
 from collections.abc import Callable
 
+import loguru
 import torch
 import torch.nn as nn
 import torchvision
@@ -1107,6 +1108,10 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
         random_crop: bool = True,
         expose_pooled: bool = False,
         input_pool: str = "map",
+        lora_rank: int = 0,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        lora_targets: str | None = None,
     ):
         super().__init__()
         # Lazy import so encoders.py stays importable without transformers
@@ -1140,6 +1145,10 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
             backbone_name,
             backbone_path,
             with_pooled=expose_pooled or input_pool == "frozen",
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            lora_targets=lora_targets,
         )
         token_dim = self.backbone.token_dim
 
@@ -1315,29 +1324,61 @@ class FrozenViTMultiObsEncoder(BaseEncoder):
         )
         return result * mask
 
-    # --- checkpoint hygiene: never serialize the frozen backbone ---
-    # The backbone is reconstructed from ``from_pretrained`` in __init__ (same
-    # pattern as the frozen TargetEncoder), so keeping it out of the checkpoint
-    # avoids tens of MB of redundant frozen weights (twice — encoder +
-    # encoder_ema). Only the trainable pools + fusion are saved.
+    def requires_grad_(self, requires_grad: bool = True):
+        # The agent calls ``encoder.requires_grad_(True)`` after construction to
+        # make the trainable encoder trainable. For a frozen_vit encoder the
+        # backbone base must stay frozen regardless: re-apply the base freeze so
+        # only the injected LoRA adapters (if any) receive gradients. No-op when
+        # the backbone has no LoRA (freeze_base then freezes everything, which
+        # the base is already, so behavior is unchanged).
+        super().requires_grad_(requires_grad)
+        if getattr(self.backbone, "has_lora", False):
+            self.backbone.freeze_base()
+        return self
+
+    # --- checkpoint hygiene: serialize the trainable weights, not the frozen
+    # backbone base ---
+    # The frozen backbone base is reconstructed from ``from_pretrained`` in
+    # __init__ (same pattern as the frozen TargetEncoder), so keeping it out of
+    # the checkpoint avoids tens of MB of redundant frozen weights (twice —
+    # encoder + encoder_ema). The trainable pools + fusion are always saved; when
+    # LoRA is active its small ``lora_A`` / ``lora_B`` adapters live under
+    # ``backbone.*`` and ARE kept (they are the only trainable backbone params).
+    @staticmethod
+    def _is_backbone_base_key(k: str) -> bool:
+        # A backbone key that is NOT a LoRA adapter param (which are named
+        # ``...lora_A`` / ``...lora_B``, so contain ``.lora_``). When no LoRA is
+        # injected there are no such keys, so this reduces to "any backbone key".
+        is_backbone = k.startswith("backbone.") or ".backbone." in k
+        return is_backbone and ".lora_" not in k
+
     def state_dict(self, *args, **kwargs):
         sd = super().state_dict(*args, **kwargs)
         for k in list(sd.keys()):
-            if k.startswith("backbone.") or ".backbone." in k:
-                del sd[k]
+            if self._is_backbone_base_key(k):
+                del sd[k]  # drop frozen base; keep pools/fusion (+ LoRA adapters)
         return sd
 
     def load_state_dict(self, state_dict, strict: bool = True):
         missing, unexpected = super().load_state_dict(state_dict, strict=False)
-        # The backbone is expected to be missing (reconstructed in __init__);
-        # anything else missing/unexpected is a real error.
-        bad_missing = [
-            k for k in missing if not (k.startswith("backbone.") or ".backbone." in k)
-        ]
-        if bad_missing or unexpected:
+        # Frozen backbone base keys are expected-missing (reconstructed in
+        # __init__). A missing LoRA adapter key is NOT expected — it means the
+        # checkpoint predates / disabled LoRA while this model has it; leave the
+        # adapters at init (B=0 -> no-op) and warn rather than error, so a
+        # non-LoRA checkpoint can warm-start a LoRA run.
+        bad_missing = [k for k in missing if not self._is_backbone_base_key(k)]
+        lora_missing = [k for k in bad_missing if ".lora_" in k]
+        real_missing = [k for k in bad_missing if ".lora_" not in k]
+        if lora_missing:
+            loguru.logger.warning(
+                f"FrozenViTMultiObsEncoder: {len(lora_missing)} LoRA adapter "
+                "params not in checkpoint; left at initialization (B=0 -> no-op). "
+                "Expected when warm-starting LoRA from a non-LoRA checkpoint."
+            )
+        if real_missing or unexpected:
             raise RuntimeError(
                 f"FrozenViTMultiObsEncoder load mismatch: "
-                f"missing={bad_missing}, unexpected={list(unexpected)}"
+                f"missing={real_missing}, unexpected={list(unexpected)}"
             )
         return missing, unexpected
 

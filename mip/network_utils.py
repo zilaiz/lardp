@@ -476,6 +476,26 @@ def get_encoder(network_config: NetworkConfig, task_config: TaskConfig):
                 "frozen_vit_input_pool",
                 NetworkConfig.frozen_vit_input_pool,
             ),
+            lora_rank=getattr(
+                network_config,
+                "frozen_vit_lora_rank",
+                NetworkConfig.frozen_vit_lora_rank,
+            ),
+            lora_alpha=getattr(
+                network_config,
+                "frozen_vit_lora_alpha",
+                NetworkConfig.frozen_vit_lora_alpha,
+            ),
+            lora_dropout=getattr(
+                network_config,
+                "frozen_vit_lora_dropout",
+                NetworkConfig.frozen_vit_lora_dropout,
+            ),
+            lora_targets=getattr(
+                network_config,
+                "frozen_vit_lora_targets",
+                NetworkConfig.frozen_vit_lora_targets,
+            ),
         )
     else:
         raise ValueError(f"Invalid encoder type: {encoder_type}")

@@ -47,3 +47,12 @@ frozen_vit_input_pool: "map"    # "map" | "frozen"
 target_include_proprio: true    # include low-dim proprio in the FM state target
 frozen_vit_autocast_bf16: true  # bf16 the frozen backbone forward on CUDA (~2x)
 frozen_vit_backbone_chunk_size: null  # cap images/backbone-forward (null = all at once)
+# --- LoRA finetuning of the frozen backbone (ON by default at r=8) ---
+# rank > 0 injects trainable low-rank adapters into the attention projections
+# (base stays frozen; only lora_A/lora_B train + are checkpointed). Set
+# frozen_vit_lora_rank<=0 (e.g. -e "network.frozen_vit_lora_rank=0") to fully
+# freeze the backbone (byte-for-byte the prior behavior).
+frozen_vit_lora_rank: 8         # <=0 = off (fully frozen backbone)
+frozen_vit_lora_alpha: 16.0     # scaling = alpha / rank (= 2.0 at r=8)
+frozen_vit_lora_dropout: 0.0    # inactive under the eval-locked backbone
+frozen_vit_lora_targets: null   # null = per-backbone default (dinov2: query,value; siglip: q_proj,v_proj)

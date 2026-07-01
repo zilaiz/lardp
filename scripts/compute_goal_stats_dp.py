@@ -48,12 +48,16 @@ def compute_stats(
 
     Returns ``{"mean": (emb_dim,), "var": (emb_dim,)}`` on CPU in float32.
     """
+    # num_workers>0: __getitem__ decodes images off a (networked) zarr store, so
+    # single-threaded loading dominates (~40s/batch). Parallel workers + pinned
+    # memory overlap that IO with the GPU encode and cut wall-clock by ~10x.
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        num_workers=0,
+        num_workers=8,
         shuffle=False,
         drop_last=False,
+        pin_memory=True,
     )
 
     total_sum = None

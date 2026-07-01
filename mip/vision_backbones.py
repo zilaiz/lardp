@@ -18,20 +18,39 @@ exactly so the two stay consistent.
 
 All backbones are frozen (``requires_grad_(False)``) and eval-always
 (``train()`` is a no-op), so they produce deterministic features regardless of
-the agent's mode. ``__deepcopy__`` returns ``self``: the agent's EMA copy of the
-encoder shares the one frozen backbone instead of duplicating its weights (and
-EMA-ing constant params).
+the agent's mode. ``__deepcopy__`` shares the frozen backbone with the agent's
+EMA copy instead of duplicating weights: with no LoRA it returns ``self``
+(nothing trainable to smooth); with LoRA it still shares the big frozen base but
+gives the copy its own small ``lora_A`` / ``lora_B`` so the EMA target becomes
+EMA(LoRA-adapted backbone) + EMA(attentive pooling) at a <~1 MB cost.
+
+Optional LoRA finetuning (``network.frozen_vit_lora_rank`` > 0) injects trainable
+low-rank adapters into the attention projections (see ``mip/lora.py``); the base
+weights stay frozen. Default (rank <= 0) is byte-for-byte the fully-frozen path.
 
 Author: Zilai Zeng
 """
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import os
 
 import loguru
 import torch
 import torch.nn as nn
+
+from mip.lora import adapters_disabled as _lora_adapters_disabled
+from mip.lora import inject_lora
+
+# Default LoRA target sub-module names per backbone family (the attention
+# projection ``nn.Linear``s in the HF implementation). Overridable via
+# ``network.frozen_vit_lora_targets``.
+_DEFAULT_LORA_TARGETS = {
+    "dinov2": ("query", "value"),  # Dinov2SelfAttention.{query,key,value}
+    "siglip": ("q_proj", "v_proj"),  # SiglipAttention.{q,k,v,out}_proj
+}
 
 
 class FrozenVisionBackbone(nn.Module):
@@ -42,6 +61,79 @@ class FrozenVisionBackbone(nn.Module):
     """
 
     token_dim: int
+    # Set True by subclasses once trainable LoRA adapters are injected into the
+    # backbone. Gates the frozen-vs-grad forward and the checkpoint handling;
+    # False (default) keeps the fully-frozen, no-grad behavior byte-for-byte.
+    has_lora: bool = False
+
+    def _inject_lora(
+        self,
+        backbone_name: str,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        targets: str | None,
+    ) -> None:
+        """Inject trainable LoRA adapters into ``self.vit`` (call AFTER
+        ``from_pretrained`` + ``requires_grad_(False)``). A no-op when
+        ``rank <= 0`` (fully frozen backbone, unchanged behavior).
+
+        ``targets`` is a comma-separated list of attention-projection attribute
+        names; when None, the per-backbone default (``_DEFAULT_LORA_TARGETS``)
+        is used. Sets ``has_lora`` and re-freezes so only the LoRA params train.
+        """
+        if rank is None or rank <= 0:
+            return
+        if targets:
+            names = [t.strip() for t in targets.split(",") if t.strip()]
+        else:
+            names = list(_DEFAULT_LORA_TARGETS.get(backbone_name, ()))
+        if not names:
+            raise ValueError(
+                f"No LoRA target module names for backbone {backbone_name!r}; "
+                "set network.frozen_vit_lora_targets explicitly."
+            )
+        n = inject_lora(self.vit, names, r=rank, alpha=alpha, dropout=dropout)
+        if n == 0:
+            raise ValueError(
+                f"frozen_vit LoRA: no nn.Linear matched target names {names} in "
+                f"the {backbone_name!r} backbone. Check "
+                "network.frozen_vit_lora_targets against the model's attention "
+                "module attribute names."
+            )
+        self.has_lora = True
+        self.freeze_base()  # base frozen; only lora_A / lora_B trainable
+        loguru.logger.info(
+            f"Injected LoRA into {n} {backbone_name} attention projections "
+            f"(rank={rank}, alpha={alpha}, targets={names}); "
+            f"{sum(p.numel() for p in self.parameters() if p.requires_grad)} "
+            "trainable backbone params"
+        )
+
+    def freeze_base(self) -> None:
+        """Freeze every backbone parameter EXCEPT the LoRA adapters (``lora_A`` /
+        ``lora_B``). With no LoRA this freezes everything, identical to
+        ``requires_grad_(False)``. Re-applied by the encoder after the agent's
+        blanket ``encoder.requires_grad_(True)`` so the frozen base never trains.
+        """
+        for name, p in self.named_parameters():
+            p.requires_grad_(".lora_" in name)
+
+    def adapters_disabled(self):
+        """Context manager that turns off all LoRA adapters for the enclosed
+        forward (native frozen features). No-op when the backbone has none —
+        used by the shared-backbone FM target to stay the fixed pretrained
+        descriptor even while the condition path is LoRA-adapted.
+        """
+        return _lora_adapters_disabled(self)
+
+    def _grad_ctx(self):
+        """``no_grad`` when the backbone is fully frozen (default), else a
+        null context so gradients can reach the injected LoRA params. The frozen
+        base carries ``requires_grad=False`` regardless, so enabling grad here
+        never trains the pretrained weights.
+        """
+        return contextlib.nullcontext() if self.has_lora else torch.no_grad()
 
     def preprocess(self, img: torch.Tensor) -> torch.Tensor:  # pragma: no cover
         """Map ``(N, 3, H, W)`` in mip's ``x*2-1`` space to the backbone's
@@ -79,11 +171,26 @@ class FrozenVisionBackbone(nn.Module):
         return super().train(False)
 
     def __deepcopy__(self, memo):
-        # Frozen + shared: the agent's encoder_ema = deepcopy(encoder) references
-        # the SAME backbone (no duplicated weights, no redundant EMA of constant
-        # params). Safe because the backbone never changes.
-        memo[id(self)] = self
-        return self
+        # Fully-frozen backbone (no LoRA): share the single instance — the
+        # agent's encoder_ema references the SAME constant weights (no
+        # duplication, no redundant EMA of constant params). Original behavior.
+        if not self.has_lora:
+            memo[id(self)] = self
+            return self
+        # LoRA present: keep sharing the big frozen BASE (encoder_ema must NOT
+        # duplicate ~tens-to-hundreds of MB, and the base must never be
+        # EMA-decayed), but give the copy its OWN small ``lora_A`` / ``lora_B``
+        # so the agent's EMA loop smooths them — i.e. the EMA target becomes
+        # EMA(LoRA-adapted backbone) + EMA(attentive pooling). Seed the memo so
+        # every non-LoRA tensor aliases to itself (shared) and only the LoRA
+        # params (< ~1 MB) are actually copied, then fall through to the default
+        # module deepcopy (which rebuilds _parameters/_modules safely).
+        for name, p in self.named_parameters():
+            if ".lora_" not in name:
+                memo[id(p)] = p  # share frozen base params
+        for b in self.buffers():
+            memo.setdefault(id(b), b)  # share buffers (_mean / _std)
+        return copy._reconstruct(self, memo, *self.__reduce_ex__(4))
 
 
 class DINOv2Backbone(FrozenVisionBackbone):
@@ -101,7 +208,15 @@ class DINOv2Backbone(FrozenVisionBackbone):
     _IMAGENET_MEAN = (0.485, 0.456, 0.406)
     _IMAGENET_STD = (0.229, 0.224, 0.225)
 
-    def __init__(self, path: str, with_pooled: bool = False):
+    def __init__(
+        self,
+        path: str,
+        with_pooled: bool = False,
+        lora_rank: int = 0,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        lora_targets: str | None = None,
+    ):
         super().__init__()
         from transformers import Dinov2Model
 
@@ -128,10 +243,13 @@ class DINOv2Backbone(FrozenVisionBackbone):
         self.register_buffer("_std", torch.tensor(self._IMAGENET_STD).view(1, 3, 1, 1))
 
         self.requires_grad_(False)
+        # Optional trainable LoRA adapters on the attention projections (no-op
+        # when lora_rank <= 0 -> fully frozen backbone, unchanged behavior).
+        self._inject_lora("dinov2", lora_rank, lora_alpha, lora_dropout, lora_targets)
         self.eval()
         loguru.logger.info(
             f"DINOv2 backbone ready (token_dim={self.token_dim}, "
-            f"register_tokens={self.num_register_tokens})"
+            f"register_tokens={self.num_register_tokens}, has_lora={self.has_lora})"
         )
 
     def preprocess(self, img: torch.Tensor) -> torch.Tensor:
@@ -148,20 +266,20 @@ class DINOv2Backbone(FrozenVisionBackbone):
         img = tvf.center_crop(img, self._CROP)
         return (img - self._mean) / self._std  # ImageNet (x-mean)/std
 
-    @torch.no_grad()
     def patch_tokens(self, img: torch.Tensor) -> torch.Tensor:
-        hs = self.vit(
-            pixel_values=img, interpolate_pos_encoding=True
-        ).last_hidden_state  # (N, 1[+reg]+N_patch, D)
-        return hs[:, 1 + self.num_register_tokens :]  # drop CLS (+ registers)
+        with self._grad_ctx():
+            hs = self.vit(
+                pixel_values=img, interpolate_pos_encoding=True
+            ).last_hidden_state  # (N, 1[+reg]+N_patch, D)
+            return hs[:, 1 + self.num_register_tokens :]  # drop CLS (+ registers)
 
-    @torch.no_grad()
     def pooled(self, img: torch.Tensor) -> torch.Tensor:
         # CLS token (index 0) — DINOv2's global descriptor (== pooler_output);
         # matches DINOv2TargetEncoder.embed exactly.
-        return self.vit(
-            pixel_values=img, interpolate_pos_encoding=True
-        ).last_hidden_state[:, 0]  # (N, D)
+        with self._grad_ctx():
+            return self.vit(
+                pixel_values=img, interpolate_pos_encoding=True
+            ).last_hidden_state[:, 0]  # (N, D)
 
 
 class SiglipBackbone(FrozenVisionBackbone):
@@ -179,7 +297,15 @@ class SiglipBackbone(FrozenVisionBackbone):
     _MEAN = (0.5, 0.5, 0.5)
     _STD = (0.5, 0.5, 0.5)
 
-    def __init__(self, path: str, with_pooled: bool = False):
+    def __init__(
+        self,
+        path: str,
+        with_pooled: bool = False,
+        lora_rank: int = 0,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        lora_targets: str | None = None,
+    ):
         super().__init__()
         from transformers import SiglipVisionConfig, SiglipVisionModel
 
@@ -208,10 +334,13 @@ class SiglipBackbone(FrozenVisionBackbone):
         self.register_buffer("_std", torch.tensor(self._STD).view(1, 3, 1, 1))
 
         self.requires_grad_(False)
+        # Optional trainable LoRA adapters on the attention projections (no-op
+        # when lora_rank <= 0 -> fully frozen backbone, unchanged behavior).
+        self._inject_lora("siglip", lora_rank, lora_alpha, lora_dropout, lora_targets)
         self.eval()
         loguru.logger.info(
             f"SigLIP backbone ready (token_dim={self.token_dim}, "
-            f"pooler_head={self._has_pooled})"
+            f"pooler_head={self._has_pooled}, has_lora={self.has_lora})"
         )
 
     def preprocess(self, img: torch.Tensor) -> torch.Tensor:
@@ -227,12 +356,11 @@ class SiglipBackbone(FrozenVisionBackbone):
         )
         return (img - self._mean) / self._std  # (x-0.5)/0.5 -> [-1,1]
 
-    @torch.no_grad()
     def patch_tokens(self, img: torch.Tensor) -> torch.Tensor:
         # No CLS token in SigLIP — all of last_hidden_state are patch tokens.
-        return self.vit(pixel_values=img).last_hidden_state  # (N, N_patch, D)
+        with self._grad_ctx():
+            return self.vit(pixel_values=img).last_hidden_state  # (N, N_patch, D)
 
-    @torch.no_grad()
     def pooled(self, img: torch.Tensor) -> torch.Tensor:
         # Attention-pooled pooler_output — SigLIP's canonical image embedding
         # (no CLS token); matches SiglipTargetEncoder.embed exactly. Requires
@@ -244,11 +372,18 @@ class SiglipBackbone(FrozenVisionBackbone):
                 "dropped). Rebuild it with with_pooled=True (set "
                 "network.frozen_vit_expose_pooled=true)."
             )
-        return self.vit(pixel_values=img).pooler_output  # (N, D)
+        with self._grad_ctx():
+            return self.vit(pixel_values=img).pooler_output  # (N, D)
 
 
 def get_vision_backbone(
-    name: str, path: str, with_pooled: bool = False
+    name: str,
+    path: str,
+    with_pooled: bool = False,
+    lora_rank: int = 0,
+    lora_alpha: float = 16.0,
+    lora_dropout: float = 0.0,
+    lora_targets: str | None = None,
 ) -> FrozenVisionBackbone:
     """Factory: build the frozen ``FrozenVisionBackbone`` selected by ``name``.
 
@@ -259,11 +394,21 @@ def get_vision_backbone(
     ``with_pooled`` keeps the backbone's native global-descriptor pooling so the
     shared-backbone frozen-target ablation can call ``pooled`` (no-op for
     DINOv2; keeps the pooler head for SigLIP).
+
+    ``lora_rank > 0`` injects trainable LoRA adapters into the attention
+    projections (the backbone base stays frozen). ``lora_rank <= 0`` (default)
+    leaves the backbone fully frozen — byte-for-byte the prior behavior.
     """
+    lora = {
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "lora_targets": lora_targets,
+    }
     if name == "dinov2":
-        return DINOv2Backbone(path, with_pooled=with_pooled)
+        return DINOv2Backbone(path, with_pooled=with_pooled, **lora)
     if name == "siglip":
-        return SiglipBackbone(path, with_pooled=with_pooled)
+        return SiglipBackbone(path, with_pooled=with_pooled, **lora)
     raise ValueError(
         f"Unknown frozen_vit_backbone={name!r}. Supported: 'dinov2', 'siglip'."
     )

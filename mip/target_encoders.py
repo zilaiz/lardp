@@ -484,7 +484,12 @@ class SharedBackboneTargetEncoder(TargetEncoder):
         # backbone.pooled runs fp32 (no bf16 autocast) so the target matches the
         # standalone *TargetEncoder the goal stats were exported with.
         flat = self.backbone.preprocess(flat)
-        pooled = self.backbone.pooled(flat)  # (B*T, D)
+        # Disable any LoRA adapters for the target pass so the FM target stays the
+        # NATIVE frozen pooled descriptor even when the input/condition path is
+        # LoRA-adapted — keeping it stationary and matching the precomputed goal
+        # z-score stats. A no-op when the backbone has no LoRA.
+        with self.backbone.adapters_disabled():
+            pooled = self.backbone.pooled(flat)  # (B*T, D)
         return pooled.reshape(B, T, self.output_dim)
 
 

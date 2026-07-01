@@ -576,6 +576,23 @@ class NetworkConfig:
     # descriptor, so leaving this on for the plain frozen_vit input encoder is
     # harmless (the head is frozen and stripped from the checkpoint).
     frozen_vit_expose_pooled: bool = False
+    # Optional LoRA finetuning of the frozen ViT backbone (encoder_type=
+    # "frozen_vit"). frozen_vit_lora_rank <= 0 (default) keeps the backbone
+    # FULLY FROZEN — byte-for-byte the prior behavior (no adapters injected, no
+    # checkpoint/EMA changes). rank > 0 injects trainable low-rank adapters into
+    # the attention projections (base weights stay frozen); only lora_A/lora_B
+    # train and are saved in the checkpoint (the frozen base is still
+    # reconstructed from frozen_vit_path at load, so deploy just needs these
+    # same fields set). The FM state-flow target stays the NATIVE frozen
+    # descriptor: the shared-backbone frozen-target agent disables the adapters
+    # for the target pass, so precomputed goal stats remain valid. Typical:
+    # rank 8-16, alpha 16-32.
+    frozen_vit_lora_rank: int = 0  # 0/<=0 = off (fully frozen backbone)
+    frozen_vit_lora_alpha: float = 16.0  # scaling = alpha / rank
+    frozen_vit_lora_dropout: float = 0.0  # inactive under the eval-locked backbone
+    # Comma-separated attention-projection attribute names to adapt; None uses
+    # the per-backbone default (dinov2: "query,value"; siglip: "q_proj,v_proj").
+    frozen_vit_lora_targets: str | None = None
     # Vanilla LBMDiT optional optimality conditioning (expert=0 / play=1),
     # mirroring the joint trunks' optimality embedding but for the plain DP
     # DiT. Off by default = byte-identical to the original LBMDiT (no extra
